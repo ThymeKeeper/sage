@@ -61,6 +61,7 @@ impl Renderer {
         
         let viewport_offset = editor.viewport_offset();
         let buffer = editor.buffer();
+        let selection = editor.selection();
         
         // Hide cursor while drawing
         #[cfg(target_os = "windows")]
@@ -103,25 +104,66 @@ impl Renderer {
                         &line
                     };
                     
-                    // Handle horizontal scrolling
-                    let display_start = viewport_offset.1.min(line_display.len());
-                    let display_text = &line_display[display_start..];
+                    // Calculate byte positions for this line
+                    let line_byte_start = buffer.line_to_byte(file_row);
                     
-                    // Add visible text
-                    let mut chars_written = 0;
-                    for ch in display_text.chars() {
-                        if chars_written >= width as usize {
-                            break;
+                    // Build line with selection highlighting
+                    let mut formatted_line = String::new();
+                    let mut byte_pos = line_byte_start;
+                    let mut col = 0;
+                    
+                    for ch in line_display.chars() {
+                        // Check if we need to start displaying (horizontal scroll)
+                        if col >= viewport_offset.1 {
+                            let chars_written = col - viewport_offset.1;
+                            if chars_written >= width as usize {
+                                break;
+                            }
+                            
+                            // Check if this character is selected
+                            let is_selected = selection.map_or(false, |(sel_start, sel_end)| {
+                                byte_pos >= sel_start && byte_pos < sel_end
+                            });
+                            
+                            #[cfg(target_os = "windows")]
+                            {
+                                if is_selected {
+                                    formatted_line.push_str("\x1b[48;5;27m"); // Blue background
+                                }
+                                formatted_line.push(ch);
+                                if is_selected {
+                                    formatted_line.push_str("\x1b[0m"); // Reset
+                                }
+                            }
+                            
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                if is_selected {
+                                    formatted_line.push_str("\x1b[48;5;27m"); // Blue background
+                                }
+                                formatted_line.push(ch);
+                                if is_selected {
+                                    formatted_line.push_str("\x1b[0m"); // Reset
+                                }
+                            }
                         }
-                        line_content.push(ch);
-                        chars_written += 1;
+                        
+                        byte_pos += ch.len_utf8();
+                        col += 1;
                     }
                     
-                    // Pad with spaces
-                    while chars_written < width as usize {
-                        line_content.push(' ');
-                        chars_written += 1;
+                    // Pad the rest of the line
+                    let displayed_chars = if viewport_offset.1 < col {
+                        col - viewport_offset.1
+                    } else {
+                        0
+                    };
+                    
+                    for _ in displayed_chars..width as usize {
+                        formatted_line.push(' ');
                     }
+                    
+                    line_content = formatted_line;
                 } else {
                     // Virtual line after the buffer - respect horizontal scrolling
                     if viewport_offset.1 == 0 {

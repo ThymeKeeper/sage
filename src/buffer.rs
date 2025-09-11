@@ -45,6 +45,8 @@ impl Buffer {
     }
     
     pub fn from_string(s: String) -> Self {
+        // Normalize line endings: CRLF -> LF
+        let s = s.replace("\r\n", "\n");
         Self {
             rope: Rope::from_str(&s),
             undo_stack: Vec::new(),

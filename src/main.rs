@@ -75,13 +75,67 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     }
                 }
                 
-                // Movement
-                KeyCode::Up => commands::Command::MoveUp,
-                KeyCode::Down => commands::Command::MoveDown,
-                KeyCode::Left => commands::Command::MoveLeft,
-                KeyCode::Right => commands::Command::MoveRight,
-                KeyCode::Home => commands::Command::MoveHome,
-                KeyCode::End => commands::Command::MoveEnd,
+                // Clipboard operations
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    commands::Command::Copy
+                }
+                
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    commands::Command::Cut
+                }
+                
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    commands::Command::Paste
+                }
+                
+                // Select All
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    commands::Command::SelectAll
+                }
+                
+                // Movement (with selection support)
+                KeyCode::Up => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        commands::Command::SelectUp
+                    } else {
+                        commands::Command::MoveUp
+                    }
+                }
+                KeyCode::Down => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        commands::Command::SelectDown
+                    } else {
+                        commands::Command::MoveDown
+                    }
+                }
+                KeyCode::Left => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        commands::Command::SelectLeft
+                    } else {
+                        commands::Command::MoveLeft
+                    }
+                }
+                KeyCode::Right => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        commands::Command::SelectRight
+                    } else {
+                        commands::Command::MoveRight
+                    }
+                }
+                KeyCode::Home => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        commands::Command::SelectHome
+                    } else {
+                        commands::Command::MoveHome
+                    }
+                }
+                KeyCode::End => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        commands::Command::SelectEnd
+                    } else {
+                        commands::Command::MoveEnd
+                    }
+                }
                 KeyCode::PageUp => commands::Command::PageUp,
                 KeyCode::PageDown => commands::Command::PageDown,
                 

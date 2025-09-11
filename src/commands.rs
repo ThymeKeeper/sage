@@ -11,12 +11,26 @@ pub enum Command {
     PageUp,
     PageDown,
     
+    // Selection movement
+    SelectUp,
+    SelectDown,
+    SelectLeft,
+    SelectRight,
+    SelectHome,
+    SelectEnd,
+    SelectAll,
+    
     // Editing
     InsertChar(char),
     InsertNewline,
     InsertTab,
     Backspace,
     Delete,
+    
+    // Clipboard operations
+    Copy,
+    Cut,
+    Paste,
     
     // File operations
     Save,

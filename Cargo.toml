@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 ropey = "1.6"
 crossterm = "0.28"
+arboard = "3.4"
