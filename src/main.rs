@@ -52,7 +52,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
             
             let cmd = match key.code {
                 // Quit
-                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('q') | KeyCode::Char('Q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if editor.is_modified() {
                         // TODO: Add save prompt
                         return Ok(());
@@ -62,12 +62,12 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                 }
                 
                 // Save
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('s') | KeyCode::Char('S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     commands::Command::Save
                 }
                 
                 // Undo/Redo
-                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('z') | KeyCode::Char('Z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if key.modifiers.contains(KeyModifiers::SHIFT) {
                         commands::Command::Redo
                     } else {
@@ -76,20 +76,20 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                 }
                 
                 // Clipboard operations
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('c') | KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     commands::Command::Copy
                 }
                 
-                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('x') | KeyCode::Char('X') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     commands::Command::Cut
                 }
                 
-                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('v') | KeyCode::Char('V') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     commands::Command::Paste
                 }
                 
                 // Select All
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('a') | KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     commands::Command::SelectAll
                 }
                 
