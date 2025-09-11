@@ -1,1 +1,41 @@
-/target
+# Rust builds
+/target/
+/Cargo.lock
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+
+# Test files
+test_*.txt
+invisible_test*.txt
+test_*.rs
+demo_*.rs
+*.pyc
+__pycache__/
+
+# Documentation build
+/docs/
+
+# Logs
+*.log
+
+# Compiled binaries
+texteditor
+texteditor.exe
+*.pdb

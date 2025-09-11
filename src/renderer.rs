@@ -2,15 +2,17 @@ use crate::editor::Editor;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     execute,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use std::io::{self, Write};
+use unicode_width::UnicodeWidthChar;
 
 pub struct Renderer {
     stdout: io::Stdout,
     last_size: (u16, u16),
     last_screen: Vec<String>,  // Store what we last rendered
     last_status: String,        // Store last status line
+    last_title: String,         // Store last terminal title
     #[cfg(target_os = "windows")]
     needs_full_redraw: bool,
 }
@@ -30,17 +32,35 @@ impl Renderer {
             last_size: (width, height),
             last_screen: vec![String::new(); height as usize],
             last_status: String::new(),
+            last_title: String::new(),
             #[cfg(target_os = "windows")]
             needs_full_redraw: true,
         })
     }
     
     pub fn cleanup(&mut self) -> io::Result<()> {
+        // Reset terminal title
+        execute!(self.stdout, SetTitle(""))?;
         execute!(self.stdout, Show, LeaveAlternateScreen)?;
         Ok(())
     }
     
     pub fn draw(&mut self, editor: &mut Editor) -> io::Result<()> {
+        // Update terminal title with filename and modified indicator
+        let file_name = editor.file_name();
+        let modified_indicator = if editor.is_modified() { " *" } else { "" };
+        
+        let title = if file_name == "[No Name]" {
+            format!("No Name{}", modified_indicator)
+        } else {
+            format!("{}{}", file_name, modified_indicator)
+        };
+        
+        if title != self.last_title {
+            execute!(self.stdout, SetTitle(&title))?;
+            self.last_title = title;
+        }
+        
         let (width, height) = terminal::size()?;
         
         // Handle resize
@@ -107,60 +127,70 @@ impl Renderer {
                     // Calculate byte positions for this line
                     let line_byte_start = buffer.line_to_byte(file_row);
                     
-                    // Build line with selection highlighting
+                    // Build line with selection highlighting and proper Unicode width handling
                     let mut formatted_line = String::new();
                     let mut byte_pos = line_byte_start;
-                    let mut col = 0;
+                    let mut display_col = 0;  // Display column position (accounts for wide chars)
+                    let mut screen_col = 0;    // Screen column position after horizontal scroll
                     
                     for ch in line_display.chars() {
-                        // Check if we need to start displaying (horizontal scroll)
-                        if col >= viewport_offset.1 {
-                            let chars_written = col - viewport_offset.1;
-                            if chars_written >= width as usize {
+                        // Get the display width of this character (0, 1, or 2 columns)
+                        let char_width = ch.width().unwrap_or(1);
+                        
+                        // Check if we're past the horizontal scroll offset
+                        if display_col + char_width > viewport_offset.1 {
+                            // Check if this character fits on screen
+                            if screen_col + char_width > width as usize {
+                                // Character doesn't fit, stop here
                                 break;
                             }
                             
-                            // Check if this character is selected
-                            let is_selected = selection.map_or(false, |(sel_start, sel_end)| {
-                                byte_pos >= sel_start && byte_pos < sel_end
-                            });
-                            
-                            #[cfg(target_os = "windows")]
-                            {
-                                if is_selected {
-                                    formatted_line.push_str("\x1b[48;5;27m"); // Blue background
+                            // For the first character after scroll, handle partial visibility
+                            if display_col < viewport_offset.1 && char_width > 1 {
+                                // Wide character is partially cut off by horizontal scroll
+                                // Skip it and add padding space
+                                formatted_line.push(' ');
+                                screen_col += 1;
+                            } else {
+                                // Check if this character is selected
+                                let is_selected = selection.map_or(false, |(sel_start, sel_end)| {
+                                    byte_pos >= sel_start && byte_pos < sel_end
+                                });
+                                
+                                #[cfg(target_os = "windows")]
+                                {
+                                    if is_selected {
+                                        formatted_line.push_str("\x1b[48;5;27m"); // Blue background
+                                    }
+                                    formatted_line.push(ch);
+                                    if is_selected {
+                                        formatted_line.push_str("\x1b[0m"); // Reset
+                                    }
                                 }
-                                formatted_line.push(ch);
-                                if is_selected {
-                                    formatted_line.push_str("\x1b[0m"); // Reset
+                                
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    if is_selected {
+                                        formatted_line.push_str("\x1b[48;5;27m"); // Blue background
+                                    }
+                                    formatted_line.push(ch);
+                                    if is_selected {
+                                        formatted_line.push_str("\x1b[0m"); // Reset
+                                    }
                                 }
-                            }
-                            
-                            #[cfg(not(target_os = "windows"))]
-                            {
-                                if is_selected {
-                                    formatted_line.push_str("\x1b[48;5;27m"); // Blue background
-                                }
-                                formatted_line.push(ch);
-                                if is_selected {
-                                    formatted_line.push_str("\x1b[0m"); // Reset
-                                }
+                                
+                                screen_col += char_width;
                             }
                         }
                         
                         byte_pos += ch.len_utf8();
-                        col += 1;
+                        display_col += char_width;
                     }
                     
-                    // Pad the rest of the line
-                    let displayed_chars = if viewport_offset.1 < col {
-                        col - viewport_offset.1
-                    } else {
-                        0
-                    };
-                    
-                    for _ in displayed_chars..width as usize {
+                    // Pad the rest of the line with spaces
+                    while screen_col < width as usize {
                         formatted_line.push(' ');
+                        screen_col += 1;
                     }
                     
                     line_content = formatted_line;
