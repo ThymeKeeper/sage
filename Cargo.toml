@@ -1,0 +1,8 @@
+[package]
+name = "texteditor"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+ropey = "1.6"
+crossterm = "0.28"
