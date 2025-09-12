@@ -2,9 +2,11 @@ mod buffer;
 mod editor;
 mod renderer;
 mod commands;
+mod prompt;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use std::io;
@@ -61,9 +63,13 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     }
                 }
                 
-                // Save
+                // Save / Save As
                 KeyCode::Char('s') | KeyCode::Char('S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    commands::Command::Save
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        commands::Command::SaveAs
+                    } else {
+                        commands::Command::Save
+                    }
                 }
                 
                 // Undo/Redo
@@ -149,7 +155,74 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                 _ => commands::Command::None,
             };
             
-            editor.execute(cmd)?;
+            // Handle commands that need special UI interaction
+            match cmd {
+                commands::Command::Save => {
+                    // Check if we have a file path
+                    if editor.file_path().is_none() {
+                        // No file path, trigger Save As
+                        let initial_path = editor.get_save_as_initial_path();
+                        let mut prompt = prompt::Prompt::new("Save As", &initial_path);
+                        
+                        // Hide cursor before showing prompt
+                        execute!(io::stdout(), crossterm::cursor::Hide)?;
+                        
+                        // Run the prompt and get result
+                        let result = prompt.run(&mut io::stdout())?;
+                        
+                        // Clear the entire screen and force complete redraw
+                        execute!(io::stdout(), 
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                            crossterm::cursor::Hide
+                        )?;
+                        renderer.force_redraw();
+                        
+                        // Process the result
+                        if let Some(path) = result {
+                            if let Err(e) = editor.save_as(path) {
+                                eprintln!("Failed to save file: {}", e);
+                            }
+                        }
+                        
+                        // Redraw the editor
+                        renderer.draw(editor)?;
+                    } else {
+                        // Normal save
+                        editor.execute(cmd)?;
+                    }
+                }
+                commands::Command::SaveAs => {
+                    let initial_path = editor.get_save_as_initial_path();
+                    let mut prompt = prompt::Prompt::new("Save As", &initial_path);
+                    
+                    // Hide cursor before showing prompt
+                    execute!(io::stdout(), crossterm::cursor::Hide)?;
+                    
+                    // Run the prompt and get result
+                    let result = prompt.run(&mut io::stdout())?;
+                    
+                    // Clear the entire screen and force complete redraw
+                    execute!(io::stdout(), 
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                        crossterm::cursor::Hide
+                    )?;
+                    renderer.force_redraw();
+                    
+                    // Process the result
+                    if let Some(path) = result {
+                        if let Err(e) = editor.save_as(path) {
+                            eprintln!("Failed to save file: {}", e);
+                        }
+                    }
+                    
+                    // Redraw the editor
+                    renderer.draw(editor)?;
+                }
+                _ => {
+                    // All other commands are handled normally
+                    editor.execute(cmd)?;
+                }
+            }
         }
     }
 }

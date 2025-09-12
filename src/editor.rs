@@ -114,6 +114,19 @@ impl Editor {
         }
     }
     
+    pub fn save_as(&mut self, path: PathBuf) -> io::Result<()> {
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        fs::write(&path, self.buffer.to_string())?;
+        self.file_path = Some(path);
+        self.modified = false;
+        self.last_saved_undo_len = 0; // Reset save point
+        Ok(())
+    }
+    
     /// Get the current selection as (start, end) byte positions
     fn get_selection(&self) -> Option<(usize, usize)> {
         self.selection_start.map(|start| {
@@ -525,6 +538,11 @@ impl Editor {
                 self.save()?;
             }
             
+            Command::SaveAs => {
+                // This is handled in main.rs as it needs UI interaction
+                return Ok(());
+            }
+            
             Command::None => {}
         }
         
@@ -567,6 +585,21 @@ impl Editor {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("[No Name]")
+    }
+    
+    /// Get the current file path or the current directory for Save As prompt
+    pub fn get_save_as_initial_path(&self) -> String {
+        if let Some(ref path) = self.file_path {
+            // Use the current file path
+            path.to_string_lossy().to_string()
+        } else {
+            // Use current directory + "untitled.txt"
+            if let Ok(cwd) = std::env::current_dir() {
+                cwd.join("untitled.txt").to_string_lossy().to_string()
+            } else {
+                "untitled.txt".to_string()
+            }
+        }
     }
     
     /// Get cursor position as (line, display_column)

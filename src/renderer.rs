@@ -306,10 +306,14 @@ impl Renderer {
         Ok(())
     }
     
-    /// Force a complete screen clear on the next draw (Windows fix)
-    #[cfg(target_os = "windows")]
-    pub fn force_clear(&mut self) {
-        self.needs_full_redraw = true;
-        execute!(self.stdout, Clear(ClearType::All)).ok();
+    /// Force a complete redraw by clearing cached state
+    pub fn force_redraw(&mut self) {
+        self.last_screen = vec![String::new(); self.last_size.1 as usize];
+        self.last_status.clear();
+        self.last_title.clear();
+        #[cfg(target_os = "windows")]
+        {
+            self.needs_full_redraw = true;
+        }
     }
 }

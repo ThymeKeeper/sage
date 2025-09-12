@@ -34,6 +34,7 @@ pub enum Command {
     
     // File operations
     Save,
+    SaveAs,
     
     // Undo/Redo
     Undo,
