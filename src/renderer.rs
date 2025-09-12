@@ -13,14 +13,35 @@ pub struct Renderer {
     last_screen: Vec<String>,  // Store what we last rendered
     last_status: String,        // Store last status line
     last_title: String,         // Store last terminal title
+    last_cursor_style: CursorStyle, // Track cursor style to avoid redundant updates
     #[cfg(target_os = "windows")]
     needs_full_redraw: bool,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum CursorStyle {
+    Block,
+    Underline,
 }
 
 impl Renderer {
     pub fn new() -> io::Result<Self> {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
+        
+        // Set initial cursor style and color
+        write!(stdout, "\x1b[2 q")?; // Steady block cursor
+        write!(stdout, "\x1b]12;#5F9EA0\x07")?; // Cadet blue - muted professional cyan
+        // Alternative professional colors you can try:
+        // write!(stdout, "\x1b]12;#708090\x07")?; // Slate grey (very muted)
+        // write!(stdout, "\x1b]12;#4682B4\x07")?; // Steel blue (professional)
+        // write!(stdout, "\x1b]12;#5F8787\x07")?; // Muted teal
+        // write!(stdout, "\x1b]12;#6C8C8C\x07")?; // Steel blue-grey
+        // write!(stdout, "\x1b]12;#7B9FAF\x07")?; // Light slate blue
+        // write!(stdout, "\x1b]12;#8BA4B0\x07")?; // Muted sky blue
+        // write!(stdout, "\x1b]12;#6495ED\x07")?; // Cornflower blue
+        // write!(stdout, "\x1b]12;#B0C4DE\x07")?; // Light steel blue (very subtle)
+        stdout.flush()?;
         
         // Initial clear
         execute!(stdout, Clear(ClearType::All))?;
@@ -33,12 +54,17 @@ impl Renderer {
             last_screen: vec![String::new(); height as usize],
             last_status: String::new(),
             last_title: String::new(),
+            last_cursor_style: CursorStyle::Block,
             #[cfg(target_os = "windows")]
             needs_full_redraw: true,
         })
     }
     
     pub fn cleanup(&mut self) -> io::Result<()> {
+        // Reset cursor style and color to terminal defaults
+        write!(self.stdout, "\x1b[0 q")?; // Reset cursor style
+        write!(self.stdout, "\x1b]112\x07")?; // Reset cursor color to default
+        self.stdout.flush()?;
         // Reset terminal title
         execute!(self.stdout, SetTitle(""))?;
         execute!(self.stdout, Show, LeaveAlternateScreen)?;
@@ -50,6 +76,21 @@ impl Renderer {
     }
     
     pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize) -> io::Result<()> {
+        // Update cursor style based on selection (only if changed)
+        let desired_style = if editor.selection().is_some() {
+            CursorStyle::Underline
+        } else {
+            CursorStyle::Block
+        };
+        
+        if desired_style != self.last_cursor_style {
+            match desired_style {
+                CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
+                CursorStyle::Underline => write!(self.stdout, "\x1b[4 q")?,
+            }
+            self.last_cursor_style = desired_style;
+        }
+        
         // Update terminal title with filename and modified indicator
         let file_name = editor.file_name();
         let modified_indicator = if editor.is_modified() { " *" } else { "" };
@@ -72,6 +113,7 @@ impl Renderer {
             self.last_size = (width, height);
             self.last_screen = vec![String::new(); height as usize];
             self.last_status.clear();
+            self.last_cursor_style = CursorStyle::Block; // Force cursor style refresh on resize
             execute!(self.stdout, Clear(ClearType::All))?;
             #[cfg(target_os = "windows")]
             {
@@ -164,7 +206,8 @@ impl Renderer {
                                 #[cfg(target_os = "windows")]
                                 {
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[48;5;240m"); // Professional grey background
+                                        // Use same cadet blue as cursor (#5F9EA0)
+                                        formatted_line.push_str("\x1b[48;2;95;158;160m"); // RGB true color
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
@@ -175,7 +218,8 @@ impl Renderer {
                                 #[cfg(not(target_os = "windows"))]
                                 {
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[48;5;240m"); // Professional grey background
+                                        // Use same cadet blue as cursor (#5F9EA0)
+                                        formatted_line.push_str("\x1b[48;2;95;158;160m"); // RGB true color
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
@@ -315,6 +359,7 @@ impl Renderer {
         self.last_screen = vec![String::new(); self.last_size.1 as usize];
         self.last_status.clear();
         self.last_title.clear();
+        self.last_cursor_style = CursorStyle::Block; // Reset to force cursor style update
         #[cfg(target_os = "windows")]
         {
             self.needs_full_redraw = true;
