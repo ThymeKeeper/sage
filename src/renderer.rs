@@ -206,8 +206,8 @@ impl Renderer {
                                 #[cfg(target_os = "windows")]
                                 {
                                     if is_selected {
-                                        // Use same cadet blue as cursor (#5F9EA0)
-                                        formatted_line.push_str("\x1b[48;2;95;158;160m"); // RGB true color
+                                        // Use same cadet blue as cursor (#5F9EA0) with black text
+                                        formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
@@ -218,8 +218,8 @@ impl Renderer {
                                 #[cfg(not(target_os = "windows"))]
                                 {
                                     if is_selected {
-                                        // Use same cadet blue as cursor (#5F9EA0)
-                                        formatted_line.push_str("\x1b[48;2;95;158;160m"); // RGB true color
+                                        // Use same cadet blue as cursor (#5F9EA0) with black text
+                                        formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
