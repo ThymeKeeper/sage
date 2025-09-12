@@ -30,6 +30,9 @@ fn main() -> io::Result<()> {
         }
     }
     
+    // Initialize viewport to follow cursor
+    editor.update_viewport_for_cursor();
+    
     // Main loop
     let result = run(&mut editor, &mut renderer);
     
@@ -63,6 +66,9 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
         // Handle input
         match event::read()? {
             Event::Mouse(mouse_event) => {
+                // Check if shift is held for horizontal scrolling
+                let shift_held = mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+                
                 // Handle mouse events for text selection
                 match mouse_event.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -88,7 +94,36 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         // Finish selection
                         editor.finish_mouse_selection();
                     }
-                    _ => {}
+                    MouseEventKind::ScrollDown => {
+                        if shift_held {
+                            // Shift+scroll = horizontal scroll right
+                            editor.scroll_viewport_horizontal(5);
+                        } else {
+                            // Normal scroll = vertical scroll down
+                            editor.scroll_viewport_vertical(3);
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if shift_held {
+                            // Shift+scroll = horizontal scroll left  
+                            editor.scroll_viewport_horizontal(-5);
+                        } else {
+                            // Normal scroll = vertical scroll up
+                            editor.scroll_viewport_vertical(-3);
+                        }
+                    }
+                    MouseEventKind::ScrollLeft => {
+                        // Scroll viewport left without moving cursor
+                        editor.scroll_viewport_horizontal(-5);
+                    }
+                    MouseEventKind::ScrollRight => {
+                        // Scroll viewport right without moving cursor
+                        editor.scroll_viewport_horizontal(5);
+                    }
+                    _ => {
+                        // Debug: uncomment to see what mouse events are being received
+                        // eprintln!("Mouse event: {:?}", mouse_event.kind);
+                    }
                 }
             }
             Event::Key(key) => {

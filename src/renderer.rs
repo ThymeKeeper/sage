@@ -79,9 +79,9 @@ impl Renderer {
             }
         }
         
-        // Update viewport - account for status bar and any bottom window
+        // Get viewport dimensions for rendering
         let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize; // Reserve for status and bottom window
-        editor.update_viewport(content_height, width as usize);
+        // Note: viewport is only updated when cursor moves, not on every render
         
         let viewport_offset = editor.viewport_offset();
         let buffer = editor.buffer();

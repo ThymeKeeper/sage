@@ -173,11 +173,15 @@ impl Editor {
         // Clear mouse selection mode on any keyboard input
         self.mouse_selecting = false;
         
+        // Track if cursor moved to update viewport
+        let mut cursor_moved = false;
+        
         // For non-selection movement commands, clear selection
         match cmd {
             Command::MoveUp | Command::MoveDown | Command::MoveLeft | Command::MoveRight |
             Command::MoveHome | Command::MoveEnd | Command::PageUp | Command::PageDown => {
                 self.selection_start = None;
+                cursor_moved = true;
             }
             _ => {}
         }
@@ -537,6 +541,7 @@ impl Editor {
                 if let Some(cursor) = self.buffer.undo() {
                     self.cursor = cursor.min(self.buffer.len_bytes());
                     self.modified = self.buffer.can_undo();
+                    cursor_moved = true;
                 }
             }
             
@@ -544,6 +549,7 @@ impl Editor {
                 if let Some(cursor) = self.buffer.redo() {
                     self.cursor = cursor.min(self.buffer.len_bytes());
                     self.modified = true;
+                    cursor_moved = true;
                 }
             }
             
@@ -563,6 +569,16 @@ impl Editor {
             }
             
             Command::None => {}
+        }
+        
+        // Update viewport if cursor moved (but not for pure viewport scrolling)
+        if cursor_moved || matches!(cmd, 
+            Command::InsertChar(_) | Command::InsertNewline | Command::InsertTab |
+            Command::Backspace | Command::Delete | Command::Paste |
+            Command::SelectUp | Command::SelectDown | Command::SelectLeft | Command::SelectRight |
+            Command::SelectHome | Command::SelectEnd | Command::SelectAll
+        ) {
+            self.update_viewport_for_cursor();
         }
         
         Ok(())
@@ -647,12 +663,14 @@ impl Editor {
     pub fn move_cursor_to(&mut self, position: usize) {
         self.cursor = position.min(self.buffer.len_bytes());
         self.selection_start = None;
+        self.update_viewport_for_cursor();
     }
     
     /// Select a range of text
     pub fn select_range(&mut self, start: usize, end: usize) {
         self.selection_start = Some(start);
         self.cursor = end;
+        self.update_viewport_for_cursor();
     }
     
     /// Replace the currently selected text
@@ -664,6 +682,7 @@ impl Editor {
             self.cursor = start + replacement.len();
             self.selection_start = None;
             self.modified = true;
+            self.update_viewport_for_cursor();
             true
         } else {
             false
@@ -685,6 +704,7 @@ impl Editor {
         }
         
         self.modified = true;
+        self.update_viewport_for_cursor();
     }
     
     /// Get cursor position as (line, display_column)
@@ -730,8 +750,19 @@ impl Editor {
         (line, display_col)
     }
     
+    /// Update viewport to follow cursor - call this when cursor moves
+    pub fn update_viewport_for_cursor(&mut self) {
+        // Get terminal size
+        if let Ok((width, height)) = crossterm::terminal::size() {
+            // Account for status bar
+            let viewport_height = (height - 1) as usize;
+            let viewport_width = width as usize;
+            self.update_viewport(viewport_height, viewport_width);
+        }
+    }
+    
     /// Update viewport to follow cursor with scrolloff
-    pub fn update_viewport(&mut self, viewport_height: usize, viewport_width: usize) {
+    fn update_viewport(&mut self, viewport_height: usize, viewport_width: usize) {
         let scrolloff = 3;
         let (cursor_line, cursor_col) = self.cursor_position();
         
@@ -884,17 +915,20 @@ impl Editor {
                 // Double click - select word
                 self.select_word_at(position);
                 self.mouse_selecting = false; // Don't continue selecting on drag
+                self.update_viewport_for_cursor();
             }
             3 => {
                 // Triple click - select line
                 self.select_line_at(position);
                 self.mouse_selecting = false; // Don't continue selecting on drag
+                self.update_viewport_for_cursor();
             }
             _ => {
                 // Single click - start normal selection
                 self.cursor = position;
                 self.selection_start = None;
                 self.mouse_selecting = true;
+                self.update_viewport_for_cursor();
             }
         }
     }
@@ -973,6 +1007,7 @@ impl Editor {
             }
             // Update cursor to current mouse position
             self.cursor = position;
+            self.update_viewport_for_cursor();
         }
     }
     
@@ -984,6 +1019,54 @@ impl Editor {
             if start == self.cursor {
                 self.selection_start = None;
             }
+        }
+    }
+    
+    /// Scroll viewport vertically without moving cursor
+    pub fn scroll_viewport_vertical(&mut self, lines: i32) {
+        if lines > 0 {
+            // Scrolling down (viewport moves down, content moves up)
+            self.viewport_offset.0 = self.viewport_offset.0.saturating_add(lines as usize);
+            // Don't scroll past the end of the buffer
+            // We have 2 virtual lines before the buffer and allow some after
+            let max_offset = self.buffer.len_lines().saturating_add(2).saturating_add(10);
+            if self.viewport_offset.0 > max_offset {
+                self.viewport_offset.0 = max_offset;
+            }
+        } else {
+            // Scrolling up (viewport moves up, content moves down)
+            self.viewport_offset.0 = self.viewport_offset.0.saturating_sub((-lines) as usize);
+        }
+    }
+    
+    /// Scroll viewport horizontally without moving cursor
+    pub fn scroll_viewport_horizontal(&mut self, cols: i32) {
+        if cols > 0 {
+            // Scrolling right (viewport moves right, content moves left)
+            self.viewport_offset.1 = self.viewport_offset.1.saturating_add(cols as usize);
+            
+            // Find the longest line to limit scrolling
+            let mut max_line_width = 0;
+            for i in 0..self.buffer.len_lines() {
+                let line = self.buffer.line(i);
+                let mut line_width = 0;
+                for ch in line.chars() {
+                    if ch == '\n' {
+                        break;
+                    }
+                    line_width += ch.width().unwrap_or(1);
+                }
+                max_line_width = max_line_width.max(line_width);
+            }
+            
+            // Limit horizontal scrolling to the longest line + some padding
+            let max_offset = max_line_width.saturating_add(20);
+            if self.viewport_offset.1 > max_offset {
+                self.viewport_offset.1 = max_offset;
+            }
+        } else {
+            // Scrolling left (viewport moves left, content moves right)
+            self.viewport_offset.1 = self.viewport_offset.1.saturating_sub((-cols) as usize);
         }
     }
 }
