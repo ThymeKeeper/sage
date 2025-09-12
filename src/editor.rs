@@ -709,6 +709,27 @@ impl Editor {
         (line, display_col)
     }
     
+    /// Get position of a byte offset as (line, display_column)
+    fn byte_position_to_display(&self, byte_pos: usize) -> (usize, usize) {
+        let line = self.buffer.byte_to_line(byte_pos);
+        let line_start = self.buffer.line_to_byte(line);
+        
+        // Calculate display column by summing character widths
+        let line_text = self.buffer.line(line);
+        let mut current_byte_pos = 0;
+        let mut display_col = 0;
+        
+        for ch in line_text.chars() {
+            if line_start + current_byte_pos >= byte_pos {
+                break;
+            }
+            display_col += ch.width().unwrap_or(1);
+            current_byte_pos += ch.len_utf8();
+        }
+        
+        (line, display_col)
+    }
+    
     /// Update viewport to follow cursor with scrolloff
     pub fn update_viewport(&mut self, viewport_height: usize, viewport_width: usize) {
         let scrolloff = 3;
@@ -730,10 +751,23 @@ impl Editor {
             self.viewport_offset.0 = logical_cursor_line + scrolloff - viewport_height;
         }
         
-        // Horizontal scrolling
-        if cursor_col < self.viewport_offset.1 + scrolloff {
-            self.viewport_offset.1 = cursor_col.saturating_sub(scrolloff);
-        } else if cursor_col >= self.viewport_offset.1 + viewport_width - scrolloff {
+        // Horizontal scrolling - consider both cursor and selection start
+        let mut left_col = cursor_col;
+        let mut right_col = cursor_col;
+        
+        // If there's a selection, we need to consider both ends
+        if let Some(sel_start) = self.selection_start {
+            let (_, sel_col) = self.byte_position_to_display(sel_start);
+            left_col = left_col.min(sel_col);
+            right_col = right_col.max(sel_col);
+        }
+        
+        // Ensure the leftmost position is visible with scrolloff
+        if left_col < self.viewport_offset.1 + scrolloff {
+            self.viewport_offset.1 = left_col.saturating_sub(scrolloff);
+        }
+        // Then check if we need to scroll right for the cursor
+        else if cursor_col >= self.viewport_offset.1 + viewport_width - scrolloff {
             self.viewport_offset.1 = cursor_col + scrolloff + 1 - viewport_width;
         }
     }

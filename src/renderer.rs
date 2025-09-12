@@ -164,7 +164,7 @@ impl Renderer {
                                 #[cfg(target_os = "windows")]
                                 {
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[48;5;27m"); // Blue background
+                                        formatted_line.push_str("\x1b[48;5;240m"); // Professional grey background
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
@@ -175,7 +175,7 @@ impl Renderer {
                                 #[cfg(not(target_os = "windows"))]
                                 {
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[48;5;27m"); // Blue background
+                                        formatted_line.push_str("\x1b[48;5;240m"); // Professional grey background
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
