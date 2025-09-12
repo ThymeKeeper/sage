@@ -4,6 +4,7 @@ use arboard::Clipboard;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 pub struct Editor {
@@ -15,6 +16,10 @@ pub struct Editor {
     viewport_offset: (usize, usize),  // (row, col) offset for scrolling
     last_saved_undo_len: usize,       // Track save point for modified flag
     clipboard: Clipboard,             // System clipboard
+    mouse_selecting: bool,            // Track if we're actively selecting with mouse
+    last_click_time: Option<Instant>, // Track time of last click for double/triple click
+    last_click_position: Option<usize>, // Track position of last click
+    click_count: usize,               // Track consecutive clicks (1=single, 2=double, 3=triple)
 }
 
 impl Editor {
@@ -86,6 +91,10 @@ impl Editor {
             viewport_offset: (0, 0),
             last_saved_undo_len: 0,
             clipboard: Clipboard::new().expect("Failed to access clipboard"),
+            mouse_selecting: false,
+            last_click_time: None,
+            last_click_position: None,
+            click_count: 0,
         }
     }
     
@@ -100,6 +109,7 @@ impl Editor {
         self.modified = false;
         self.viewport_offset = (0, 0);
         self.last_saved_undo_len = 0;
+        self.mouse_selecting = false;
         Ok(())
     }
     
@@ -160,6 +170,9 @@ impl Editor {
     }
     
     pub fn execute(&mut self, cmd: Command) -> io::Result<()> {
+        // Clear mouse selection mode on any keyboard input
+        self.mouse_selecting = false;
+        
         // For non-selection movement commands, clear selection
         match cmd {
             Command::MoveUp | Command::MoveDown | Command::MoveLeft | Command::MoveRight |
@@ -722,6 +735,221 @@ impl Editor {
             self.viewport_offset.1 = cursor_col.saturating_sub(scrolloff);
         } else if cursor_col >= self.viewport_offset.1 + viewport_width - scrolloff {
             self.viewport_offset.1 = cursor_col + scrolloff + 1 - viewport_width;
+        }
+    }
+    
+    /// Convert screen coordinates to buffer position
+    pub fn screen_to_buffer_position(&self, screen_col: usize, screen_row: usize) -> Option<usize> {
+        // Get terminal height to check if click is on status bar
+        if let Ok((_, height)) = crossterm::terminal::size() {
+            // Ignore clicks on the status bar (last row)
+            if screen_row >= (height - 1) as usize {
+                return None;
+            }
+        }
+        
+        // Calculate logical line from screen row
+        let logical_line = self.viewport_offset.0 + screen_row;
+        
+        // Virtual lines before the buffer (lines 0 and 1)
+        if logical_line < 2 {
+            return Some(0); // Click on virtual lines maps to start of buffer
+        }
+        
+        // Map logical line to buffer line
+        let buffer_line = logical_line - 2;
+        
+        // Check if the line exists in the buffer
+        if buffer_line >= self.buffer.len_lines() {
+            // Click beyond the buffer content
+            return Some(self.buffer.len_bytes());
+        }
+        
+        // Get the line content
+        let line = self.buffer.line(buffer_line);
+        let line_start = self.buffer.line_to_byte(buffer_line);
+        
+        // Calculate the display column accounting for horizontal scroll
+        let target_display_col = screen_col + self.viewport_offset.1;
+        
+        // Find the byte position for the target display column
+        let mut byte_pos = 0;
+        let mut display_col = 0;
+        
+        for ch in line.chars() {
+            if display_col >= target_display_col {
+                break;
+            }
+            
+            let char_width = ch.width().unwrap_or(1);
+            
+            // Check if clicking in the middle of a wide character
+            if display_col + char_width > target_display_col {
+                // Click is within this character, decide based on position
+                if target_display_col - display_col < char_width / 2 {
+                    // Closer to start of character
+                    break;
+                } else {
+                    // Closer to end of character
+                    byte_pos += ch.len_utf8();
+                    break;
+                }
+            }
+            
+            display_col += char_width;
+            byte_pos += ch.len_utf8();
+        }
+        
+        // Don't include the newline in selection
+        if line.ends_with('\n') && byte_pos >= line.len() - 1 {
+            byte_pos = line.len().saturating_sub(1);
+        }
+        
+        Some(line_start + byte_pos)
+    }
+    
+    /// Start a mouse selection
+    pub fn start_mouse_selection(&mut self, position: usize) {
+        let now = Instant::now();
+        let double_click_time = Duration::from_millis(500);
+        
+        // Check for double/triple click
+        if let Some(last_time) = self.last_click_time {
+            if now.duration_since(last_time) < double_click_time {
+                if let Some(last_pos) = self.last_click_position {
+                    // Check if clicking near the same position (within 3 characters)
+                    let pos_diff = if position > last_pos {
+                        position - last_pos
+                    } else {
+                        last_pos - position
+                    };
+                    
+                    if pos_diff <= 3 {
+                        self.click_count += 1;
+                        if self.click_count > 3 {
+                            self.click_count = 1;
+                        }
+                    } else {
+                        self.click_count = 1;
+                    }
+                } else {
+                    self.click_count = 1;
+                }
+            } else {
+                self.click_count = 1;
+            }
+        } else {
+            self.click_count = 1;
+        }
+        
+        self.last_click_time = Some(now);
+        self.last_click_position = Some(position);
+        
+        match self.click_count {
+            2 => {
+                // Double click - select word
+                self.select_word_at(position);
+                self.mouse_selecting = false; // Don't continue selecting on drag
+            }
+            3 => {
+                // Triple click - select line
+                self.select_line_at(position);
+                self.mouse_selecting = false; // Don't continue selecting on drag
+            }
+            _ => {
+                // Single click - start normal selection
+                self.cursor = position;
+                self.selection_start = None;
+                self.mouse_selecting = true;
+            }
+        }
+    }
+    
+    /// Select the word at the given position
+    fn select_word_at(&mut self, position: usize) {
+        let content = self.buffer.to_string();
+        let chars: Vec<char> = content.chars().collect();
+        
+        // Convert byte position to char position
+        let mut byte_pos = 0;
+        let mut char_pos = 0;
+        for (i, ch) in chars.iter().enumerate() {
+            if byte_pos >= position {
+                char_pos = i;
+                break;
+            }
+            byte_pos += ch.len_utf8();
+        }
+        
+        // Find word boundaries
+        let mut start_char = char_pos;
+        let mut end_char = char_pos;
+        
+        // Move start backward to beginning of word
+        while start_char > 0 && chars[start_char - 1].is_alphanumeric() {
+            start_char -= 1;
+        }
+        
+        // Move end forward to end of word
+        while end_char < chars.len() && chars[end_char].is_alphanumeric() {
+            end_char += 1;
+        }
+        
+        // Convert char positions back to byte positions
+        let mut start_byte = 0;
+        for i in 0..start_char {
+            start_byte += chars[i].len_utf8();
+        }
+        
+        let mut end_byte = start_byte;
+        for i in start_char..end_char {
+            end_byte += chars[i].len_utf8();
+        }
+        
+        // Set selection
+        if start_byte < end_byte {
+            self.selection_start = Some(start_byte);
+            self.cursor = end_byte;
+        }
+    }
+    
+    /// Select the line at the given position
+    fn select_line_at(&mut self, position: usize) {
+        let line = self.buffer.byte_to_line(position);
+        let line_start = self.buffer.line_to_byte(line);
+        let line_text = self.buffer.line(line);
+        
+        // Don't include the newline in the selection
+        let line_end = if line_text.ends_with('\n') {
+            line_start + line_text.len() - 1
+        } else {
+            line_start + line_text.len()
+        };
+        
+        self.selection_start = Some(line_start);
+        self.cursor = line_end;
+    }
+    
+    /// Update mouse selection while dragging
+    pub fn update_mouse_selection(&mut self, position: usize) {
+        if self.mouse_selecting {
+            if self.selection_start.is_none() {
+                // Start selection from the initial cursor position
+                self.selection_start = Some(self.cursor);
+            }
+            // Update cursor to current mouse position
+            self.cursor = position;
+        }
+    }
+    
+    /// Finish mouse selection
+    pub fn finish_mouse_selection(&mut self) {
+        self.mouse_selecting = false;
+        // If selection start equals cursor, clear the selection
+        if let Some(start) = self.selection_start {
+            if start == self.cursor {
+                self.selection_start = None;
+            }
         }
     }
 }
