@@ -46,6 +46,10 @@ impl Renderer {
     }
     
     pub fn draw(&mut self, editor: &mut Editor) -> io::Result<()> {
+        self.draw_with_bottom_window(editor, 0)
+    }
+    
+    pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize) -> io::Result<()> {
         // Update terminal title with filename and modified indicator
         let file_name = editor.file_name();
         let modified_indicator = if editor.is_modified() { " *" } else { "" };
@@ -75,8 +79,8 @@ impl Renderer {
             }
         }
         
-        // Update viewport - normal height calculation
-        let content_height = height.saturating_sub(1) as usize; // Reserve 1 for status
+        // Update viewport - account for status bar and any bottom window
+        let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize; // Reserve for status and bottom window
         editor.update_viewport(content_height, width as usize);
         
         let viewport_offset = editor.viewport_offset();
@@ -234,8 +238,8 @@ impl Renderer {
             }
         }
         
-        // Build status line
-        let status_row = height as usize - 1;
+        // Build status line - position it above any bottom window
+        let status_row = (height - 1 - bottom_window_height as u16) as usize;
         let modified_indicator = if editor.is_modified() { "*" } else { "" };
         let file_name = editor.file_name();
         let (line, col) = editor.cursor_position();

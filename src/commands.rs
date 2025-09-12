@@ -36,6 +36,13 @@ pub enum Command {
     Save,
     SaveAs,
     
+    // Find and Replace
+    FindReplace,
+    FindNext,
+    FindPrev,
+    Replace,
+    ReplaceAll,
+    
     // Undo/Redo
     Undo,
     Redo,

@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthChar;
 pub struct Editor {
     buffer: Buffer,
     cursor: usize,           // Byte position in the buffer
-    selection_start: Option<usize>,  // Start of selection (if any)
+    pub selection_start: Option<usize>,  // Start of selection (if any)
     file_path: Option<PathBuf>,
     modified: bool,
     viewport_offset: (usize, usize),  // (row, col) offset for scrolling
@@ -543,6 +543,12 @@ impl Editor {
                 return Ok(());
             }
             
+            Command::FindReplace | Command::FindNext | Command::FindPrev | 
+            Command::Replace | Command::ReplaceAll => {
+                // These are handled in main.rs with the find/replace window
+                return Ok(());
+            }
+            
             Command::None => {}
         }
         
@@ -600,6 +606,72 @@ impl Editor {
                 "untitled.txt".to_string()
             }
         }
+    }
+    
+    /// Find all occurrences of a string in the buffer
+    pub fn find_all(&self, search_text: &str) -> Vec<(usize, usize)> {
+        if search_text.is_empty() {
+            return Vec::new();
+        }
+        
+        let mut matches = Vec::new();
+        let content = self.buffer.to_string();
+        let search_lower = search_text.to_lowercase();
+        let content_lower = content.to_lowercase();
+        
+        let mut start = 0;
+        while let Some(pos) = content_lower[start..].find(&search_lower) {
+            let match_start = start + pos;
+            let match_end = match_start + search_text.len();
+            matches.push((match_start, match_end));
+            start = match_start + 1; // Move forward by 1 to find overlapping matches
+        }
+        
+        matches
+    }
+    
+    /// Move cursor to a specific position
+    pub fn move_cursor_to(&mut self, position: usize) {
+        self.cursor = position.min(self.buffer.len_bytes());
+        self.selection_start = None;
+    }
+    
+    /// Select a range of text
+    pub fn select_range(&mut self, start: usize, end: usize) {
+        self.selection_start = Some(start);
+        self.cursor = end;
+    }
+    
+    /// Replace the currently selected text
+    pub fn replace_selection(&mut self, replacement: &str) -> bool {
+        if let Some((start, end)) = self.get_selection() {
+            let cursor_before = self.cursor;
+            self.buffer.delete(start, end, cursor_before, start);
+            self.buffer.insert(start, replacement, start, start + replacement.len());
+            self.cursor = start + replacement.len();
+            self.selection_start = None;
+            self.modified = true;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Replace text at a specific position
+    pub fn replace_at(&mut self, start: usize, end: usize, replacement: &str) {
+        let cursor_before = self.cursor;
+        self.buffer.delete(start, end, cursor_before, start);
+        self.buffer.insert(start, replacement, start, start + replacement.len());
+        
+        // Adjust cursor if it was after the replacement
+        if self.cursor > end {
+            let diff = (end - start) as isize - replacement.len() as isize;
+            self.cursor = (self.cursor as isize - diff) as usize;
+        } else if self.cursor >= start && self.cursor <= end {
+            self.cursor = start + replacement.len();
+        }
+        
+        self.modified = true;
     }
     
     /// Get cursor position as (line, display_column)
