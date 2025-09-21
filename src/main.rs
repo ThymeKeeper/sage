@@ -50,17 +50,23 @@ fn main() -> io::Result<()> {
 
 fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
+    let mut needs_redraw = true; // Track if we need to redraw
     
     loop {
-        // Draw the editor with find/replace window if active
-        if find_replace.is_some() {
-            renderer.draw_with_bottom_window(editor, 3)?;  // Changed from 5 to 3
-        } else {
-            renderer.draw(editor)?;
-        }
-        
-        if let Some(ref fr) = find_replace {
-            fr.draw(&mut io::stdout())?;
+        // Only draw if needed
+        if needs_redraw {
+            // Draw the editor with find/replace window if active
+            if find_replace.is_some() {
+                renderer.draw_with_bottom_window(editor, 3)?;  // Changed from 5 to 3
+            } else {
+                renderer.draw(editor)?;
+            }
+            
+            if let Some(ref fr) = find_replace {
+                fr.draw(&mut io::stdout())?;
+            }
+            
+            needs_redraw = false; // Reset flag after drawing
         }
         
         // Handle input
@@ -69,60 +75,105 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                 // Check if shift is held for horizontal scrolling
                 let shift_held = mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
                 
-                // Handle mouse events for text selection
-                match mouse_event.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        // Start selection
-                        if let Some(position) = editor.screen_to_buffer_position(
-                            mouse_event.column as usize,
-                            mouse_event.row as usize,
-                        ) {
-                            editor.start_mouse_selection(position);
-                            renderer.force_redraw();
+                // Only handle mouse events if find/replace is NOT open
+                if find_replace.is_none() {
+                    // Handle mouse events for text selection
+                    match mouse_event.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // Start selection
+                            if let Some(position) = editor.screen_to_buffer_position(
+                                mouse_event.column as usize,
+                                mouse_event.row as usize,
+                            ) {
+                                editor.start_mouse_selection(position);
+                                renderer.force_redraw();
+                                needs_redraw = true; // Need to redraw for selection
+                            }
                         }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        // Update selection
-                        if let Some(position) = editor.screen_to_buffer_position(
-                            mouse_event.column as usize,
-                            mouse_event.row as usize,
-                        ) {
-                            editor.update_mouse_selection(position);
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            // Update selection
+                            if let Some(position) = editor.screen_to_buffer_position(
+                                mouse_event.column as usize,
+                                mouse_event.row as usize,
+                            ) {
+                                editor.update_mouse_selection(position);
+                                needs_redraw = true; // Need to redraw for selection update
+                            }
                         }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        // Finish selection
-                        editor.finish_mouse_selection();
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if shift_held {
-                            // Shift+scroll = horizontal scroll right
-                            editor.scroll_viewport_horizontal(5);
-                        } else {
-                            // Normal scroll = vertical scroll down
-                            editor.scroll_viewport_vertical(3);
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            // Finish selection
+                            editor.finish_mouse_selection();
+                            needs_redraw = true; // Need to redraw to finalize selection
                         }
-                    }
-                    MouseEventKind::ScrollUp => {
-                        if shift_held {
-                            // Shift+scroll = horizontal scroll left  
+                        MouseEventKind::ScrollDown => {
+                            if shift_held {
+                                // Shift+scroll = horizontal scroll right
+                                editor.scroll_viewport_horizontal(5);
+                            } else {
+                                // Normal scroll = vertical scroll down
+                                editor.scroll_viewport_vertical(3);
+                            }
+                            needs_redraw = true; // Need to redraw for scroll
+                        }
+                        MouseEventKind::ScrollUp => {
+                            if shift_held {
+                                // Shift+scroll = horizontal scroll left  
+                                editor.scroll_viewport_horizontal(-5);
+                            } else {
+                                // Normal scroll = vertical scroll up
+                                editor.scroll_viewport_vertical(-3);
+                            }
+                            needs_redraw = true; // Need to redraw for scroll
+                        }
+                        MouseEventKind::ScrollLeft => {
+                            // Scroll viewport left without moving cursor
                             editor.scroll_viewport_horizontal(-5);
-                        } else {
-                            // Normal scroll = vertical scroll up
-                            editor.scroll_viewport_vertical(-3);
+                            needs_redraw = true; // Need to redraw for scroll
+                        }
+                        MouseEventKind::ScrollRight => {
+                            // Scroll viewport right without moving cursor
+                            editor.scroll_viewport_horizontal(5);
+                            needs_redraw = true; // Need to redraw for scroll
+                        }
+                        MouseEventKind::Moved => {
+                            // Mouse just moved, no interaction - DO NOT REDRAW
+                            // This prevents flickering when mouse moves
+                        }
+                        _ => {
+                            // Other mouse events we don't handle - DO NOT REDRAW
                         }
                     }
-                    MouseEventKind::ScrollLeft => {
-                        // Scroll viewport left without moving cursor
-                        editor.scroll_viewport_horizontal(-5);
-                    }
-                    MouseEventKind::ScrollRight => {
-                        // Scroll viewport right without moving cursor
-                        editor.scroll_viewport_horizontal(5);
-                    }
-                    _ => {
-                        // Debug: uncomment to see what mouse events are being received
-                        // eprintln!("Mouse event: {:?}", mouse_event.kind);
+                } else {
+                    // Find/replace is open, only handle scroll events
+                    match mouse_event.kind {
+                        MouseEventKind::ScrollDown => {
+                            if shift_held {
+                                editor.scroll_viewport_horizontal(5);
+                            } else {
+                                editor.scroll_viewport_vertical(3);
+                            }
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::ScrollUp => {
+                            if shift_held {
+                                editor.scroll_viewport_horizontal(-5);
+                            } else {
+                                editor.scroll_viewport_vertical(-3);
+                            }
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::ScrollLeft => {
+                            editor.scroll_viewport_horizontal(-5);
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::ScrollRight => {
+                            editor.scroll_viewport_horizontal(5);
+                            needs_redraw = true;
+                        }
+                        _ => {
+                            // Ignore all other mouse events when find/replace is open
+                            // This includes mouse movement, clicks, and drags
+                        }
                     }
                 }
             }
@@ -132,6 +183,8 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                 if key.kind == event::KeyEventKind::Release {
                     continue;
                 }
+                
+                needs_redraw = true; // Key events usually need redraw
                 
                 // If find/replace window is active, handle its input first
                 if let Some(ref mut fr) = find_replace {
@@ -496,13 +549,24 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         // Open find/replace window
                         find_replace = Some(find_replace::FindReplace::new());
                     }
+                    commands::Command::None => {
+                        // No command, don't need redraw
+                        needs_redraw = false;
+                    }
                     _ => {
                         // All other commands are handled normally
                         editor.execute(cmd)?;
                     }
                 }
             }
-            _ => {}
+            Event::Resize(_, _) => {
+                // Terminal was resized, force redraw
+                renderer.force_redraw();
+                needs_redraw = true;
+            }
+            _ => {
+                // Other events don't need redraw
+            }
         }
     }
 }

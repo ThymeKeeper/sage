@@ -5,16 +5,19 @@ use crossterm::{
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor, ResetColor},
     terminal,
 };
+use arboard::Clipboard;
 use std::io::{self, Write};
 
 pub struct FindReplace {
     find_text: String,
     replace_text: String,
     cursor_pos: usize,
+    selection_start: Option<usize>,  // Selection start position in active field
     active_field: Field,
     current_match: usize,
     total_matches: usize,
     matches: Vec<(usize, usize)>, // (start_byte, end_byte) positions
+    clipboard: Clipboard,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -29,10 +32,12 @@ impl FindReplace {
             find_text: String::new(),
             replace_text: String::new(),
             cursor_pos: 0,
+            selection_start: None,
             active_field: Field::Find,
             current_match: 0,
             total_matches: 0,
             matches: Vec::new(),
+            clipboard: Clipboard::new().expect("Failed to access clipboard"),
         }
     }
     
@@ -98,6 +103,47 @@ impl FindReplace {
         self.find_text.is_empty()
     }
     
+    /// Get the current selection in the active field (start, end)
+    fn get_selection(&self) -> Option<(usize, usize)> {
+        self.selection_start.map(|start| {
+            if start < self.cursor_pos {
+                (start, self.cursor_pos)
+            } else {
+                (self.cursor_pos, start)
+            }
+        })
+    }
+    
+    /// Delete the selected text in the active field
+    fn delete_selection(&mut self) -> bool {
+        if let Some((start, end)) = self.get_selection() {
+            let text = if self.active_field == Field::Find {
+                &mut self.find_text
+            } else {
+                &mut self.replace_text
+            };
+            
+            text.drain(start..end);
+            self.cursor_pos = start;
+            self.selection_start = None;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Get selected text in the active field
+    fn get_selected_text(&self) -> Option<String> {
+        self.get_selection().map(|(start, end)| {
+            let text = if self.active_field == Field::Find {
+                &self.find_text
+            } else {
+                &self.replace_text
+            };
+            text[start..end].to_string()
+        })
+    }
+    
     /// Draw the find/replace window at bottom of screen
     pub fn draw(&self, stdout: &mut io::Stdout) -> io::Result<()> {
         let (width, height) = terminal::size()?;
@@ -105,6 +151,23 @@ impl FindReplace {
         // Position at bottom, above status bar
         let window_height = 3;  // Still 3 lines but simpler
         let window_y = height.saturating_sub(window_height + 1) as usize; // -1 for status bar
+        
+        // Calculate counter string first to know its actual length - we'll use this for both drawing and cursor positioning
+        let counter_str = if self.total_matches > 0 || !self.find_text.is_empty() {
+            if self.total_matches > 0 {
+                format!(" [{}/{}]", self.current_match + 1, self.total_matches)
+            } else {
+                " [0/0]".to_string()
+            }
+        } else {
+            String::new()
+        };
+        let actual_counter_len = counter_str.len();
+        
+        // Calculate field widths - split available space
+        let total_width = width as usize - 4; // Subtract borders and padding
+        let available_for_fields = total_width.saturating_sub(6 + 9 + actual_counter_len + 4); // "Find: " + "Replace: " + counter + spacing
+        let field_width = available_for_fields / 2;
         
         // Draw window background with border
         for y in 0..window_height as usize {
@@ -138,26 +201,13 @@ impl FindReplace {
                     SetForegroundColor(Color::Rgb { r: 200, g: 200, b: 205 }),
                 )?;
                 
-                // Calculate counter string first to know its actual length
-                let counter_str = if self.total_matches > 0 || !self.find_text.is_empty() {
-                    if self.total_matches > 0 {
-                        format!(" [{}/{}]", self.current_match + 1, self.total_matches)
-                    } else {
-                        " [0/0]".to_string()
-                    }
-                } else {
-                    String::new()
-                };
-                
-                // Calculate field widths - split available space
-                let total_width = width as usize - 4; // Subtract borders and padding
-                let actual_counter_len = counter_str.len();
-                let available_for_fields = total_width.saturating_sub(6 + 9 + actual_counter_len + 4); // "Find: " + "Replace: " + counter + spacing
-                let field_width = available_for_fields / 2;
-                
                 // Find input field
-                let visible_find = self.get_visible_text(&self.find_text, field_width, 
-                    if self.active_field == Field::Find { self.cursor_pos } else { 0 });
+                let visible_find = self.get_visible_text_with_selection(
+                    &self.find_text, 
+                    field_width, 
+                    if self.active_field == Field::Find { self.cursor_pos } else { 0 },
+                    if self.active_field == Field::Find { self.get_selection() } else { None }
+                );
                 
                 execute!(
                     stdout,
@@ -167,9 +217,18 @@ impl FindReplace {
                         Color::Rgb { r: 30, g: 30, b: 35 }
                     }),
                     SetForegroundColor(Color::Rgb { r: 220, g: 220, b: 230 }),
-                    Print(format!("{:<width$}", visible_find, width = field_width)),
-                    SetBackgroundColor(Color::Rgb { r: 40, g: 40, b: 45 }),
                 )?;
+                
+                // Write the field content with selection highlighting
+                write!(stdout, "{}", visible_find)?;
+                
+                // Pad to field width
+                let visible_len = self.visible_length(&visible_find);
+                for _ in visible_len..field_width {
+                    write!(stdout, " ")?;
+                }
+                
+                execute!(stdout, SetBackgroundColor(Color::Rgb { r: 40, g: 40, b: 45 }))?;
                 
                 // Match counter
                 if !counter_str.is_empty() {
@@ -197,8 +256,12 @@ impl FindReplace {
                 )?;
                 
                 // Replace input field
-                let visible_replace = self.get_visible_text(&self.replace_text, field_width,
-                    if self.active_field == Field::Replace { self.cursor_pos } else { 0 });
+                let visible_replace = self.get_visible_text_with_selection(
+                    &self.replace_text, 
+                    field_width,
+                    if self.active_field == Field::Replace { self.cursor_pos } else { 0 },
+                    if self.active_field == Field::Replace { self.get_selection() } else { None }
+                );
                 
                 execute!(
                     stdout,
@@ -208,13 +271,24 @@ impl FindReplace {
                         Color::Rgb { r: 30, g: 30, b: 35 }
                     }),
                     SetForegroundColor(Color::Rgb { r: 220, g: 220, b: 230 }),
-                    Print(format!("{:<width$}", visible_replace, width = field_width)),
+                )?;
+                
+                // Write the field content with selection highlighting
+                write!(stdout, "{}", visible_replace)?;
+                
+                // Pad to field width
+                let visible_len = self.visible_length(&visible_replace);
+                for _ in visible_len..field_width {
+                    write!(stdout, " ")?;
+                }
+                
+                execute!(
+                    stdout,
                     SetBackgroundColor(Color::Rgb { r: 40, g: 40, b: 45 }),
                     SetForegroundColor(Color::Rgb { r: 200, g: 200, b: 205 }),
                 )?;
                 
                 // Fill rest of line
-                let actual_counter_len = counter_str.len();
                 let used = 2 + 6 + field_width + actual_counter_len + 2 + 9 + field_width;
                 // Make sure we don't overflow
                 if used < width as usize - 1 {
@@ -235,35 +309,34 @@ impl FindReplace {
         }
         
         // Position cursor in active field
-        // Recalculate counter string length for cursor positioning
-        let counter_len = if self.total_matches > 0 || !self.find_text.is_empty() {
-            if self.total_matches > 0 {
-                format!(" [{}/{}]", self.current_match + 1, self.total_matches).len()
-            } else {
-                7 // " [0/0]"
-            }
+        // Use the same counter length and field width that we calculated for drawing
+        
+        // Calculate the actual cursor display position within the visible field
+        let (active_text, active_cursor) = if self.active_field == Field::Find {
+            (&self.find_text, self.cursor_pos)
+        } else {
+            (&self.replace_text, self.cursor_pos)
+        };
+        
+        // Calculate scrolling offset for the field
+        let scroll_offset = if active_text.len() <= field_width {
+            0
+        } else if active_cursor > field_width - 1 {
+            active_cursor - (field_width - 1)
         } else {
             0
         };
         
-        // Calculate field widths again for cursor positioning
-        let total_width = width as usize - 4;
-        let available_for_fields = total_width.saturating_sub(6 + 9 + counter_len + 4);
-        let field_width = available_for_fields / 2;
-        
-        let cursor_display_pos = if (self.active_field == Field::Find && self.cursor_pos > field_width - 1) ||
-                                    (self.active_field == Field::Replace && self.cursor_pos > field_width - 1) {
-            field_width - 1
-        } else {
-            self.cursor_pos
-        };
+        // The cursor's visual position within the field
+        let cursor_display_pos = active_cursor.saturating_sub(scroll_offset);
         
         let cursor_x = if self.active_field == Field::Find {
             2 + 6 + cursor_display_pos // "│ " + "Find: "
         } else {
-            2 + 6 + field_width + counter_len + 2 + 9 + cursor_display_pos // All the way to Replace field
+            2 + 6 + field_width + actual_counter_len + 2 + 9 + cursor_display_pos // All the way to Replace field
         };
         
+        // Just position the cursor, don't change style
         execute!(
             stdout,
             MoveTo(cursor_x as u16, (window_y + 1) as u16),  // Both fields are on line 1
@@ -288,12 +361,70 @@ impl FindReplace {
         }
     }
     
+    /// Get visible portion of text with selection highlighting
+    fn get_visible_text_with_selection(&self, text: &str, width: usize, cursor: usize, selection: Option<(usize, usize)>) -> String {
+        let visible = self.get_visible_text(text, width, cursor);
+        
+        // Calculate offset for visible portion
+        let offset = if text.len() <= width {
+            0
+        } else if cursor > width - 1 {
+            cursor - (width - 1)
+        } else {
+            0
+        };
+        
+        // Apply selection highlighting if needed
+        if let Some((sel_start, sel_end)) = selection {
+            let mut result = String::new();
+            for (i, ch) in visible.chars().enumerate() {
+                let abs_pos = offset + i;
+                if abs_pos >= sel_start && abs_pos < sel_end {
+                    // Selected character - use inverted colors
+                    result.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m");
+                    result.push(ch);
+                    result.push_str("\x1b[0m");
+                    // Restore the field background color
+                    result.push_str("\x1b[48;2;20;20;25m\x1b[38;2;220;220;230m");
+                } else {
+                    result.push(ch);
+                }
+            }
+            result
+        } else {
+            visible
+        }
+    }
+    
+    /// Calculate visible length accounting for ANSI escape sequences
+    fn visible_length(&self, s: &str) -> usize {
+        let mut len = 0;
+        let mut in_escape = false;
+        for ch in s.chars() {
+            if ch == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if ch == 'm' {
+                    in_escape = false;
+                }
+            } else {
+                len += 1;
+            }
+        }
+        len
+    }
+    
     /// Handle keyboard input
     pub fn handle_input(&mut self, key: KeyCode, modifiers: KeyModifiers) -> InputResult {
         match key {
-            KeyCode::Esc => InputResult::Close,
+            KeyCode::Esc => {
+                self.selection_start = None; // Clear selection when closing
+                InputResult::Close
+            }
             
             KeyCode::Tab => {
+                // Clear selection when switching fields
+                self.selection_start = None;
                 // Switch between fields
                 self.active_field = match self.active_field {
                     Field::Find => {
@@ -309,6 +440,8 @@ impl FindReplace {
             }
             
             KeyCode::Enter => {
+                // Clear selection
+                self.selection_start = None;
                 // Enter in find field = find next
                 if self.active_field == Field::Find {
                     InputResult::FindNext
@@ -317,7 +450,112 @@ impl FindReplace {
                 }
             }
             
+            // Handle Ctrl+A (Select All)
+            KeyCode::Char('a') | KeyCode::Char('A') if modifiers.contains(KeyModifiers::CONTROL) => {
+                // Select all text in current field
+                self.selection_start = Some(0);
+                let text = if self.active_field == Field::Find {
+                    &self.find_text
+                } else {
+                    &self.replace_text
+                };
+                self.cursor_pos = text.len();
+                InputResult::Continue
+            }
+            
+            // Handle Ctrl+C (Copy)
+            KeyCode::Char('c') | KeyCode::Char('C') if modifiers.contains(KeyModifiers::CONTROL) => {
+                // Copy selected text or entire field if no selection
+                let text_to_copy = if let Some(selected) = self.get_selected_text() {
+                    selected
+                } else {
+                    // No selection, copy entire field
+                    if self.active_field == Field::Find {
+                        self.find_text.clone()
+                    } else {
+                        self.replace_text.clone()
+                    }
+                };
+                
+                if let Err(e) = self.clipboard.set_text(text_to_copy) {
+                    eprintln!("Failed to copy to clipboard: {}", e);
+                }
+                InputResult::Continue
+            }
+            
+            // Handle Ctrl+X (Cut)
+            KeyCode::Char('x') | KeyCode::Char('X') if modifiers.contains(KeyModifiers::CONTROL) => {
+                // Cut selected text or entire field if no selection
+                let text_to_cut = if let Some(selected) = self.get_selected_text() {
+                    selected
+                } else {
+                    // No selection, cut entire field
+                    let text = if self.active_field == Field::Find {
+                        &mut self.find_text
+                    } else {
+                        &mut self.replace_text
+                    };
+                    let all = text.clone();
+                    text.clear();
+                    self.cursor_pos = 0;
+                    all
+                };
+                
+                if let Err(e) = self.clipboard.set_text(text_to_cut) {
+                    eprintln!("Failed to copy to clipboard: {}", e);
+                } else if self.selection_start.is_some() {
+                    // Delete the selection after copying
+                    self.delete_selection();
+                }
+                
+                if self.active_field == Field::Find {
+                    InputResult::FindTextChanged
+                } else {
+                    InputResult::Continue
+                }
+            }
+            
+            // Handle Ctrl+V (Paste)
+            KeyCode::Char('v') | KeyCode::Char('V') if modifiers.contains(KeyModifiers::CONTROL) => {
+                match self.clipboard.get_text() {
+                    Ok(clipboard_text) => {
+                        // Truncate at first newline for single-line fields
+                        let text_to_paste = clipboard_text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        
+                        // Delete any selected text first
+                        self.delete_selection();
+                        
+                        let text = if self.active_field == Field::Find {
+                            &mut self.find_text
+                        } else {
+                            &mut self.replace_text
+                        };
+                        
+                        // Insert clipboard content at cursor position
+                        text.insert_str(self.cursor_pos, &text_to_paste);
+                        self.cursor_pos += text_to_paste.len();
+                        
+                        if self.active_field == Field::Find {
+                            InputResult::FindTextChanged
+                        } else {
+                            InputResult::Continue
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to paste from clipboard: {}", e);
+                        InputResult::Continue
+                    }
+                }
+            }
+            
             KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                // Delete any selected text first
+                let was_selection = self.delete_selection();
+                
                 let text = if self.active_field == Field::Find {
                     &mut self.find_text
                 } else {
@@ -327,7 +565,7 @@ impl FindReplace {
                 text.insert(self.cursor_pos, c);
                 self.cursor_pos += 1;
                 
-                if self.active_field == Field::Find {
+                if self.active_field == Field::Find || was_selection {
                     InputResult::FindTextChanged
                 } else {
                     InputResult::Continue
@@ -335,47 +573,77 @@ impl FindReplace {
             }
             
             KeyCode::Backspace => {
-                let text = if self.active_field == Field::Find {
-                    &mut self.find_text
-                } else {
-                    &mut self.replace_text
-                };
-                
-                if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
-                    text.remove(self.cursor_pos);
-                    
+                // If there's a selection, delete it
+                if self.delete_selection() {
                     if self.active_field == Field::Find {
                         InputResult::FindTextChanged
                     } else {
                         InputResult::Continue
                     }
                 } else {
-                    InputResult::Continue
+                    // No selection, delete character before cursor
+                    let text = if self.active_field == Field::Find {
+                        &mut self.find_text
+                    } else {
+                        &mut self.replace_text
+                    };
+                    
+                    if self.cursor_pos > 0 {
+                        self.cursor_pos -= 1;
+                        text.remove(self.cursor_pos);
+                        
+                        if self.active_field == Field::Find {
+                            InputResult::FindTextChanged
+                        } else {
+                            InputResult::Continue
+                        }
+                    } else {
+                        InputResult::Continue
+                    }
                 }
             }
             
             KeyCode::Delete => {
-                let text = if self.active_field == Field::Find {
-                    &mut self.find_text
-                } else {
-                    &mut self.replace_text
-                };
-                
-                if self.cursor_pos < text.len() {
-                    text.remove(self.cursor_pos);
-                    
+                // If there's a selection, delete it
+                if self.delete_selection() {
                     if self.active_field == Field::Find {
                         InputResult::FindTextChanged
                     } else {
                         InputResult::Continue
                     }
                 } else {
-                    InputResult::Continue
+                    // No selection, delete character after cursor
+                    let text = if self.active_field == Field::Find {
+                        &mut self.find_text
+                    } else {
+                        &mut self.replace_text
+                    };
+                    
+                    if self.cursor_pos < text.len() {
+                        text.remove(self.cursor_pos);
+                        
+                        if self.active_field == Field::Find {
+                            InputResult::FindTextChanged
+                        } else {
+                            InputResult::Continue
+                        }
+                    } else {
+                        InputResult::Continue
+                    }
                 }
             }
             
             KeyCode::Left => {
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+Left = select left
+                    if self.selection_start.is_none() {
+                        self.selection_start = Some(self.cursor_pos);
+                    }
+                } else {
+                    // Regular Left = clear selection and move
+                    self.selection_start = None;
+                }
+                
                 if self.cursor_pos > 0 {
                     self.cursor_pos -= 1;
                 }
@@ -389,6 +657,16 @@ impl FindReplace {
                     &self.replace_text
                 };
                 
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+Right = select right
+                    if self.selection_start.is_none() {
+                        self.selection_start = Some(self.cursor_pos);
+                    }
+                } else {
+                    // Regular Right = clear selection and move
+                    self.selection_start = None;
+                }
+                
                 if self.cursor_pos < text.len() {
                     self.cursor_pos += 1;
                 }
@@ -396,6 +674,15 @@ impl FindReplace {
             }
             
             KeyCode::Home => {
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+Home = select to beginning
+                    if self.selection_start.is_none() {
+                        self.selection_start = Some(self.cursor_pos);
+                    }
+                } else {
+                    // Regular Home = clear selection and move
+                    self.selection_start = None;
+                }
                 self.cursor_pos = 0;
                 InputResult::Continue
             }
@@ -406,6 +693,16 @@ impl FindReplace {
                 } else {
                     &self.replace_text
                 };
+                
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+End = select to end
+                    if self.selection_start.is_none() {
+                        self.selection_start = Some(self.cursor_pos);
+                    }
+                } else {
+                    // Regular End = clear selection and move
+                    self.selection_start = None;
+                }
                 self.cursor_pos = text.len();
                 InputResult::Continue
             }

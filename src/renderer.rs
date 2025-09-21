@@ -32,6 +32,7 @@ impl Renderer {
         // Set initial cursor style and color
         write!(stdout, "\x1b[2 q")?; // Steady block cursor
         write!(stdout, "\x1b]12;#5F9EA0\x07")?; // Cadet blue - muted professional cyan
+        
         // Alternative professional colors you can try:
         // write!(stdout, "\x1b]12;#708090\x07")?; // Slate grey (very muted)
         // write!(stdout, "\x1b]12;#4682B4\x07")?; // Steel blue (professional)
@@ -43,8 +44,11 @@ impl Renderer {
         // write!(stdout, "\x1b]12;#B0C4DE\x07")?; // Light steel blue (very subtle)
         stdout.flush()?;
         
-        // Initial clear
+        // Set consistent background color regardless of how we're launched
+        // This ensures the same appearance whether launched from terminal or Explorer
+        write!(stdout, "\x1b[48;2;22;22;22m")?; // Dark neutral grey background
         execute!(stdout, Clear(ClearType::All))?;
+        write!(stdout, "\x1b[0m")?; // Reset after clear
         
         let (width, height) = terminal::size()?;
         
@@ -76,14 +80,15 @@ impl Renderer {
     }
     
     pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize) -> io::Result<()> {
-        // Update cursor style based on selection (only if changed)
-        let desired_style = if editor.selection().is_some() {
-            CursorStyle::Underline
-        } else {
-            CursorStyle::Block
-        };
-        
-        if desired_style != self.last_cursor_style {
+        // Update cursor style based on selection - but only if find/replace is closed
+        if bottom_window_height == 0 {
+            let desired_style = if editor.selection().is_some() {
+                CursorStyle::Underline
+            } else {
+                CursorStyle::Block
+            };
+            
+            // Always write the cursor style to ensure it's correct
             match desired_style {
                 CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
                 CursorStyle::Underline => write!(self.stdout, "\x1b[4 q")?,
@@ -114,7 +119,10 @@ impl Renderer {
             self.last_screen = vec![String::new(); height as usize];
             self.last_status.clear();
             self.last_cursor_style = CursorStyle::Block; // Force cursor style refresh on resize
+            // Maintain consistent background on resize
+            write!(self.stdout, "\x1b[48;2;22;22;22m")?; // Dark neutral grey background
             execute!(self.stdout, Clear(ClearType::All))?;
+            write!(self.stdout, "\x1b[0m")?; // Reset after clear
             #[cfg(target_os = "windows")]
             {
                 self.needs_full_redraw = true;
@@ -148,15 +156,19 @@ impl Renderer {
                 // Virtual lines before the buffer - respect horizontal scrolling
                 if viewport_offset.1 == 0 {
                     // Only show the ~ if we're not horizontally scrolled
+                    line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
                     line_content.push('~');
                     for _ in 1..width {
                         line_content.push(' ');
                     }
+                    line_content.push_str("\x1b[0m");
                 } else {
                     // If horizontally scrolled, show all spaces
+                    line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
                     for _ in 0..width {
                         line_content.push(' ');
                     }
+                    line_content.push_str("\x1b[0m");
                 }
             } else {
                 // Map logical line to buffer line (subtract 2 for the virtual lines)
@@ -175,6 +187,8 @@ impl Renderer {
                     
                     // Build line with selection highlighting and proper Unicode width handling
                     let mut formatted_line = String::new();
+                    // Start with the background color for the entire line
+                    formatted_line.push_str("\x1b[48;2;22;22;22m"); // Set line background
                     let mut byte_pos = line_byte_start;
                     let mut display_col = 0;  // Display column position (accounts for wide chars)
                     let mut screen_col = 0;    // Screen column position after horizontal scroll
@@ -211,7 +225,7 @@ impl Renderer {
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[0m"); // Reset
+                                        formatted_line.push_str("\x1b[0m\x1b[48;2;22;22;22m"); // Reset and restore line background
                                     }
                                 }
                                 
@@ -223,7 +237,7 @@ impl Renderer {
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[0m"); // Reset
+                                        formatted_line.push_str("\x1b[0m\x1b[48;2;22;22;22m"); // Reset and restore line background
                                     }
                                 }
                                 
@@ -235,26 +249,31 @@ impl Renderer {
                         display_col += char_width;
                     }
                     
-                    // Pad the rest of the line with spaces
+                    // Pad the rest of the line with spaces (background already set)
                     while screen_col < width as usize {
                         formatted_line.push(' ');
                         screen_col += 1;
                     }
+                    formatted_line.push_str("\x1b[0m"); // Reset at end of line
                     
                     line_content = formatted_line;
                 } else {
                     // Virtual line after the buffer - respect horizontal scrolling
                     if viewport_offset.1 == 0 {
                         // Only show the ~ if we're not horizontally scrolled
+                        line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
                         line_content.push('~');
                         for _ in 1..width {
                             line_content.push(' ');
                         }
+                        line_content.push_str("\x1b[0m");
                     } else {
                         // If horizontally scrolled, show all spaces
+                        line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
                         for _ in 0..width {
                             line_content.push(' ');
                         }
+                        line_content.push_str("\x1b[0m");
                     }
                 }
             }
@@ -287,9 +306,10 @@ impl Renderer {
         let modified_indicator = if editor.is_modified() { "*" } else { "" };
         let file_name = editor.file_name();
         let (line, col) = editor.cursor_position();
+        let total_lines = buffer.len_lines();
         
         let left_status = format!(" {}{} ", file_name, modified_indicator);
-        let right_status = format!(" {}:{} ", line + 1, col + 1);
+        let right_status = format!(" {}/{}:{} ", line + 1, total_lines, col + 1);
         
         let mut status_line = String::with_capacity(width as usize);
         status_line.push_str(&left_status);
@@ -327,28 +347,32 @@ impl Renderer {
         }
         
         // Position cursor - map buffer position to screen position
-        let (cursor_line, cursor_col) = editor.cursor_position();
-        let logical_cursor_line = cursor_line + 2; // Add 2 for virtual lines before buffer
-        
-        if logical_cursor_line >= viewport_offset.0 && 
-           logical_cursor_line < viewport_offset.0 + content_height &&
-           cursor_col >= viewport_offset.1 &&
-           cursor_col < viewport_offset.1 + width as usize {
+        // Only show cursor if there's no bottom window (find/replace is closed)
+        if bottom_window_height == 0 {
+            let (cursor_line, cursor_col) = editor.cursor_position();
+            let logical_cursor_line = cursor_line + 2; // Add 2 for virtual lines before buffer
             
-            let screen_row = logical_cursor_line - viewport_offset.0;
-            let screen_col = cursor_col - viewport_offset.1;
-            
-            #[cfg(target_os = "windows")]
-            write!(self.stdout, "\x1b[{};{}H\x1b[?25h", 
-                screen_row + 1, screen_col + 1)?;
-            
-            #[cfg(not(target_os = "windows"))]
-            execute!(
-                self.stdout,
-                MoveTo(screen_col as u16, screen_row as u16),
-                Show
-            )?;
+            if logical_cursor_line >= viewport_offset.0 && 
+               logical_cursor_line < viewport_offset.0 + content_height &&
+               cursor_col >= viewport_offset.1 &&
+               cursor_col < viewport_offset.1 + width as usize {
+                
+                let screen_row = logical_cursor_line - viewport_offset.0;
+                let screen_col = cursor_col - viewport_offset.1;
+                
+                #[cfg(target_os = "windows")]
+                write!(self.stdout, "\x1b[{};{}H\x1b[?25h", 
+                    screen_row + 1, screen_col + 1)?;
+                
+                #[cfg(not(target_os = "windows"))]
+                execute!(
+                    self.stdout,
+                    MoveTo(screen_col as u16, screen_row as u16),
+                    Show
+                )?;
+            }
         }
+        // If find/replace is open, cursor will be positioned by find_replace.draw()
         
         self.stdout.flush()?;
         Ok(())
@@ -359,7 +383,7 @@ impl Renderer {
         self.last_screen = vec![String::new(); self.last_size.1 as usize];
         self.last_status.clear();
         self.last_title.clear();
-        self.last_cursor_style = CursorStyle::Block; // Reset to force cursor style update
+        // FIX 3: Don't reset cursor style here, let draw_with_bottom_window handle it properly
         #[cfg(target_os = "windows")]
         {
             self.needs_full_redraw = true;
