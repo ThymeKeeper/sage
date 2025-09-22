@@ -165,7 +165,9 @@ impl Renderer {
                 if viewport_offset.1 == 0 {
                     // Only show the ~ if we're not horizontally scrolled
                     line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
+                    line_content.push_str("\x1b[38;2;110;110;110m"); // Dim grey like comments
                     line_content.push('~');
+                    line_content.push_str("\x1b[39m"); // Reset foreground color
                     for _ in 1..width {
                         line_content.push(' ');
                     }
@@ -324,7 +326,9 @@ impl Renderer {
                     if viewport_offset.1 == 0 {
                         // Only show the ~ if we're not horizontally scrolled
                         line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
+                        line_content.push_str("\x1b[38;2;110;110;110m"); // Dim grey like comments
                         line_content.push('~');
+                        line_content.push_str("\x1b[39m"); // Reset foreground color
                         for _ in 1..width {
                             line_content.push(' ');
                         }
@@ -371,7 +375,14 @@ impl Renderer {
         let total_lines = buffer.len_lines();
         
         let left_status = format!(" {}{} ", file_name, modified_indicator);
-        let right_status = format!(" {}/{}:{} ", line + 1, total_lines, col + 1);
+        
+        // Format the right status with fixed-width column field (4 chars)
+        // This prevents the row/total from jumping around when column changes
+        let right_status = format!(" {}/{}  {:>4} ", 
+            line + 1, 
+            total_lines, 
+            col + 1
+        );
         
         let mut status_line = String::with_capacity(width as usize);
         status_line.push_str(&left_status);
