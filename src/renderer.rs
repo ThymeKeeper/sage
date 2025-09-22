@@ -376,11 +376,12 @@ impl Renderer {
         
         let left_status = format!(" {}{} ", file_name, modified_indicator);
         
-        // Format the right status with fixed-width column field (4 chars)
-        // This prevents the row/total from jumping around when column changes
-        let right_status = format!(" {}/{}  {:>4} ", 
-            line + 1, 
-            total_lines, 
+        // Format the right status with fixed-width fields
+        // Right-align the entire row/total as one unit (19 chars) and column (4 chars)
+        // This accommodates up to 999,999,999 lines (9 digits + "/" + 9 digits)
+        let row_info = format!("{}/{}", line + 1, total_lines);
+        let right_status = format!(" {:>19}  {:>4} ", 
+            row_info, 
             col + 1
         );
         
