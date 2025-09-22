@@ -1032,6 +1032,11 @@ impl Editor {
     
     /// Get cursor position as (line, display_column)
     /// The column value accounts for Unicode character widths
+    /// Check if syntax highlighting has pending work
+    pub fn has_syntax_work(&self) -> bool {
+        self.syntax.has_dirty_lines()
+    }
+    
     /// Process syntax highlighting updates
     pub fn update_syntax_highlighting(&mut self) {
         // Update viewport for large files

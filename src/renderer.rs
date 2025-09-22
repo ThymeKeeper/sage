@@ -138,7 +138,10 @@ impl Renderer {
         // Update viewport for large files
         let viewport_height = content_height;
         editor.update_syntax_viewport(viewport_height);
-        editor.update_syntax_highlighting();
+        // Only update syntax highlighting if we have work to do
+        if editor.has_syntax_work() {
+            editor.update_syntax_highlighting();
+        }
         
         // Now get all the data we need with immutable borrows
         let viewport_offset = editor.viewport_offset();

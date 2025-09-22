@@ -134,6 +134,11 @@ impl SyntaxHighlighter {
         }
     }
     
+    /// Check if there are any dirty lines to process
+    pub fn has_dirty_lines(&self) -> bool {
+        !self.dirty_lines.is_empty()
+    }
+    
     /// Mark a range of lines as dirty
     pub fn mark_range_dirty(&mut self, start: usize, end: usize) {
         for line in start..=end {
@@ -344,6 +349,11 @@ impl SyntaxHighlighter {
     
     /// Process all dirty lines
     pub fn process_dirty_lines(&mut self, get_line: impl Fn(usize) -> Option<String>) {
+        // Early exit if no dirty lines
+        if self.dirty_lines.is_empty() {
+            return;
+        }
+        
         // In viewport mode, only process lines within the buffer zone
         let process_limit = if self.viewport_mode { 100 } else { usize::MAX };
         let mut processed = 0;
@@ -380,9 +390,14 @@ impl SyntaxHighlighter {
     
     /// Called when lines are inserted
     pub fn lines_inserted(&mut self, at_line: usize, count: usize) {
+        // Ensure we have enough line states before the insertion point
+        while self.line_states.len() < at_line {
+            self.line_states.push(LineState::new());
+        }
+        
         // Insert new line states
         for _ in 0..count {
-            self.line_states.insert(at_line, LineState::new());
+            self.line_states.insert(at_line.min(self.line_states.len()), LineState::new());
         }
         
         // Mark the inserted lines and the next line as dirty
