@@ -23,6 +23,8 @@ pub struct Editor {
     click_count: usize,               // Track consecutive clicks (1=single, 2=double, 3=triple)
     preferred_column: Option<usize>,  // Preferred column for vertical movement
     syntax: SyntaxHighlighter,       // Syntax highlighting state
+    read_only: bool,                  // Whether the file is read-only
+    pub status_message: Option<(String, bool)>, // Status bar message (text, is_error)
 }
 
 impl Editor {
@@ -100,6 +102,8 @@ impl Editor {
             click_count: 0,
             preferred_column: None,
             syntax: SyntaxHighlighter::new(),
+            read_only: false,
+            status_message: None,
         }
     }
     
@@ -116,6 +120,9 @@ impl Editor {
         self.last_saved_undo_len = 0;
         self.mouse_selecting = false;
         self.preferred_column = None;
+        
+        // Check if file is read-only
+        self.read_only = self.is_file_read_only(path);
         
         // Initialize syntax highlighting
         self.syntax = SyntaxHighlighter::new();
@@ -137,28 +144,73 @@ impl Editor {
         Ok(())
     }
     
+    fn is_file_read_only(&self, path: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        
+        if let Ok(metadata) = fs::metadata(path) {
+            let permissions = metadata.permissions();
+            // Check if file is read-only
+            permissions.readonly() || (permissions.mode() & 0o200) == 0
+        } else {
+            false // If we can't get metadata, assume it's writable (will fail on save anyway)
+        }
+    }
+    
     pub fn save(&mut self) -> io::Result<()> {
+        if self.read_only {
+            self.status_message = Some(("Cannot save: File is read-only".to_string(), true));
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "File is read-only"));
+        }
+        
         if let Some(ref path) = self.file_path {
-            fs::write(path, self.buffer.to_string())?;
-            self.modified = false;
-            self.last_saved_undo_len = 0; // Reset save point
-            Ok(())
+            // Create parent directories if they don't exist
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::write(path, self.buffer.to_string()) {
+                Ok(_) => {
+                    self.modified = false;
+                    self.last_saved_undo_len = 0; // Reset save point
+                    self.status_message = None; // Clear any error messages
+                    Ok(())
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Save failed: {}", e), true));
+                    Err(e)
+                }
+            }
         } else {
             Err(io::Error::new(io::ErrorKind::Other, "No file path set"))
         }
     }
     
     pub fn save_as(&mut self, path: PathBuf) -> io::Result<()> {
+        // Check if the new path would be read-only
+        let new_read_only = self.is_file_read_only(path.to_str().unwrap_or(""));
+        if new_read_only {
+            self.status_message = Some(("Cannot save: Target location is read-only".to_string(), true));
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Target location is read-only"));
+        }
+        
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         
-        fs::write(&path, self.buffer.to_string())?;
-        self.file_path = Some(path);
-        self.modified = false;
-        self.last_saved_undo_len = 0; // Reset save point
-        Ok(())
+        match fs::write(&path, self.buffer.to_string()) {
+            Ok(_) => {
+                self.file_path = Some(path.clone());
+                self.modified = false;
+                self.last_saved_undo_len = 0; // Reset save point
+                self.read_only = new_read_only;
+                self.status_message = None; // Clear any error messages
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = Some((format!("Save as failed: {}", e), true));
+                Err(e)
+            }
+        }
     }
     
     /// Get the current selection as (start, end) byte positions
@@ -196,6 +248,15 @@ impl Editor {
     pub fn execute(&mut self, cmd: Command) -> io::Result<()> {
         // Clear mouse selection mode on any keyboard input
         self.mouse_selecting = false;
+        
+        // Clear error messages on any input (except for save commands)
+        if !matches!(cmd, Command::Save | Command::SaveAs) && self.status_message.is_some() {
+            if let Some((_, is_error)) = self.status_message {
+                if is_error {
+                    self.status_message = None;
+                }
+            }
+        }
         
         // Track if cursor moved to update viewport
         let mut cursor_moved = false;
@@ -931,6 +992,10 @@ impl Editor {
         self.modified
     }
     
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+    
     pub fn file_path(&self) -> Option<&Path> {
         self.file_path.as_deref()
     }
@@ -941,6 +1006,10 @@ impl Editor {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("[No Name]")
+    }
+    
+    pub fn set_file_path(&mut self, path: &str) {
+        self.file_path = Some(PathBuf::from(path));
     }
     
     /// Get the current file path or the current directory for Save As prompt
@@ -1464,5 +1533,10 @@ impl Editor {
             // Scrolling left (viewport moves left, content moves right)
             self.viewport_offset.1 = self.viewport_offset.1.saturating_sub((-cols) as usize);
         }
+    }
+    
+    /// Clear the status message
+    pub fn clear_status_message(&mut self) {
+        self.status_message = None;
     }
 }

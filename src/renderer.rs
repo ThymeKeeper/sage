@@ -373,11 +373,24 @@ impl Renderer {
         // Build status line - position it above any bottom window
         let status_row = (height - 1 - bottom_window_height as u16) as usize;
         let modified_indicator = if editor.is_modified() { "*" } else { "" };
+        let read_only_indicator = if editor.is_read_only() { " [RO]" } else { "" };
         let file_name = editor.file_name();
         let (line, col) = editor.cursor_position();
         let total_lines = buffer.len_lines();
         
-        let left_status = format!(" {}{} ", file_name, modified_indicator);
+        // Check for status messages (errors)
+        let (status_msg, is_error) = if let Some((msg, is_err)) = &editor.status_message {
+            (msg.as_str(), *is_err)
+        } else {
+            ("", false)
+        };
+        
+        let left_status = if !status_msg.is_empty() {
+            // Show error message instead of filename
+            format!(" {} ", status_msg)
+        } else {
+            format!(" {}{}{} ", file_name, modified_indicator, read_only_indicator)
+        };
         
         // Format the right status with fixed-width fields
         // Right-align the entire row/total as one unit (19 chars) and column (4 chars)
@@ -400,9 +413,17 @@ impl Renderer {
         #[cfg(target_os = "windows")]
         {
             if self.needs_full_redraw || status_line != self.last_status {
-                write!(self.stdout, 
-                    "\x1b[{};1H\x1b[48;5;238m\x1b[38;5;15m{}\x1b[0m", 
-                    height, status_line)?;
+                if is_error {
+                    // Red background for errors
+                    write!(self.stdout, 
+                        "\x1b[{};1H\x1b[48;5;196m\x1b[38;5;15m{}\x1b[0m", 
+                        height, status_line)?;
+                } else {
+                    // Normal dark grey background
+                    write!(self.stdout, 
+                        "\x1b[{};1H\x1b[48;5;238m\x1b[38;5;15m{}\x1b[0m", 
+                        height, status_line)?;
+                }
                 self.last_status = status_line;
             }
             self.needs_full_redraw = false;
@@ -411,14 +432,27 @@ impl Renderer {
         #[cfg(not(target_os = "windows"))]
         {
             if status_line != self.last_status {
-                execute!(
-                    self.stdout,
-                    MoveTo(0, status_row as u16),
-                    crossterm::style::SetBackgroundColor(crossterm::style::Color::DarkGrey),
-                    crossterm::style::SetForegroundColor(crossterm::style::Color::White),
-                    crossterm::style::Print(&status_line),
-                    crossterm::style::ResetColor
-                )?;
+                if is_error {
+                    // Red background for errors
+                    execute!(
+                        self.stdout,
+                        MoveTo(0, status_row as u16),
+                        crossterm::style::SetBackgroundColor(crossterm::style::Color::Red),
+                        crossterm::style::SetForegroundColor(crossterm::style::Color::White),
+                        crossterm::style::Print(&status_line),
+                        crossterm::style::ResetColor
+                    )?;
+                } else {
+                    // Normal dark grey background
+                    execute!(
+                        self.stdout,
+                        MoveTo(0, status_row as u16),
+                        crossterm::style::SetBackgroundColor(crossterm::style::Color::DarkGrey),
+                        crossterm::style::SetForegroundColor(crossterm::style::Color::White),
+                        crossterm::style::Print(&status_line),
+                        crossterm::style::ResetColor
+                    )?;
+                }
                 self.last_status = status_line;
             }
         }

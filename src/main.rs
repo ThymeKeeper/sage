@@ -15,8 +15,75 @@ use crossterm::{
 use std::io;
 
 fn main() -> io::Result<()> {
-    // Setup terminal
-    enable_raw_mode()?;
+    // Check if we're running in a terminal
+    if let Err(_) = enable_raw_mode() {
+        // No terminal available - relaunch in a terminal emulator
+        let args: Vec<String> = std::env::args().collect();
+        let program_path = &args[0];
+        let file_args: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+        
+        // Build full command with all arguments
+        let mut full_command = vec![program_path.as_str()];
+        full_command.extend(&file_args);
+        
+        // Method 1: Check environment variable
+        if let Ok(terminal) = std::env::var("TERMINAL") {
+            if launch_in_terminal(&terminal, &full_command) {
+                return Ok(());
+            }
+        }
+        
+        // Method 2: Check Cinnamon desktop settings (Linux Mint)
+        if let Ok(output) = std::process::Command::new("gsettings")
+            .args(&["get", "org.cinnamon.desktop.default-applications.terminal", "exec"])
+            .output() 
+        {
+            if output.status.success() {
+                let terminal = String::from_utf8_lossy(&output.stdout).trim().trim_matches('\'').to_string();
+                if !terminal.is_empty() && launch_in_terminal(&terminal, &full_command) {
+                    return Ok(());
+                }
+            }
+        }
+        
+        // Method 3: Check GNOME desktop settings
+        if let Ok(output) = std::process::Command::new("gsettings")
+            .args(&["get", "org.gnome.desktop.default-applications.terminal", "exec"])
+            .output() 
+        {
+            if output.status.success() {
+                let terminal = String::from_utf8_lossy(&output.stdout).trim().trim_matches('\'').to_string();
+                if !terminal.is_empty() && terminal != "x-terminal-emulator" {
+                    if launch_in_terminal(&terminal, &full_command) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        
+        // Method 4: Use x-terminal-emulator (Debian/Ubuntu standard)
+        if launch_in_terminal("x-terminal-emulator", &full_command) {
+            return Ok(());
+        }
+        
+        // Method 5: Try sensible-terminal
+        if launch_in_terminal("sensible-terminal", &full_command) {
+            return Ok(());
+        }
+        
+        // Method 6: Fallback to common terminal emulators
+        let fallback_terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm", "mate-terminal", "alacritty", "kitty", "terminator"];
+        for terminal in &fallback_terminals {
+            if launch_in_terminal(terminal, &full_command) {
+                return Ok(());
+            }
+        }
+        
+        eprintln!("Error: Not running in a terminal and no terminal emulator found");
+        return Err(io::Error::new(io::ErrorKind::Other, "No terminal available"));
+    }
+    
+    // If we get here, we're in a terminal - continue with normal setup
     
     // Enable mouse support
     execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
@@ -29,8 +96,15 @@ fn main() -> io::Result<()> {
     
     // Load file if provided
     if let Some(path) = std::env::args().nth(1) {
-        if let Err(e) = editor.load_file(&path) {
-            eprintln!("Failed to load file: {}", e);
+        match editor.load_file(&path) {
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist - create new file with this path
+                editor.set_file_path(&path);
+            },
+            Err(e) => {
+                eprintln!("Failed to load file: {}", e);
+            }
         }
     }
     
@@ -51,6 +125,55 @@ fn main() -> io::Result<()> {
     }
     
     Ok(())
+}
+
+fn launch_in_terminal(terminal: &str, command: &[&str]) -> bool {
+    // First check if the terminal exists
+    if let Ok(output) = std::process::Command::new("which").arg(terminal).output() {
+        if !output.status.success() {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    
+    // Different terminals have different command line formats
+    let result = match terminal {
+        // Terminals that use -- to separate their args from the command
+        "gnome-terminal" | "mate-terminal" | "tilix" => {
+            let mut args = vec!["--"];
+            args.extend_from_slice(command);
+            std::process::Command::new(terminal).args(&args).spawn()
+        },
+        // Terminals that use -e for execute
+        "xterm" | "konsole" | "xfce4-terminal" | "lxterminal" | "sakura" | "roxterm" => {
+            let mut args = vec!["-e"];
+            args.extend_from_slice(command);
+            std::process::Command::new(terminal).args(&args).spawn()
+        },
+        // Terminals that take the command directly
+        "alacritty" | "kitty" | "foot" => {
+            std::process::Command::new(terminal).args(command).spawn()
+        },
+        // Terminator uses -x
+        "terminator" => {
+            let mut args = vec!["-x"];
+            args.extend_from_slice(command);
+            std::process::Command::new(terminal).args(&args).spawn()
+        },
+        // For x-terminal-emulator and sensible-terminal, try -e format
+        "x-terminal-emulator" | "sensible-terminal" => {
+            let mut args = vec!["-e"];
+            args.extend_from_slice(command);
+            std::process::Command::new(terminal).args(&args).spawn()
+        },
+        // Default: try direct command
+        _ => {
+            std::process::Command::new(terminal).args(command).spawn()
+        }
+    };
+    
+    result.is_ok()
 }
 
 fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
@@ -339,8 +462,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                         let mut prompt = prompt::Prompt::new("Save As", &initial_path);
                                         
                                         if let Some(path) = prompt.run(&mut io::stdout())? {
-                                            if let Err(e) = editor.save_as(path) {
-                                                eprintln!("Failed to save file: {}", e);
+                                            if editor.save_as(path).is_err() {
                                                 // Clear and redraw
                                                 execute!(io::stdout(), 
                                                     crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
@@ -364,8 +486,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                         }
                                     } else {
                                         // Normal save
-                                        if let Err(e) = editor.save() {
-                                            eprintln!("Failed to save file: {}", e);
+                                        if editor.save().is_err() {
                                             renderer.draw(editor)?;
                                             continue; // Don't exit if save failed
                                         } else {
@@ -524,16 +645,14 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             
                             // Process the result
                             if let Some(path) = result {
-                                if let Err(e) = editor.save_as(path) {
-                                    eprintln!("Failed to save file: {}", e);
-                                }
+                                let _ = editor.save_as(path);
                             }
                             
                             // Redraw the editor
                             renderer.draw(editor)?;
                         } else {
                             // Normal save
-                            editor.execute(cmd)?;
+                            let _ = editor.execute(cmd);
                         }
                     }
                     commands::Command::SaveAs => {
@@ -555,9 +674,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         
                         // Process the result
                         if let Some(path) = result {
-                            if let Err(e) = editor.save_as(path) {
-                                eprintln!("Failed to save file: {}", e);
-                            }
+                            let _ = editor.save_as(path);
                         }
                         
                         // Redraw the editor
