@@ -8,7 +8,7 @@ mod exit_prompt;
 mod syntax;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
+    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton, EnableBracketedPaste, DisableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
@@ -20,6 +20,9 @@ fn main() -> io::Result<()> {
     
     // Enable mouse support
     execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+    
+    // Enable bracketed paste mode
+    execute!(io::stdout(), event::EnableBracketedPaste)?;
     
     let mut editor = editor::Editor::new();
     let mut renderer = renderer::Renderer::new()?;
@@ -40,6 +43,7 @@ fn main() -> io::Result<()> {
     // Cleanup
     renderer.cleanup()?;
     execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
+    execute!(io::stdout(), event::DisableBracketedPaste)?;
     disable_raw_mode()?;
     
     if let Err(e) = result {
@@ -177,6 +181,11 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                 }
+            }
+            Event::Paste(text) => {
+                // Handle bracketed paste - insert the entire text at once without triggering auto-indent
+                editor.paste_text(text);
+                needs_redraw = true;
             }
             Event::Key(key) => {
                 // Windows: ignore key release events

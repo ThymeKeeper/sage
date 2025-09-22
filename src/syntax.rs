@@ -230,6 +230,9 @@ impl SyntaxHighlighter {
                         span_start = current_pos;
                         current_state = SyntaxState::StringDouble;
                         current_pos += 1;
+                    // TODO: Enable single-quote string detection for programming languages
+                    // For plain text, apostrophes are common and shouldn't be treated as strings
+                    /*
                     } else if bytes[current_pos] == b'\'' {
                         // Start single-quoted string
                         if current_pos > span_start {
@@ -242,6 +245,7 @@ impl SyntaxHighlighter {
                         span_start = current_pos;
                         current_state = SyntaxState::StringSingle;
                         current_pos += 1;
+                    */
                     } else {
                         current_pos += 1;
                     }
@@ -267,7 +271,13 @@ impl SyntaxHighlighter {
                     }
                 }
                 
+                // TODO: Re-enable when we add language detection
                 SyntaxState::StringSingle => {
+                    // This state should never be reached with single quotes disabled
+                    // but we'll handle it gracefully just in case
+                    current_pos += 1;
+                    
+                    /* Original single-quote string handling for future use:
                     // Look for end of single-quoted string (handling escapes)
                     if bytes[current_pos] == b'\\' && current_pos + 1 < bytes.len() {
                         // Skip escaped character
@@ -285,6 +295,7 @@ impl SyntaxHighlighter {
                     } else {
                         current_pos += 1;
                     }
+                    */
                 }
                 
                 SyntaxState::LineComment => {

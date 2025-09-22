@@ -1037,6 +1037,30 @@ impl Editor {
         self.syntax.has_dirty_lines()
     }
     
+    /// Direct paste method for bracketed paste support
+    pub fn paste_text(&mut self, text: String) {
+        // Delete selection first if any
+        self.delete_selection();
+        
+        // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
+        let text = Self::normalize_text(text);
+        
+        let line_before = self.buffer.byte_to_line(self.cursor);
+        let cursor_before = self.cursor;
+        self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());
+        self.cursor += text.len();
+        self.modified = true;
+        self.preferred_column = None; // Clear preferred column
+        
+        // Update syntax - check if we added newlines
+        let line_after = self.buffer.byte_to_line(self.cursor);
+        if line_after > line_before {
+            let lines_added = line_after - line_before;
+            self.syntax.lines_inserted(line_before + 1, lines_added);
+        }
+        self.syntax.line_modified(line_before);
+    }
+    
     /// Process syntax highlighting updates
     pub fn update_syntax_highlighting(&mut self) {
         // Update viewport for large files
