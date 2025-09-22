@@ -91,6 +91,18 @@ fn main() -> io::Result<()> {
     // Enable bracketed paste mode
     execute!(io::stdout(), event::EnableBracketedPaste)?;
     
+    // Enable enhanced keyboard protocol for better key combination support (especially in Kitty)
+    if let Ok(_) = execute!(
+        io::stdout(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    ) {
+        // Enhanced keyboard mode enabled successfully
+    }
+    
     let mut editor = editor::Editor::new();
     let mut renderer = renderer::Renderer::new()?;
     
@@ -118,6 +130,8 @@ fn main() -> io::Result<()> {
     renderer.cleanup()?;
     execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
     execute!(io::stdout(), event::DisableBracketedPaste)?;
+    // Disable enhanced keyboard protocol
+    let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     
     if let Err(e) = result {
@@ -431,6 +445,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     continue; // Skip normal command processing
                 }
                 
+                
                 let cmd = match key.code {
                     // Quit
                     KeyCode::Char('q') | KeyCode::Char('Q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -620,6 +635,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     
                     _ => commands::Command::None,
                 };
+                
                 
                 // Handle commands that need special UI interaction
                 match cmd {
