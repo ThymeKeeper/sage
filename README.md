@@ -40,6 +40,11 @@ thyme is a terminal-based text editor written in Rust. It's the editor you use w
 - Filters out zero-width and invisible Unicode characters
 - Handles various text encodings gracefully
 
+### Smart Editing
+- Auto-indentation: new lines inherit indentation from the previous line
+- Tab with selection: indents all selected lines by 4 spaces
+- Shift+Tab: dedents current line or all selected lines by up to 4 spaces
+
 ## Installation
 
 Requires Rust 1.70 or later.
@@ -73,14 +78,16 @@ thyme
 | Undo | Ctrl+Z |
 | Redo | Ctrl+Shift+Z |
 | Find/Replace | Ctrl+F |
-| Find Next | F3 or Ctrl+F (when find is open) |
-| Find Previous | Shift+F3 or Ctrl+Shift+F |
+| Find Next | Ctrl+F (when find is open) |
+| Find Previous | Ctrl+Shift+F |
 | Replace | Ctrl+H |
 | Replace All | Ctrl+Shift+H |
 | Select All | Ctrl+A |
 | Copy | Ctrl+C |
 | Cut | Ctrl+X |
 | Paste | Ctrl+V |
+| Indent | Tab (with selection) |
+| Dedent | Shift+Tab |
 
 ### Selection
 

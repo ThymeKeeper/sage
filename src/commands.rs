@@ -24,6 +24,8 @@ pub enum Command {
     InsertChar(char),
     InsertNewline,
     InsertTab,
+    Indent,    // Indent line(s)
+    Dedent,    // Dedent line(s)
     Backspace,
     Delete,
     

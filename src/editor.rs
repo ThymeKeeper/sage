@@ -20,6 +20,7 @@ pub struct Editor {
     last_click_time: Option<Instant>, // Track time of last click for double/triple click
     last_click_position: Option<usize>, // Track position of last click
     click_count: usize,               // Track consecutive clicks (1=single, 2=double, 3=triple)
+    preferred_column: Option<usize>,  // Preferred column for vertical movement
 }
 
 impl Editor {
@@ -95,6 +96,7 @@ impl Editor {
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
+            preferred_column: None,
         }
     }
     
@@ -110,6 +112,7 @@ impl Editor {
         self.viewport_offset = (0, 0);
         self.last_saved_undo_len = 0;
         self.mouse_selecting = false;
+        self.preferred_column = None;
         Ok(())
     }
     
@@ -211,16 +214,33 @@ impl Editor {
                 self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());
                 self.cursor += text.len();
                 self.modified = true;
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::InsertNewline => {
                 // Delete selection first if any
                 self.delete_selection();
                 
+                // Get the current line to check for indentation
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                let line_text = self.buffer.line(current_line);
+                
+                // Count leading spaces
+                let indent_count = line_text.chars()
+                    .take_while(|&c| c == ' ')
+                    .count();
+                
+                // Create the new line with indentation
+                let mut new_text = String::from("\n");
+                for _ in 0..indent_count {
+                    new_text.push(' ');
+                }
+                
                 let cursor_before = self.cursor;
-                self.buffer.insert(self.cursor, "\n", cursor_before, self.cursor + 1);
-                self.cursor += 1;
+                self.buffer.insert(self.cursor, &new_text, cursor_before, self.cursor + new_text.len());
+                self.cursor += new_text.len();
                 self.modified = true;
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::InsertTab => {
@@ -231,6 +251,7 @@ impl Editor {
                 self.buffer.insert(self.cursor, "    ", cursor_before, self.cursor + 4);
                 self.cursor += 4;
                 self.modified = true;
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::Backspace => {
@@ -252,6 +273,7 @@ impl Editor {
                         }
                     }
                 }
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::Delete => {
@@ -270,6 +292,7 @@ impl Editor {
                         self.modified = true;
                     }
                 }
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::MoveLeft => {
@@ -279,6 +302,7 @@ impl Editor {
                         self.cursor = self.buffer.char_to_byte(char_pos - 1);
                     }
                 }
+                self.preferred_column = None; // Clear preferred column on horizontal movement
             }
             
             Command::MoveRight => {
@@ -286,73 +310,141 @@ impl Editor {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
                     self.cursor = self.buffer.char_to_byte(char_pos + 1);
                 }
+                self.preferred_column = None; // Clear preferred column on horizontal movement
             }
             
             Command::MoveUp => {
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line > 0 {
-                    // Get current display column
-                    let (_, current_display_col) = self.cursor_position();
+                    // Set preferred column if not already set
+                    if self.preferred_column.is_none() {
+                        let (_, col) = self.cursor_position();
+                        self.preferred_column = Some(col);
+                    }
+                    
+                    // Use preferred column as target
+                    let target_display_col = self.preferred_column.unwrap();
                     
                     let new_line = current_line - 1;
                     let new_line_start = self.buffer.line_to_byte(new_line);
                     let new_line_text = self.buffer.line(new_line);
                     
-                    // Find byte position for the same display column in the new line
-                    let mut byte_pos = 0;
+                    // Find the best position on the new line
+                    let mut best_byte_pos = 0;
+                    let mut current_byte_pos = 0;
                     let mut display_col = 0;
                     
                     for ch in new_line_text.chars() {
-                        if display_col >= current_display_col {
-                            break;
+                        if ch == '\n' {
+                            break; // Stop at newline
                         }
+                        
                         let char_width = ch.width().unwrap_or(1);
-                        if display_col + char_width > current_display_col {
-                            // We'd overshoot, stop here
+                        
+                        // If adding this character would overshoot, decide whether to include it
+                        if display_col + char_width > target_display_col {
+                            // Check if we're closer to target by including or excluding this char
+                            let without_char_distance = target_display_col - display_col;
+                            let with_char_distance = (display_col + char_width) - target_display_col;
+                            
+                            if with_char_distance < without_char_distance {
+                                // Include this character
+                                best_byte_pos = current_byte_pos + ch.len_utf8();
+                            } else {
+                                // Exclude this character
+                                best_byte_pos = current_byte_pos;
+                            }
                             break;
                         }
+                        
+                        // Move past this character
+                        current_byte_pos += ch.len_utf8();
                         display_col += char_width;
-                        byte_pos += ch.len_utf8();
+                        best_byte_pos = current_byte_pos;
+                        
+                        // If we've reached exactly the target column, stop
+                        if display_col == target_display_col {
+                            break;
+                        }
                     }
                     
-                    self.cursor = new_line_start + byte_pos;
+                    self.cursor = new_line_start + best_byte_pos;
+                } else {
+                    // Already on first line, move to start of buffer
+                    self.cursor = 0;
+                    self.preferred_column = Some(0); // Reset preferred column at buffer start
                 }
             }
             
             Command::MoveDown => {
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line < self.buffer.len_lines() - 1 {
-                    // Get current display column
-                    let (_, current_display_col) = self.cursor_position();
+                    // Set preferred column if not already set
+                    if self.preferred_column.is_none() {
+                        let (_, col) = self.cursor_position();
+                        self.preferred_column = Some(col);
+                    }
+                    
+                    // Use preferred column as target
+                    let target_display_col = self.preferred_column.unwrap();
                     
                     let new_line = current_line + 1;
                     let new_line_start = self.buffer.line_to_byte(new_line);
                     let new_line_text = self.buffer.line(new_line);
                     
-                    // Find byte position for the same display column in the new line
-                    let mut byte_pos = 0;
+                    // Find the best position on the new line
+                    let mut best_byte_pos = 0;
+                    let mut current_byte_pos = 0;
                     let mut display_col = 0;
                     
                     for ch in new_line_text.chars() {
-                        if display_col >= current_display_col {
-                            break;
+                        if ch == '\n' {
+                            break; // Stop at newline
                         }
+                        
                         let char_width = ch.width().unwrap_or(1);
-                        if display_col + char_width > current_display_col {
-                            // We'd overshoot, stop here
+                        
+                        // If adding this character would overshoot, decide whether to include it
+                        if display_col + char_width > target_display_col {
+                            // Check if we're closer to target by including or excluding this char
+                            let without_char_distance = target_display_col - display_col;
+                            let with_char_distance = (display_col + char_width) - target_display_col;
+                            
+                            if with_char_distance < without_char_distance {
+                                // Include this character
+                                best_byte_pos = current_byte_pos + ch.len_utf8();
+                            } else {
+                                // Exclude this character
+                                best_byte_pos = current_byte_pos;
+                            }
                             break;
                         }
+                        
+                        // Move past this character
+                        current_byte_pos += ch.len_utf8();
                         display_col += char_width;
-                        byte_pos += ch.len_utf8();
+                        best_byte_pos = current_byte_pos;
+                        
+                        // If we've reached exactly the target column, stop
+                        if display_col == target_display_col {
+                            break;
+                        }
                     }
                     
-                    self.cursor = new_line_start + byte_pos;
+                    self.cursor = new_line_start + best_byte_pos;
+                } else {
+                    // Already on last line, move to end of buffer
+                    self.cursor = self.buffer.len_bytes();
+                    // Reset preferred column to end of last line for consistency
+                    let (_, col) = self.cursor_position();
+                    self.preferred_column = Some(col);
                 }
             }
             
             Command::MoveHome => {
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 self.cursor = self.buffer.line_to_byte(current_line);
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::MoveEnd => {
@@ -365,6 +457,7 @@ impl Editor {
                     line.len()
                 };
                 self.cursor = line_start + line_len;
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::PageUp => {
@@ -392,6 +485,7 @@ impl Editor {
                         self.cursor = self.buffer.char_to_byte(char_pos - 1);
                     }
                 }
+                self.preferred_column = None; // Clear on horizontal movement
             }
             
             Command::SelectRight => {
@@ -402,6 +496,7 @@ impl Editor {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
                     self.cursor = self.buffer.char_to_byte(char_pos + 1);
                 }
+                self.preferred_column = None; // Clear on horizontal movement
             }
             
             Command::SelectUp => {
@@ -410,30 +505,63 @@ impl Editor {
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line > 0 {
-                    // Get current display column
-                    let (_, current_display_col) = self.cursor_position();
+                    // Set preferred column if not already set
+                    if self.preferred_column.is_none() {
+                        let (_, col) = self.cursor_position();
+                        self.preferred_column = Some(col);
+                    }
+                    
+                    // Use preferred column as target
+                    let target_display_col = self.preferred_column.unwrap();
                     
                     let new_line = current_line - 1;
                     let new_line_start = self.buffer.line_to_byte(new_line);
                     let new_line_text = self.buffer.line(new_line);
                     
-                    // Find byte position for the same display column in the new line
-                    let mut byte_pos = 0;
+                    // Find the best position on the new line
+                    let mut best_byte_pos = 0;
+                    let mut current_byte_pos = 0;
                     let mut display_col = 0;
                     
                     for ch in new_line_text.chars() {
-                        if display_col >= current_display_col {
-                            break;
+                        if ch == '\n' {
+                            break; // Stop at newline
                         }
+                        
                         let char_width = ch.width().unwrap_or(1);
-                        if display_col + char_width > current_display_col {
+                        
+                        // If adding this character would overshoot, decide whether to include it
+                        if display_col + char_width > target_display_col {
+                            // Check if we're closer to target by including or excluding this char
+                            let without_char_distance = target_display_col - display_col;
+                            let with_char_distance = (display_col + char_width) - target_display_col;
+                            
+                            if with_char_distance < without_char_distance {
+                                // Include this character
+                                best_byte_pos = current_byte_pos + ch.len_utf8();
+                            } else {
+                                // Exclude this character
+                                best_byte_pos = current_byte_pos;
+                            }
                             break;
                         }
+                        
+                        // Move past this character
+                        current_byte_pos += ch.len_utf8();
                         display_col += char_width;
-                        byte_pos += ch.len_utf8();
+                        best_byte_pos = current_byte_pos;
+                        
+                        // If we've reached exactly the target column, stop
+                        if display_col == target_display_col {
+                            break;
+                        }
                     }
                     
-                    self.cursor = new_line_start + byte_pos;
+                    self.cursor = new_line_start + best_byte_pos;
+                } else {
+                    // Already on first line, move to start of buffer
+                    self.cursor = 0;
+                    self.preferred_column = Some(0); // Reset preferred column at buffer start
                 }
             }
             
@@ -443,30 +571,65 @@ impl Editor {
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line < self.buffer.len_lines() - 1 {
-                    // Get current display column
-                    let (_, current_display_col) = self.cursor_position();
+                    // Set preferred column if not already set
+                    if self.preferred_column.is_none() {
+                        let (_, col) = self.cursor_position();
+                        self.preferred_column = Some(col);
+                    }
+                    
+                    // Use preferred column as target
+                    let target_display_col = self.preferred_column.unwrap();
                     
                     let new_line = current_line + 1;
                     let new_line_start = self.buffer.line_to_byte(new_line);
                     let new_line_text = self.buffer.line(new_line);
                     
-                    // Find byte position for the same display column in the new line
-                    let mut byte_pos = 0;
+                    // Find the best position on the new line
+                    let mut best_byte_pos = 0;
+                    let mut current_byte_pos = 0;
                     let mut display_col = 0;
                     
                     for ch in new_line_text.chars() {
-                        if display_col >= current_display_col {
-                            break;
+                        if ch == '\n' {
+                            break; // Stop at newline
                         }
+                        
                         let char_width = ch.width().unwrap_or(1);
-                        if display_col + char_width > current_display_col {
+                        
+                        // If adding this character would overshoot, decide whether to include it
+                        if display_col + char_width > target_display_col {
+                            // Check if we're closer to target by including or excluding this char
+                            let without_char_distance = target_display_col - display_col;
+                            let with_char_distance = (display_col + char_width) - target_display_col;
+                            
+                            if with_char_distance < without_char_distance {
+                                // Include this character
+                                best_byte_pos = current_byte_pos + ch.len_utf8();
+                            } else {
+                                // Exclude this character
+                                best_byte_pos = current_byte_pos;
+                            }
                             break;
                         }
+                        
+                        // Move past this character
+                        current_byte_pos += ch.len_utf8();
                         display_col += char_width;
-                        byte_pos += ch.len_utf8();
+                        best_byte_pos = current_byte_pos;
+                        
+                        // If we've reached exactly the target column, stop
+                        if display_col == target_display_col {
+                            break;
+                        }
                     }
                     
-                    self.cursor = new_line_start + byte_pos;
+                    self.cursor = new_line_start + best_byte_pos;
+                } else {
+                    // Already on last line, move to end of buffer
+                    self.cursor = self.buffer.len_bytes();
+                    // Reset preferred column to end of last line for consistency
+                    let (_, col) = self.cursor_position();
+                    self.preferred_column = Some(col);
                 }
             }
             
@@ -476,6 +639,7 @@ impl Editor {
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 self.cursor = self.buffer.line_to_byte(current_line);
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::SelectEnd => {
@@ -491,11 +655,13 @@ impl Editor {
                     line.len()
                 };
                 self.cursor = line_start + line_len;
+                self.preferred_column = None; // Clear preferred column
             }
             
             Command::SelectAll => {
                 self.selection_start = Some(0);
                 self.cursor = self.buffer.len_bytes();
+                self.preferred_column = None; // Clear preferred column
             }
             
             // Clipboard operations
@@ -530,6 +696,7 @@ impl Editor {
                         self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());
                         self.cursor += text.len();
                         self.modified = true;
+                        self.preferred_column = None; // Clear preferred column
                     }
                     Err(e) => {
                         eprintln!("Failed to paste from clipboard: {}", e);
@@ -568,12 +735,120 @@ impl Editor {
                 return Ok(());
             }
             
+            Command::Indent => {
+                // Get the lines to indent
+                let (start_line, end_line) = if let Some((sel_start, sel_end)) = self.get_selection() {
+                    // Indent all lines in selection
+                    let start = self.buffer.byte_to_line(sel_start);
+                    let end = self.buffer.byte_to_line(sel_end);
+                    (start, end)
+                } else {
+                    // Indent current line only
+                    let line = self.buffer.byte_to_line(self.cursor);
+                    (line, line)
+                };
+                
+                // Track cursor adjustment
+                let mut cursor_adjustment = 0;
+                let mut selection_start_adjustment = 0;
+                
+                // Process each line from last to first to maintain positions
+                for line_num in (start_line..=end_line).rev() {
+                    let line_start = self.buffer.line_to_byte(line_num);
+                    
+                    // Insert 4 spaces at the start of the line
+                    let cursor_before = self.cursor;
+                    self.buffer.insert(line_start, "    ", cursor_before, cursor_before);
+                    
+                    // Track adjustments for cursor and selection
+                    if self.cursor >= line_start {
+                        cursor_adjustment += 4;
+                    }
+                    if let Some(sel_start) = self.selection_start {
+                        if sel_start >= line_start {
+                            selection_start_adjustment += 4;
+                        }
+                    }
+                }
+                
+                // Apply cursor adjustment
+                self.cursor += cursor_adjustment;
+                if let Some(ref mut sel_start) = self.selection_start {
+                    *sel_start += selection_start_adjustment;
+                }
+                
+                self.modified = true;
+            }
+            
+            Command::Dedent => {
+                // Get the lines to dedent
+                let (start_line, end_line) = if let Some((sel_start, sel_end)) = self.get_selection() {
+                    // Dedent all lines in selection
+                    let start = self.buffer.byte_to_line(sel_start);
+                    let end = self.buffer.byte_to_line(sel_end);
+                    (start, end)
+                } else {
+                    // Dedent current line only
+                    let line = self.buffer.byte_to_line(self.cursor);
+                    (line, line)
+                };
+                
+                // Store original positions
+                let original_cursor = self.cursor;
+                let original_selection_start = self.selection_start;
+                
+                // Track total adjustment needed
+                let mut cursor_adjustment = 0;
+                let mut selection_adjustment = 0;
+                
+                // Process lines from last to first so deletions don't affect line positions
+                for line_num in (start_line..=end_line).rev() {
+                    let line_start = self.buffer.line_to_byte(line_num);
+                    let line_text = self.buffer.line(line_num);
+                    
+                    // Count leading spaces (up to 4)
+                    let mut spaces_count = 0;
+                    for ch in line_text.chars().take(4) {
+                        if ch == ' ' {
+                            spaces_count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    if spaces_count > 0 {
+                        // Delete the spaces
+                        self.buffer.delete(line_start, line_start + spaces_count, 
+                                         original_cursor, line_start);
+                        
+                        // Update adjustments if this deletion affects cursor/selection
+                        if line_start < original_cursor {
+                            cursor_adjustment += spaces_count;
+                        }
+                        if let Some(sel) = original_selection_start {
+                            if line_start < sel {
+                                selection_adjustment += spaces_count;
+                            }
+                        }
+                    }
+                }
+                
+                // Apply adjustments
+                self.cursor = original_cursor.saturating_sub(cursor_adjustment);
+                if let Some(sel) = original_selection_start {
+                    self.selection_start = Some(sel.saturating_sub(selection_adjustment));
+                }
+                
+                self.modified = true;
+            }
+            
             Command::None => {}
         }
         
         // Update viewport if cursor moved (but not for pure viewport scrolling)
         if cursor_moved || matches!(cmd, 
             Command::InsertChar(_) | Command::InsertNewline | Command::InsertTab |
+            Command::Indent | Command::Dedent |
             Command::Backspace | Command::Delete | Command::Paste |
             Command::SelectUp | Command::SelectDown | Command::SelectLeft | Command::SelectRight |
             Command::SelectHome | Command::SelectEnd | Command::SelectAll
@@ -663,6 +938,7 @@ impl Editor {
     pub fn move_cursor_to(&mut self, position: usize) {
         self.cursor = position.min(self.buffer.len_bytes());
         self.selection_start = None;
+        self.preferred_column = None; // Clear preferred column
         self.update_viewport_for_cursor();
     }
     
@@ -670,6 +946,7 @@ impl Editor {
     pub fn select_range(&mut self, start: usize, end: usize) {
         self.selection_start = Some(start);
         self.cursor = end;
+        self.preferred_column = None; // Clear preferred column
         self.update_viewport_for_cursor();
     }
     
@@ -877,6 +1154,9 @@ impl Editor {
     pub fn start_mouse_selection(&mut self, position: usize) {
         let now = Instant::now();
         let double_click_time = Duration::from_millis(500);
+        
+        // Clear preferred column on mouse interaction
+        self.preferred_column = None;
         
         // Check for double/triple click
         if let Some(last_time) = self.last_click_time {

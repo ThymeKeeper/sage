@@ -22,10 +22,6 @@ desktop.ini
 .classpath
 
 # Test files
-test_*.txt
-invisible_test*.txt
-test_*.rs
-demo_*.rs
 *.pyc
 __pycache__/
 
@@ -36,6 +32,5 @@ __pycache__/
 *.log
 
 # Compiled binaries
-texteditor
-texteditor.exe
+thyme.exe
 *.pdb

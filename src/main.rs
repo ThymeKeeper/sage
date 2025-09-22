@@ -206,14 +206,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         KeyCode::Char('h') | KeyCode::Char('H') if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
                             Some(commands::Command::ReplaceAll)
                         }
-                        // F3 = find next
-                        KeyCode::F(3) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            Some(commands::Command::FindNext)
-                        }
-                        // Shift+F3 = find previous
-                        KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            Some(commands::Command::FindPrev)
-                        }
+
                         _ => None
                     };
                     
@@ -475,7 +468,22 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     // Editing
                     KeyCode::Char(c) => commands::Command::InsertChar(c),
                     KeyCode::Enter => commands::Command::InsertNewline,
-                    KeyCode::Tab => commands::Command::InsertTab,
+                    KeyCode::Tab => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            // Shift+Tab = dedent
+                            commands::Command::Dedent
+                        } else if editor.selection().is_some() {
+                            // Tab with selection = indent all selected lines
+                            commands::Command::Indent
+                        } else {
+                            // Tab without selection = insert 4 spaces
+                            commands::Command::InsertTab
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        // Some terminals send BackTab for Shift+Tab
+                        commands::Command::Dedent
+                    }
                     KeyCode::Backspace => commands::Command::Backspace,
                     KeyCode::Delete => commands::Command::Delete,
                     
