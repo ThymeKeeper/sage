@@ -1,5 +1,6 @@
 use crate::buffer::Buffer;
 use crate::commands::Command;
+use crate::syntax::SyntaxHighlighter;
 use arboard::Clipboard;
 use std::fs;
 use std::io;
@@ -21,6 +22,7 @@ pub struct Editor {
     last_click_position: Option<usize>, // Track position of last click
     click_count: usize,               // Track consecutive clicks (1=single, 2=double, 3=triple)
     preferred_column: Option<usize>,  // Preferred column for vertical movement
+    syntax: SyntaxHighlighter,       // Syntax highlighting state
 }
 
 impl Editor {
@@ -97,6 +99,7 @@ impl Editor {
             last_click_position: None,
             click_count: 0,
             preferred_column: None,
+            syntax: SyntaxHighlighter::new(),
         }
     }
     
@@ -113,6 +116,24 @@ impl Editor {
         self.last_saved_undo_len = 0;
         self.mouse_selecting = false;
         self.preferred_column = None;
+        
+        // Initialize syntax highlighting
+        self.syntax = SyntaxHighlighter::new();
+        let line_count = self.buffer.len_lines();
+        
+        // For large files, use viewport mode; otherwise init all lines
+        if line_count <= 50_000 {
+            self.syntax.init_all_lines(line_count);
+            self.syntax.process_dirty_lines(|line_index| {
+                if line_index < self.buffer.len_lines() {
+                    Some(self.buffer.line(line_index).to_string())
+                } else {
+                    None
+                }
+            });
+        }
+        // Large files will initialize viewport on first render
+        
         Ok(())
     }
     
@@ -215,6 +236,10 @@ impl Editor {
                 self.cursor += text.len();
                 self.modified = true;
                 self.preferred_column = None; // Clear preferred column
+                
+                // Update syntax highlighting for the modified line
+                let line = self.buffer.byte_to_line(self.cursor);
+                self.syntax.line_modified(line);
             }
             
             Command::InsertNewline => {
@@ -241,6 +266,9 @@ impl Editor {
                 self.cursor += new_text.len();
                 self.modified = true;
                 self.preferred_column = None; // Clear preferred column
+                
+                // Update syntax highlighting - line was inserted
+                self.syntax.lines_inserted(current_line + 1, 1);
             }
             
             Command::InsertTab => {
@@ -260,6 +288,7 @@ impl Editor {
                     // Otherwise delete character before cursor
                     if self.cursor > 0 {
                         let cursor_before = self.cursor;
+                        let line_before = self.buffer.byte_to_line(self.cursor);
                         
                         // Find the previous character boundary
                         let char_pos = self.buffer.byte_to_char(self.cursor);
@@ -270,6 +299,14 @@ impl Editor {
                             self.buffer.delete(prev_byte, self.cursor, cursor_before, prev_byte);
                             self.cursor = prev_byte;
                             self.modified = true;
+                            
+                            // Update syntax - check if we deleted a newline (merged lines)
+                            let line_after = self.buffer.byte_to_line(self.cursor);
+                            if line_before != line_after {
+                                // Lines were merged
+                                self.syntax.lines_deleted(line_after, 1);
+                            }
+                            self.syntax.line_modified(line_after);
                         }
                     }
                 }
@@ -692,11 +729,20 @@ impl Editor {
                         // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
                         let text = Self::normalize_text(text);
                         
+                        let line_before = self.buffer.byte_to_line(self.cursor);
                         let cursor_before = self.cursor;
                         self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());
                         self.cursor += text.len();
                         self.modified = true;
                         self.preferred_column = None; // Clear preferred column
+                        
+                        // Update syntax - check if we added newlines
+                        let line_after = self.buffer.byte_to_line(self.cursor);
+                        if line_after > line_before {
+                            let lines_added = line_after - line_before;
+                            self.syntax.lines_inserted(line_before + 1, lines_added);
+                        }
+                        self.syntax.line_modified(line_before);
                     }
                     Err(e) => {
                         eprintln!("Failed to paste from clipboard: {}", e);
@@ -986,6 +1032,47 @@ impl Editor {
     
     /// Get cursor position as (line, display_column)
     /// The column value accounts for Unicode character widths
+    /// Process syntax highlighting updates
+    pub fn update_syntax_highlighting(&mut self) {
+        // Update viewport for large files
+        let line_count = self.buffer.len_lines();
+        if line_count > 50_000 {
+            // Calculate current viewport from cursor position
+            let (cursor_line, _) = self.cursor_position();
+            let viewport_height = 50; // Approximate visible lines
+            let viewport_start = self.viewport_offset.0;
+            let viewport_end = viewport_start + viewport_height;
+            
+            // Set viewport for syntax highlighter
+            self.syntax.set_viewport(viewport_start, viewport_end, line_count);
+        }
+        
+        // Process any pending dirty lines
+        self.syntax.process_dirty_lines(|line_index| {
+            if line_index < self.buffer.len_lines() {
+                Some(self.buffer.line(line_index).to_string())
+            } else {
+                None
+            }
+        });
+    }
+    
+    /// Update viewport for syntax highlighting in large files
+    pub fn update_syntax_viewport(&mut self, viewport_height: usize) {
+        let line_count = self.buffer.len_lines();
+        if line_count > 50_000 || self.syntax.is_viewport_mode() {
+            // Use actual viewport from renderer
+            let viewport_start = self.viewport_offset.0;
+            let viewport_end = (viewport_start + viewport_height).min(line_count);
+            self.syntax.set_viewport(viewport_start, viewport_end, line_count);
+        }
+    }
+    
+    /// Get syntax spans for a line (immutable access)
+    pub fn get_syntax_spans(&self, line_index: usize) -> Option<&[crate::syntax::HighlightSpan]> {
+        self.syntax.get_line_spans(line_index)
+    }
+    
     pub fn cursor_position(&self) -> (usize, usize) {
         let line = self.buffer.byte_to_line(self.cursor);
         let line_start = self.buffer.line_to_byte(line);

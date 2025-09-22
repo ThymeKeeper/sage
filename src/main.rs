@@ -5,6 +5,7 @@ mod commands;
 mod prompt;
 mod find_replace;
 mod exit_prompt;
+mod syntax;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},

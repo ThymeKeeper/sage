@@ -1,4 +1,5 @@
 use crate::editor::Editor;
+use crate::syntax::{HighlightSpan, SyntaxState};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     execute,
@@ -133,9 +134,16 @@ impl Renderer {
         let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize; // Reserve for status and bottom window
         // Note: viewport is only updated when cursor moves, not on every render
         
+        // Process syntax highlighting first (requires mutable borrow)
+        // Update viewport for large files
+        let viewport_height = content_height;
+        editor.update_syntax_viewport(viewport_height);
+        editor.update_syntax_highlighting();
+        
+        // Now get all the data we need with immutable borrows
         let viewport_offset = editor.viewport_offset();
-        let buffer = editor.buffer();
         let selection = editor.selection();
+        let buffer = editor.buffer();
         
         // Hide cursor while drawing
         #[cfg(target_os = "windows")]
@@ -185,13 +193,17 @@ impl Renderer {
                     // Calculate byte positions for this line
                     let line_byte_start = buffer.line_to_byte(file_row);
                     
-                    // Build line with selection highlighting and proper Unicode width handling
+                    // Get syntax highlighting for this line
+                    let syntax_spans = editor.get_syntax_spans(file_row);
+                    
+                    // Build line with selection and syntax highlighting
                     let mut formatted_line = String::new();
                     // Start with the background color for the entire line
                     formatted_line.push_str("\x1b[48;2;22;22;22m"); // Set line background
                     let mut byte_pos = line_byte_start;
                     let mut display_col = 0;  // Display column position (accounts for wide chars)
                     let mut screen_col = 0;    // Screen column position after horizontal scroll
+                    let mut line_byte_offset = 0;  // Byte offset within the line
                     
                     for ch in line_display.chars() {
                         // Get the display width of this character (0, 1, or 2 columns)
@@ -217,15 +229,45 @@ impl Renderer {
                                     byte_pos >= sel_start && byte_pos < sel_end
                                 });
                                 
+                                // Check syntax highlighting for this character
+                                let mut syntax_state = SyntaxState::Normal;
+                                if let Some(spans) = syntax_spans {
+                                    for span in spans {
+                                        if line_byte_offset >= span.start && line_byte_offset < span.end {
+                                            syntax_state = span.state;
+                                            break;
+                                        }
+                                    }
+                                }
+                                
                                 #[cfg(target_os = "windows")]
                                 {
                                     if is_selected {
                                         // Use same cadet blue as cursor (#5F9EA0) with black text
                                         formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
+                                    } else {
+                                        // Apply syntax highlighting colors for plain text
+                                        match syntax_state {
+                                            SyntaxState::StringDouble | SyntaxState::StringSingle => {
+                                                // Slightly dimmer grey for strings
+                                                formatted_line.push_str("\x1b[38;2;140;140;140m"); // #8C8C8C
+                                            }
+                                            SyntaxState::LineComment | SyntaxState::BlockComment => {
+                                                // Even dimmer grey for comments
+                                                formatted_line.push_str("\x1b[38;2;110;110;110m"); // #6E6E6E
+                                            }
+                                            SyntaxState::Normal => {
+                                                // Normal text - default foreground color
+                                                // No need to set color as it's already the default
+                                            }
+                                        }
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
                                         formatted_line.push_str("\x1b[0m\x1b[48;2;22;22;22m"); // Reset and restore line background
+                                    } else if syntax_state != SyntaxState::Normal {
+                                        // Reset color after syntax-highlighted character
+                                        formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
                                 }
                                 
@@ -234,10 +276,29 @@ impl Renderer {
                                     if is_selected {
                                         // Use same cadet blue as cursor (#5F9EA0) with black text
                                         formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
+                                    } else {
+                                        // Apply syntax highlighting colors for plain text
+                                        match syntax_state {
+                                            SyntaxState::StringDouble | SyntaxState::StringSingle => {
+                                                // Slightly dimmer grey for strings
+                                                formatted_line.push_str("\x1b[38;2;140;140;140m"); // #8C8C8C
+                                            }
+                                            SyntaxState::LineComment | SyntaxState::BlockComment => {
+                                                // Even dimmer grey for comments
+                                                formatted_line.push_str("\x1b[38;2;110;110;110m"); // #6E6E6E
+                                            }
+                                            SyntaxState::Normal => {
+                                                // Normal text - default foreground color
+                                                // No need to set color as it's already the default
+                                            }
+                                        }
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
                                         formatted_line.push_str("\x1b[0m\x1b[48;2;22;22;22m"); // Reset and restore line background
+                                    } else if syntax_state != SyntaxState::Normal {
+                                        // Reset color after syntax-highlighted character
+                                        formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
                                 }
                                 
@@ -246,6 +307,7 @@ impl Renderer {
                         }
                         
                         byte_pos += ch.len_utf8();
+                        line_byte_offset += ch.len_utf8();
                         display_col += char_width;
                     }
                     
