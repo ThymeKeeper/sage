@@ -878,11 +878,11 @@ impl Editor {
                 let mut target_line = None;
                 for line_num in (0..current_line).rev() {
                     let line_text = self.buffer.line(line_num);
-                    let is_empty = line_text.trim().is_empty();
+                    let is_empty = line_text.is_empty() || line_text == "\n";
                     
                     if !is_empty && line_num > 0 {
                         let prev_line = self.buffer.line(line_num - 1);
-                        if prev_line.trim().is_empty() {
+                        if prev_line.is_empty() || prev_line == "\n" {
                             target_line = Some(line_num);
                             break;
                         }
@@ -912,7 +912,7 @@ impl Editor {
                 
                 for line_num in (current_line + 1)..total_lines {
                     let line_text = self.buffer.line(line_num);
-                    let is_empty = line_text.trim().is_empty();
+                    let is_empty = line_text.is_empty() || line_text == "\n";
                     
                     if is_empty {
                         found_empty = true;
@@ -1102,11 +1102,11 @@ impl Editor {
                 let mut target_line = None;
                 for line_num in (0..current_line).rev() {
                     let line_text = self.buffer.line(line_num);
-                    let is_empty = line_text.trim().is_empty();
+                    let is_empty = line_text.is_empty() || line_text == "\n";
                     
                     if !is_empty && line_num > 0 {
                         let prev_line = self.buffer.line(line_num - 1);
-                        if prev_line.trim().is_empty() {
+                        if prev_line.is_empty() || prev_line == "\n" {
                             target_line = Some(line_num);
                             break;
                         }
@@ -1133,7 +1133,7 @@ impl Editor {
                 
                 for line_num in (current_line + 1)..total_lines {
                     let line_text = self.buffer.line(line_num);
-                    let is_empty = line_text.trim().is_empty();
+                    let is_empty = line_text.is_empty() || line_text == "\n";
                     
                     if is_empty {
                         found_empty = true;
