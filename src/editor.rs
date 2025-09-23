@@ -591,6 +591,7 @@ impl Editor {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
                     if char_pos > 0 {
                         self.cursor = self.buffer.char_to_byte(char_pos - 1);
+                        cursor_moved = true;
                     }
                 }
                 self.preferred_column = None; // Clear on horizontal movement
@@ -603,6 +604,7 @@ impl Editor {
                 if self.cursor < self.buffer.len_bytes() {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
                     self.cursor = self.buffer.char_to_byte(char_pos + 1);
+                    cursor_moved = true;
                 }
                 self.preferred_column = None; // Clear on horizontal movement
             }
@@ -666,10 +668,12 @@ impl Editor {
                     }
                     
                     self.cursor = new_line_start + best_byte_pos;
+                    cursor_moved = true;
                 } else {
                     // Already on first line, move to start of buffer
                     self.cursor = 0;
                     self.preferred_column = Some(0); // Reset preferred column at buffer start
+                    cursor_moved = true;
                 }
             }
             
@@ -732,12 +736,14 @@ impl Editor {
                     }
                     
                     self.cursor = new_line_start + best_byte_pos;
+                    cursor_moved = true;
                 } else {
                     // Already on last line, move to end of buffer
                     self.cursor = self.buffer.len_bytes();
                     // Reset preferred column to end of last line for consistency
                     let (_, col) = self.cursor_position();
                     self.preferred_column = Some(col);
+                    cursor_moved = true;
                 }
             }
             
@@ -748,6 +754,7 @@ impl Editor {
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 self.cursor = self.buffer.line_to_byte(current_line);
                 self.preferred_column = None; // Clear preferred column
+                cursor_moved = true;
             }
             
             Command::SelectEnd => {
@@ -764,6 +771,7 @@ impl Editor {
                 };
                 self.cursor = line_start + line_len;
                 self.preferred_column = None; // Clear preferred column
+                cursor_moved = true;
             }
             
             Command::SelectAll => {
@@ -811,7 +819,7 @@ impl Editor {
                     self.cursor = line_start;
                 }
                 self.preferred_column = None;
-                self.update_viewport_for_word_jump();
+                cursor_moved = true;
             }
             
             Command::SelectWordRight => {
@@ -857,7 +865,7 @@ impl Editor {
                     self.cursor = line_start + line_without_newline.len();
                 }
                 self.preferred_column = None;
-                self.update_viewport_for_word_jump();
+                cursor_moved = true;
             }
             
             Command::SelectParagraphUp => {
@@ -888,6 +896,7 @@ impl Editor {
                     self.cursor = 0;
                 }
                 self.preferred_column = None;
+                cursor_moved = true;
             }
             
             Command::SelectParagraphDown => {
@@ -921,6 +930,7 @@ impl Editor {
                     self.cursor = self.buffer.len_bytes();
                 }
                 self.preferred_column = None;
+                cursor_moved = true;
             }
             
             // Clipboard operations
@@ -1039,7 +1049,7 @@ impl Editor {
                     self.cursor = line_start;
                 }
                 self.preferred_column = None;
-                self.update_viewport_for_word_jump();
+                cursor_moved = true;
             }
             
             Command::MoveWordRight => {
@@ -1082,7 +1092,7 @@ impl Editor {
                     self.cursor = line_start + line_without_newline.len();
                 }
                 self.preferred_column = None;
-                self.update_viewport_for_word_jump();
+                cursor_moved = true;
             }
             
             Command::MoveParagraphUp => {
@@ -1110,6 +1120,7 @@ impl Editor {
                     self.cursor = 0;
                 }
                 self.preferred_column = None;
+                cursor_moved = true;
             }
             
             Command::MoveParagraphDown => {
@@ -1140,6 +1151,7 @@ impl Editor {
                     self.cursor = self.buffer.len_bytes();
                 }
                 self.preferred_column = None;
+                cursor_moved = true;
             }
             
             Command::Indent => {
@@ -1253,14 +1265,15 @@ impl Editor {
         }
         
         // Update viewport if cursor moved (but not for pure viewport scrolling)
-        // Note: Word movements handle their own viewport updates with more aggressive scrolloff
         if cursor_moved || matches!(cmd, 
             Command::InsertChar(_) | Command::InsertNewline | Command::InsertTab |
             Command::Indent | Command::Dedent |
             Command::Backspace | Command::Delete | Command::Paste |
             Command::SelectUp | Command::SelectDown | Command::SelectLeft | Command::SelectRight |
             Command::SelectHome | Command::SelectEnd | Command::SelectAll |
+            Command::MoveWordLeft | Command::MoveWordRight | 
             Command::MoveParagraphUp | Command::MoveParagraphDown |
+            Command::SelectWordLeft | Command::SelectWordRight |
             Command::SelectParagraphUp | Command::SelectParagraphDown
         ) {
             self.update_viewport_for_cursor();
@@ -1526,39 +1539,6 @@ impl Editor {
         }
     }
     
-    /// Force viewport update with more aggressive scrolloff for word jumps
-    fn update_viewport_for_word_jump(&mut self) {
-        // Get terminal size
-        if let Ok((width, height)) = crossterm::terminal::size() {
-            // Account for status bar
-            let viewport_height = (height - 1) as usize;
-            let viewport_width = width as usize;
-            
-            // Use a larger scrolloff for word jumps to ensure visibility
-            let word_scrolloff = 5;
-            let (cursor_line, cursor_col) = self.cursor_position();
-            
-            // Logical line includes the 2 virtual lines before the buffer
-            let logical_cursor_line = cursor_line + 3;
-            
-            // Vertical scrolling with more aggressive scrolloff
-            let cursor_screen_row = logical_cursor_line.saturating_sub(self.viewport_offset.0);
-            
-            if cursor_screen_row < word_scrolloff && self.viewport_offset.0 > 0 {
-                let desired_offset = logical_cursor_line.saturating_sub(word_scrolloff);
-                self.viewport_offset.0 = desired_offset.max(0);
-            } else if cursor_screen_row >= viewport_height - word_scrolloff {
-                self.viewport_offset.0 = logical_cursor_line + word_scrolloff - viewport_height;
-            }
-            
-            // Horizontal scrolling with more aggressive scrolloff
-            if cursor_col < self.viewport_offset.1 + word_scrolloff {
-                self.viewport_offset.1 = cursor_col.saturating_sub(word_scrolloff);
-            } else if cursor_col >= self.viewport_offset.1 + viewport_width - word_scrolloff {
-                self.viewport_offset.1 = cursor_col + word_scrolloff + 1 - viewport_width;
-            }
-        }
-    }
     
     /// Update viewport to follow cursor with scrolloff
     fn update_viewport(&mut self, viewport_height: usize, viewport_width: usize) {
@@ -1596,10 +1576,11 @@ impl Editor {
         if left_col < self.viewport_offset.1 + scrolloff {
             self.viewport_offset.1 = left_col.saturating_sub(scrolloff);
         }
-        // Then check if we need to scroll right for the cursor
-        else if cursor_col >= self.viewport_offset.1 + viewport_width - scrolloff {
+        // Always check if we need to scroll right for the cursor
+        if cursor_col >= self.viewport_offset.1 + viewport_width - scrolloff {
             self.viewport_offset.1 = cursor_col + scrolloff + 1 - viewport_width;
         }
+        
     }
     
     /// Convert screen coordinates to buffer position
