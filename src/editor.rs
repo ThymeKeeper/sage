@@ -262,8 +262,9 @@ impl Editor {
         let mut cursor_moved = false;
         
         // For non-selection movement commands, clear selection
+        // Note: MoveLeft and MoveRight handle their own selection clearing
         match cmd {
-            Command::MoveUp | Command::MoveDown | Command::MoveLeft | Command::MoveRight |
+            Command::MoveUp | Command::MoveDown |
             Command::MoveHome | Command::MoveEnd | Command::PageUp | Command::PageDown |
             Command::MoveWordLeft | Command::MoveWordRight | 
             Command::MoveParagraphUp | Command::MoveParagraphDown => {
@@ -404,21 +405,37 @@ impl Editor {
             }
             
             Command::MoveLeft => {
-                if self.cursor > 0 {
-                    let char_pos = self.buffer.byte_to_char(self.cursor);
-                    if char_pos > 0 {
-                        self.cursor = self.buffer.char_to_byte(char_pos - 1);
+                // If there's a selection, just move to the start of it
+                if let Some((start, _end)) = self.get_selection() {
+                    self.cursor = start;
+                    self.selection_start = None;
+                } else {
+                    // Otherwise perform normal left movement
+                    if self.cursor > 0 {
+                        let char_pos = self.buffer.byte_to_char(self.cursor);
+                        if char_pos > 0 {
+                            self.cursor = self.buffer.char_to_byte(char_pos - 1);
+                        }
                     }
                 }
                 self.preferred_column = None; // Clear preferred column on horizontal movement
+                cursor_moved = true;
             }
             
             Command::MoveRight => {
-                if self.cursor < self.buffer.len_bytes() {
-                    let char_pos = self.buffer.byte_to_char(self.cursor);
-                    self.cursor = self.buffer.char_to_byte(char_pos + 1);
+                // If there's a selection, just move to the end of it
+                if let Some((_start, end)) = self.get_selection() {
+                    self.cursor = end;
+                    self.selection_start = None;
+                } else {
+                    // Otherwise perform normal right movement
+                    if self.cursor < self.buffer.len_bytes() {
+                        let char_pos = self.buffer.byte_to_char(self.cursor);
+                        self.cursor = self.buffer.char_to_byte(char_pos + 1);
+                    }
                 }
                 self.preferred_column = None; // Clear preferred column on horizontal movement
+                cursor_moved = true;
             }
             
             Command::MoveUp => {
