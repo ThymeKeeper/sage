@@ -262,9 +262,8 @@ impl Editor {
         let mut cursor_moved = false;
         
         // For non-selection movement commands, clear selection
-        // Note: MoveLeft and MoveRight handle their own selection clearing
+        // Note: MoveLeft, MoveRight, MoveUp, and MoveDown handle their own selection clearing
         match cmd {
-            Command::MoveUp | Command::MoveDown |
             Command::MoveHome | Command::MoveEnd | Command::PageUp | Command::PageDown |
             Command::MoveWordLeft | Command::MoveWordRight | 
             Command::MoveParagraphUp | Command::MoveParagraphDown => {
@@ -439,8 +438,15 @@ impl Editor {
             }
             
             Command::MoveUp => {
-                let current_line = self.buffer.byte_to_line(self.cursor);
-                if current_line > 0 {
+                // If there's a selection, move to the start of it
+                if let Some((start, _end)) = self.get_selection() {
+                    self.cursor = start;
+                    self.selection_start = None;
+                    self.preferred_column = None; // Clear preferred column when collapsing selection
+                    cursor_moved = true;
+                } else {
+                    let current_line = self.buffer.byte_to_line(self.cursor);
+                    if current_line > 0 {
                     // Set preferred column if not already set
                     if self.preferred_column.is_none() {
                         let (_, col) = self.cursor_position();
@@ -499,11 +505,20 @@ impl Editor {
                     self.cursor = 0;
                     self.preferred_column = Some(0); // Reset preferred column at buffer start
                 }
+                cursor_moved = true;
+                }
             }
             
             Command::MoveDown => {
-                let current_line = self.buffer.byte_to_line(self.cursor);
-                if current_line < self.buffer.len_lines() - 1 {
+                // If there's a selection, move to the end of it
+                if let Some((_start, end)) = self.get_selection() {
+                    self.cursor = end;
+                    self.selection_start = None;
+                    self.preferred_column = None; // Clear preferred column when collapsing selection
+                    cursor_moved = true;
+                } else {
+                    let current_line = self.buffer.byte_to_line(self.cursor);
+                    if current_line < self.buffer.len_lines() - 1 {
                     // Set preferred column if not already set
                     if self.preferred_column.is_none() {
                         let (_, col) = self.cursor_position();
@@ -563,6 +578,8 @@ impl Editor {
                     // Reset preferred column to end of last line for consistency
                     let (_, col) = self.cursor_position();
                     self.preferred_column = Some(col);
+                }
+                cursor_moved = true;
                 }
             }
             
