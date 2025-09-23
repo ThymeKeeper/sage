@@ -309,17 +309,24 @@ impl Editor {
                 
                 // Get the current line to check for indentation
                 let current_line = self.buffer.byte_to_line(self.cursor);
-                let line_text = self.buffer.line(current_line);
+                let line_start = self.buffer.line_to_byte(current_line);
+                let is_at_line_start = self.cursor == line_start;
                 
-                // Count leading spaces
-                let indent_count = line_text.chars()
-                    .take_while(|&c| c == ' ')
-                    .count();
-                
-                // Create the new line with indentation
                 let mut new_text = String::from("\n");
-                for _ in 0..indent_count {
-                    new_text.push(' ');
+                
+                // Only add indentation if cursor is NOT at the start of the line
+                if !is_at_line_start {
+                    let line_text = self.buffer.line(current_line);
+                    
+                    // Count leading spaces
+                    let indent_count = line_text.chars()
+                        .take_while(|&c| c == ' ')
+                        .count();
+                    
+                    // Add indentation spaces
+                    for _ in 0..indent_count {
+                        new_text.push(' ');
+                    }
                 }
                 
                 let cursor_before = self.cursor;
