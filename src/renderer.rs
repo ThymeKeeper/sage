@@ -47,7 +47,7 @@ impl Renderer {
         
         // Set consistent background color regardless of how we're launched
         // This ensures the same appearance whether launched from terminal or Explorer
-        write!(stdout, "\x1b[48;2;22;22;22m")?; // Dark neutral grey background
+        write!(stdout, "\x1b[48;2;30;30;30m")?; // Background color RGB(30,30,30)
         execute!(stdout, Clear(ClearType::All))?;
         write!(stdout, "\x1b[0m")?; // Reset after clear
         
@@ -121,7 +121,7 @@ impl Renderer {
             self.last_status.clear();
             self.last_cursor_style = CursorStyle::Block; // Force cursor style refresh on resize
             // Maintain consistent background on resize
-            write!(self.stdout, "\x1b[48;2;22;22;22m")?; // Dark neutral grey background
+            write!(self.stdout, "\x1b[48;2;30;30;30m")?; // Background color RGB(30,30,30)
             execute!(self.stdout, Clear(ClearType::All))?;
             write!(self.stdout, "\x1b[0m")?; // Reset after clear
             #[cfg(target_os = "windows")]
@@ -167,7 +167,7 @@ impl Renderer {
                 // Virtual lines before the buffer - respect horizontal scrolling
                 if viewport_offset.1 == 0 {
                     // Only show the ~ if we're not horizontally scrolled
-                    line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
+                    line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
                     line_content.push_str("\x1b[38;2;110;110;110m"); // Dim grey like comments
                     line_content.push('~');
                     line_content.push_str("\x1b[39m"); // Reset foreground color
@@ -177,7 +177,7 @@ impl Renderer {
                     line_content.push_str("\x1b[0m");
                 } else {
                     // If horizontally scrolled, show all spaces
-                    line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
+                    line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
                     for _ in 0..width {
                         line_content.push(' ');
                     }
@@ -204,7 +204,14 @@ impl Renderer {
                     // Build line with selection and syntax highlighting
                     let mut formatted_line = String::new();
                     // Start with the background color for the entire line
-                    formatted_line.push_str("\x1b[48;2;22;22;22m"); // Set line background
+                    // Check if this is the current line
+                    let is_current_line = file_row == editor.cursor_position().0;
+                    let line_bg_color = if is_current_line {
+                        "\x1b[48;2;40;40;40m" // Current line background RGB(40,40,40)
+                    } else {
+                        "\x1b[48;2;30;30;30m" // Normal background RGB(30,30,30)
+                    };
+                    formatted_line.push_str(line_bg_color); // Set line background
                     let mut byte_pos = line_byte_start;
                     let mut display_col = 0;  // Display column position (accounts for wide chars)
                     let mut screen_col = 0;    // Screen column position after horizontal scroll
@@ -269,7 +276,8 @@ impl Renderer {
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[0m\x1b[48;2;22;22;22m"); // Reset and restore line background
+                                        formatted_line.push_str("\x1b[0m");
+                                        formatted_line.push_str(line_bg_color); // Reset and restore line background
                                     } else if syntax_state != SyntaxState::Normal {
                                         // Reset color after syntax-highlighted character
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
@@ -300,7 +308,8 @@ impl Renderer {
                                     }
                                     formatted_line.push(ch);
                                     if is_selected {
-                                        formatted_line.push_str("\x1b[0m\x1b[48;2;22;22;22m"); // Reset and restore line background
+                                        formatted_line.push_str("\x1b[0m");
+                                        formatted_line.push_str(line_bg_color); // Reset and restore line background
                                     } else if syntax_state != SyntaxState::Normal {
                                         // Reset color after syntax-highlighted character
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
@@ -328,7 +337,7 @@ impl Renderer {
                     // Virtual line after the buffer - respect horizontal scrolling
                     if viewport_offset.1 == 0 {
                         // Only show the ~ if we're not horizontally scrolled
-                        line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
+                        line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
                         line_content.push_str("\x1b[38;2;110;110;110m"); // Dim grey like comments
                         line_content.push('~');
                         line_content.push_str("\x1b[39m"); // Reset foreground color
@@ -338,7 +347,7 @@ impl Renderer {
                         line_content.push_str("\x1b[0m");
                     } else {
                         // If horizontally scrolled, show all spaces
-                        line_content.push_str("\x1b[48;2;22;22;22m"); // Consistent background
+                        line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
                         for _ in 0..width {
                             line_content.push(' ');
                         }
