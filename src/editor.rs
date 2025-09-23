@@ -264,7 +264,9 @@ impl Editor {
         // For non-selection movement commands, clear selection
         match cmd {
             Command::MoveUp | Command::MoveDown | Command::MoveLeft | Command::MoveRight |
-            Command::MoveHome | Command::MoveEnd | Command::PageUp | Command::PageDown => {
+            Command::MoveHome | Command::MoveEnd | Command::PageUp | Command::PageDown |
+            Command::MoveWordLeft | Command::MoveWordRight | 
+            Command::MoveParagraphUp | Command::MoveParagraphDown => {
                 self.selection_start = None;
                 cursor_moved = true;
             }
@@ -770,6 +772,157 @@ impl Editor {
                 self.preferred_column = None; // Clear preferred column
             }
             
+            Command::SelectWordLeft => {
+                if self.selection_start.is_none() {
+                    self.selection_start = Some(self.cursor);
+                }
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                let line_start = self.buffer.line_to_byte(current_line);
+                let line_text = self.buffer.line(current_line);
+                let cursor_in_line = self.cursor - line_start;
+                
+                if cursor_in_line > 0 {
+                    // Find the previous word boundary within the current line
+                    let mut new_pos = 0;
+                    let mut in_word = false;
+                    let mut byte_pos = 0;
+                    
+                    for ch in line_text.chars() {
+                        if byte_pos >= cursor_in_line {
+                            break;
+                        }
+                        
+                        if ch.is_alphanumeric() || ch == '_' {
+                            if !in_word {
+                                // Start of a new word
+                                new_pos = byte_pos;
+                                in_word = true;
+                            }
+                        } else {
+                            in_word = false;
+                        }
+                        
+                        byte_pos += ch.len_utf8();
+                    }
+                    
+                    self.cursor = line_start + new_pos;
+                } else {
+                    // Already at start of line, stay there
+                    self.cursor = line_start;
+                }
+                self.preferred_column = None;
+                self.update_viewport_for_word_jump();
+            }
+            
+            Command::SelectWordRight => {
+                if self.selection_start.is_none() {
+                    self.selection_start = Some(self.cursor);
+                }
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                let line_start = self.buffer.line_to_byte(current_line);
+                let line_text = self.buffer.line(current_line);
+                let cursor_in_line = self.cursor - line_start;
+                
+                // Remove trailing newline from line text for processing
+                let line_without_newline = if line_text.ends_with('\n') {
+                    &line_text[..line_text.len() - 1]
+                } else {
+                    &line_text
+                };
+                
+                if cursor_in_line < line_without_newline.len() {
+                    // Find the next word boundary within the current line
+                    let mut in_word = false;
+                    let mut found_next_word = false;
+                    let mut byte_pos = 0;
+                    
+                    for ch in line_without_newline.chars() {
+                        if byte_pos > cursor_in_line && !in_word && (ch.is_alphanumeric() || ch == '_') {
+                            // Found start of next word
+                            self.cursor = line_start + byte_pos;
+                            found_next_word = true;
+                            break;
+                        }
+                        
+                        in_word = ch.is_alphanumeric() || ch == '_';
+                        byte_pos += ch.len_utf8();
+                    }
+                    
+                    if !found_next_word {
+                        // No more words on this line, go to end of line
+                        self.cursor = line_start + line_without_newline.len();
+                    }
+                } else {
+                    // Already at end of line, stay there
+                    self.cursor = line_start + line_without_newline.len();
+                }
+                self.preferred_column = None;
+                self.update_viewport_for_word_jump();
+            }
+            
+            Command::SelectParagraphUp => {
+                if self.selection_start.is_none() {
+                    self.selection_start = Some(self.cursor);
+                }
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                
+                // Search backwards for a non-empty line preceded by an empty line
+                let mut target_line = None;
+                for line_num in (0..current_line).rev() {
+                    let line_text = self.buffer.line(line_num);
+                    let is_empty = line_text.trim().is_empty();
+                    
+                    if !is_empty && line_num > 0 {
+                        let prev_line = self.buffer.line(line_num - 1);
+                        if prev_line.trim().is_empty() {
+                            target_line = Some(line_num);
+                            break;
+                        }
+                    }
+                }
+                
+                if let Some(line) = target_line {
+                    self.cursor = self.buffer.line_to_byte(line);
+                } else {
+                    // No paragraph found, go to start of file
+                    self.cursor = 0;
+                }
+                self.preferred_column = None;
+            }
+            
+            Command::SelectParagraphDown => {
+                if self.selection_start.is_none() {
+                    self.selection_start = Some(self.cursor);
+                }
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                let total_lines = self.buffer.len_lines();
+                
+                // Search forward for a non-empty line preceded by an empty line
+                let mut found_empty = false;
+                let mut target_line = None;
+                
+                for line_num in (current_line + 1)..total_lines {
+                    let line_text = self.buffer.line(line_num);
+                    let is_empty = line_text.trim().is_empty();
+                    
+                    if is_empty {
+                        found_empty = true;
+                    } else if found_empty {
+                        // Found a non-empty line after an empty line
+                        target_line = Some(line_num);
+                        break;
+                    }
+                }
+                
+                if let Some(line) = target_line {
+                    self.cursor = self.buffer.line_to_byte(line);
+                } else {
+                    // No paragraph found, go to end of file
+                    self.cursor = self.buffer.len_bytes();
+                }
+                self.preferred_column = None;
+            }
+            
             // Clipboard operations
             Command::Copy => {
                 if let Some(text) = self.get_selected_text() {
@@ -848,6 +1001,145 @@ impl Editor {
             Command::Replace | Command::ReplaceAll => {
                 // These are handled in main.rs with the find/replace window
                 return Ok(());
+            }
+            
+            Command::MoveWordLeft => {
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                let line_start = self.buffer.line_to_byte(current_line);
+                let line_text = self.buffer.line(current_line);
+                let cursor_in_line = self.cursor - line_start;
+                
+                if cursor_in_line > 0 {
+                    // Find the previous word boundary within the current line
+                    let mut new_pos = 0;
+                    let mut in_word = false;
+                    let mut byte_pos = 0;
+                    
+                    for ch in line_text.chars() {
+                        if byte_pos >= cursor_in_line {
+                            break;
+                        }
+                        
+                        if ch.is_alphanumeric() || ch == '_' {
+                            if !in_word {
+                                // Start of a new word
+                                new_pos = byte_pos;
+                                in_word = true;
+                            }
+                        } else {
+                            in_word = false;
+                        }
+                        
+                        byte_pos += ch.len_utf8();
+                    }
+                    
+                    self.cursor = line_start + new_pos;
+                } else {
+                    // Already at start of line, stay there
+                    self.cursor = line_start;
+                }
+                self.preferred_column = None;
+                self.update_viewport_for_word_jump();
+            }
+            
+            Command::MoveWordRight => {
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                let line_start = self.buffer.line_to_byte(current_line);
+                let line_text = self.buffer.line(current_line);
+                let cursor_in_line = self.cursor - line_start;
+                
+                // Remove trailing newline from line text for processing
+                let line_without_newline = if line_text.ends_with('\n') {
+                    &line_text[..line_text.len() - 1]
+                } else {
+                    &line_text
+                };
+                
+                if cursor_in_line < line_without_newline.len() {
+                    // Find the next word boundary within the current line
+                    let mut in_word = false;
+                    let mut found_next_word = false;
+                    let mut byte_pos = 0;
+                    
+                    for ch in line_without_newline.chars() {
+                        if byte_pos > cursor_in_line && !in_word && (ch.is_alphanumeric() || ch == '_') {
+                            // Found start of next word
+                            self.cursor = line_start + byte_pos;
+                            found_next_word = true;
+                            break;
+                        }
+                        
+                        in_word = ch.is_alphanumeric() || ch == '_';
+                        byte_pos += ch.len_utf8();
+                    }
+                    
+                    if !found_next_word {
+                        // No more words on this line, go to end of line
+                        self.cursor = line_start + line_without_newline.len();
+                    }
+                } else {
+                    // Already at end of line, stay there
+                    self.cursor = line_start + line_without_newline.len();
+                }
+                self.preferred_column = None;
+                self.update_viewport_for_word_jump();
+            }
+            
+            Command::MoveParagraphUp => {
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                
+                // Search backwards for a non-empty line preceded by an empty line
+                let mut target_line = None;
+                for line_num in (0..current_line).rev() {
+                    let line_text = self.buffer.line(line_num);
+                    let is_empty = line_text.trim().is_empty();
+                    
+                    if !is_empty && line_num > 0 {
+                        let prev_line = self.buffer.line(line_num - 1);
+                        if prev_line.trim().is_empty() {
+                            target_line = Some(line_num);
+                            break;
+                        }
+                    }
+                }
+                
+                if let Some(line) = target_line {
+                    self.cursor = self.buffer.line_to_byte(line);
+                } else {
+                    // No paragraph found, go to start of file
+                    self.cursor = 0;
+                }
+                self.preferred_column = None;
+            }
+            
+            Command::MoveParagraphDown => {
+                let current_line = self.buffer.byte_to_line(self.cursor);
+                let total_lines = self.buffer.len_lines();
+                
+                // Search forward for a non-empty line preceded by an empty line
+                let mut found_empty = false;
+                let mut target_line = None;
+                
+                for line_num in (current_line + 1)..total_lines {
+                    let line_text = self.buffer.line(line_num);
+                    let is_empty = line_text.trim().is_empty();
+                    
+                    if is_empty {
+                        found_empty = true;
+                    } else if found_empty {
+                        // Found a non-empty line after an empty line
+                        target_line = Some(line_num);
+                        break;
+                    }
+                }
+                
+                if let Some(line) = target_line {
+                    self.cursor = self.buffer.line_to_byte(line);
+                } else {
+                    // No paragraph found, go to end of file
+                    self.cursor = self.buffer.len_bytes();
+                }
+                self.preferred_column = None;
             }
             
             Command::Indent => {
@@ -961,12 +1253,15 @@ impl Editor {
         }
         
         // Update viewport if cursor moved (but not for pure viewport scrolling)
+        // Note: Word movements handle their own viewport updates with more aggressive scrolloff
         if cursor_moved || matches!(cmd, 
             Command::InsertChar(_) | Command::InsertNewline | Command::InsertTab |
             Command::Indent | Command::Dedent |
             Command::Backspace | Command::Delete | Command::Paste |
             Command::SelectUp | Command::SelectDown | Command::SelectLeft | Command::SelectRight |
-            Command::SelectHome | Command::SelectEnd | Command::SelectAll
+            Command::SelectHome | Command::SelectEnd | Command::SelectAll |
+            Command::MoveParagraphUp | Command::MoveParagraphDown |
+            Command::SelectParagraphUp | Command::SelectParagraphDown
         ) {
             self.update_viewport_for_cursor();
         }
@@ -1228,6 +1523,40 @@ impl Editor {
             let viewport_height = (height - 1) as usize;
             let viewport_width = width as usize;
             self.update_viewport(viewport_height, viewport_width);
+        }
+    }
+    
+    /// Force viewport update with more aggressive scrolloff for word jumps
+    fn update_viewport_for_word_jump(&mut self) {
+        // Get terminal size
+        if let Ok((width, height)) = crossterm::terminal::size() {
+            // Account for status bar
+            let viewport_height = (height - 1) as usize;
+            let viewport_width = width as usize;
+            
+            // Use a larger scrolloff for word jumps to ensure visibility
+            let word_scrolloff = 5;
+            let (cursor_line, cursor_col) = self.cursor_position();
+            
+            // Logical line includes the 2 virtual lines before the buffer
+            let logical_cursor_line = cursor_line + 3;
+            
+            // Vertical scrolling with more aggressive scrolloff
+            let cursor_screen_row = logical_cursor_line.saturating_sub(self.viewport_offset.0);
+            
+            if cursor_screen_row < word_scrolloff && self.viewport_offset.0 > 0 {
+                let desired_offset = logical_cursor_line.saturating_sub(word_scrolloff);
+                self.viewport_offset.0 = desired_offset.max(0);
+            } else if cursor_screen_row >= viewport_height - word_scrolloff {
+                self.viewport_offset.0 = logical_cursor_line + word_scrolloff - viewport_height;
+            }
+            
+            // Horizontal scrolling with more aggressive scrolloff
+            if cursor_col < self.viewport_offset.1 + word_scrolloff {
+                self.viewport_offset.1 = cursor_col.saturating_sub(word_scrolloff);
+            } else if cursor_col >= self.viewport_offset.1 + viewport_width - word_scrolloff {
+                self.viewport_offset.1 = cursor_col + word_scrolloff + 1 - viewport_width;
+            }
         }
     }
     

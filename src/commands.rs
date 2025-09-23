@@ -10,6 +10,10 @@ pub enum Command {
     MoveEnd,
     PageUp,
     PageDown,
+    MoveWordLeft,
+    MoveWordRight,
+    MoveParagraphUp,
+    MoveParagraphDown,
     
     // Selection movement
     SelectUp,
@@ -19,6 +23,10 @@ pub enum Command {
     SelectHome,
     SelectEnd,
     SelectAll,
+    SelectWordLeft,
+    SelectWordRight,
+    SelectParagraphUp,
+    SelectParagraphDown,
     
     // Editing
     InsertChar(char),

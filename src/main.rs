@@ -567,28 +567,44 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     
                     // Movement (with selection support)
                     KeyCode::Up => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                            commands::Command::SelectParagraphUp
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            commands::Command::MoveParagraphUp
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             commands::Command::SelectUp
                         } else {
                             commands::Command::MoveUp
                         }
                     }
                     KeyCode::Down => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                            commands::Command::SelectParagraphDown
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            commands::Command::MoveParagraphDown
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             commands::Command::SelectDown
                         } else {
                             commands::Command::MoveDown
                         }
                     }
                     KeyCode::Left => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                            commands::Command::SelectWordLeft
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            commands::Command::MoveWordLeft
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             commands::Command::SelectLeft
                         } else {
                             commands::Command::MoveLeft
                         }
                     }
                     KeyCode::Right => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                            commands::Command::SelectWordRight
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            commands::Command::MoveWordRight
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             commands::Command::SelectRight
                         } else {
                             commands::Command::MoveRight
