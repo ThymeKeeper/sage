@@ -408,41 +408,51 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         continue;
                     }
                     
-                    // Handle regular input for find/replace window
-                    let result = fr.handle_input(key.code, key.modifiers);
-                    match result {
-                        find_replace::InputResult::Close => {
-                            find_replace = None;
-                            // Clear selection when closing find
-                            editor.selection_start = None;
-                            // Force redraw
-                            execute!(io::stdout(), 
-                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                crossterm::cursor::Hide
-                            )?;
-                            renderer.force_redraw();
-                        }
-                        find_replace::InputResult::FindTextChanged => {
-                            // Update search results
-                            let matches = editor.find_all(fr.find_text());
-                            fr.update_matches(matches.clone());
-                            // Select first match if any
-                            if let Some((start, end)) = fr.current_match_position() {
-                                editor.select_range(start, end);
-                            } else {
+                    // Check if this is an undo/redo command first
+                    let is_undo_redo = match (key.code, key.modifiers.contains(KeyModifiers::CONTROL)) {
+                        (KeyCode::Char('z') | KeyCode::Char('Z'), true) => true,
+                        _ => false,
+                    };
+                    
+                    // If it's not undo/redo, handle it as find/replace input
+                    if !is_undo_redo {
+                        // Handle regular input for find/replace window
+                        let result = fr.handle_input(key.code, key.modifiers);
+                        match result {
+                            find_replace::InputResult::Close => {
+                                find_replace = None;
+                                // Clear selection when closing find
                                 editor.selection_start = None;
+                                // Force redraw
+                                execute!(io::stdout(), 
+                                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                                    crossterm::cursor::Hide
+                                )?;
+                                renderer.force_redraw();
                             }
-                        }
-                        find_replace::InputResult::FindNext => {
-                            if !fr.is_empty() {
-                                if let Some((start, end)) = fr.next_match() {
+                            find_replace::InputResult::FindTextChanged => {
+                                // Update search results
+                                let matches = editor.find_all(fr.find_text());
+                                fr.update_matches(matches.clone());
+                                // Select first match if any
+                                if let Some((start, end)) = fr.current_match_position() {
                                     editor.select_range(start, end);
+                                } else {
+                                    editor.selection_start = None;
                                 }
                             }
+                            find_replace::InputResult::FindNext => {
+                                if !fr.is_empty() {
+                                    if let Some((start, end)) = fr.next_match() {
+                                        editor.select_range(start, end);
+                                    }
+                                }
+                            }
+                            find_replace::InputResult::Continue => {}
                         }
-                        find_replace::InputResult::Continue => {}
+                        continue; // Skip normal command processing
                     }
-                    continue; // Skip normal command processing
+                    // If it's undo/redo, fall through to normal command processing
                 }
                 
                 
