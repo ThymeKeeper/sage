@@ -619,7 +619,7 @@ impl Editor {
             // Selection movement commands
             Command::SelectLeft => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 if self.cursor > 0 {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
@@ -633,7 +633,7 @@ impl Editor {
             
             Command::SelectRight => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 if self.cursor < self.buffer.len_bytes() {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
@@ -645,7 +645,7 @@ impl Editor {
             
             Command::SelectUp => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line > 0 {
@@ -713,7 +713,7 @@ impl Editor {
             
             Command::SelectDown => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line < self.buffer.len_lines() - 1 {
@@ -783,7 +783,7 @@ impl Editor {
             
             Command::SelectHome => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 self.cursor = self.buffer.line_to_byte(current_line);
@@ -793,7 +793,7 @@ impl Editor {
             
             Command::SelectEnd => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 let line_start = self.buffer.line_to_byte(current_line);
@@ -809,14 +809,14 @@ impl Editor {
             }
             
             Command::SelectAll => {
-                self.selection_start = Some(0);
+                self.set_selection_start(0);
                 self.cursor = self.buffer.len_bytes();
                 self.preferred_column = None; // Clear preferred column
             }
             
             Command::SelectWordLeft => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 let line_start = self.buffer.line_to_byte(current_line);
@@ -858,7 +858,7 @@ impl Editor {
             
             Command::SelectWordRight => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 let line_start = self.buffer.line_to_byte(current_line);
@@ -873,25 +873,47 @@ impl Editor {
                 };
                 
                 if cursor_in_line < line_without_newline.len() {
-                    // Find the next word boundary within the current line
-                    let mut in_word = false;
-                    let mut found_next_word = false;
+                    // Find the end of the current or next word
                     let mut byte_pos = 0;
+                    let mut in_word = false;
+                    let mut cursor_in_word = false;
                     
+                    // First, check if cursor is currently in a word
                     for ch in line_without_newline.chars() {
-                        if byte_pos > cursor_in_line && !in_word && (ch.is_alphanumeric() || ch == '_') {
-                            // Found start of next word
-                            self.cursor = line_start + byte_pos;
-                            found_next_word = true;
+                        if byte_pos == cursor_in_line {
+                            cursor_in_word = ch.is_alphanumeric() || ch == '_';
                             break;
                         }
-                        
-                        in_word = ch.is_alphanumeric() || ch == '_';
                         byte_pos += ch.len_utf8();
                     }
                     
-                    if !found_next_word {
-                        // No more words on this line, go to end of line
+                    // Reset for main scan
+                    byte_pos = 0;
+                    let mut found_word_end = false;
+                    
+                    for ch in line_without_newline.chars() {
+                        let is_word_char = ch.is_alphanumeric() || ch == '_';
+                        
+                        if byte_pos > cursor_in_line {
+                            if cursor_in_word && in_word && !is_word_char {
+                                // We were in a word and just found the end of it
+                                self.cursor = line_start + byte_pos;
+                                found_word_end = true;
+                                break;
+                            } else if !cursor_in_word && in_word && !is_word_char {
+                                // We weren't in a word but found the end of the next word
+                                self.cursor = line_start + byte_pos;
+                                found_word_end = true;
+                                break;
+                            }
+                        }
+                        
+                        in_word = is_word_char;
+                        byte_pos += ch.len_utf8();
+                    }
+                    
+                    if !found_word_end {
+                        // We're at the end of a word at end of line
                         self.cursor = line_start + line_without_newline.len();
                     }
                 } else {
@@ -904,7 +926,7 @@ impl Editor {
             
             Command::SelectParagraphUp => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 
@@ -935,7 +957,7 @@ impl Editor {
             
             Command::SelectParagraphDown => {
                 if self.selection_start.is_none() {
-                    self.selection_start = Some(self.cursor);
+                    self.set_selection_start(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 let total_lines = self.buffer.len_lines();
@@ -1289,7 +1311,7 @@ impl Editor {
                 // Apply adjustments
                 self.cursor = original_cursor.saturating_sub(cursor_adjustment);
                 if let Some(sel) = original_selection_start {
-                    self.selection_start = Some(sel.saturating_sub(selection_adjustment));
+                    self.set_selection_start(sel.saturating_sub(selection_adjustment));
                 }
                 
                 self.modified = true;
@@ -1409,7 +1431,7 @@ impl Editor {
     
     /// Select a range of text
     pub fn select_range(&mut self, start: usize, end: usize) {
-        self.selection_start = Some(start);
+        self.set_selection_start(start);
         self.cursor = end;
         self.preferred_column = None; // Clear preferred column
         self.update_viewport_for_cursor();
@@ -1750,6 +1772,45 @@ impl Editor {
         }
     }
     
+    /// Skip forward over spaces from a given position to exclude them from selection
+    /// Exception: preserve leading indentation spaces at the start of lines
+    fn skip_forward_spaces(&self, position: usize) -> usize {
+        // Check if we're at the start of a line (including indentation)
+        let line = self.buffer.byte_to_line(position);
+        let line_start = self.buffer.line_to_byte(line);
+        let line_text = self.buffer.line(line);
+        
+        // Find where the actual content (non-space) begins on this line
+        let mut first_non_space = 0;
+        for ch in line_text.chars() {
+            if ch != ' ' && ch != '\t' {
+                break;
+            }
+            first_non_space += ch.len_utf8();
+        }
+        
+        // If position is within the leading indentation, don't skip spaces
+        if position >= line_start && position <= line_start + first_non_space {
+            return position;
+        }
+        
+        // Otherwise, skip forward over spaces
+        let content = self.buffer.to_string();
+        let bytes = content.as_bytes();
+        let mut pos = position;
+        
+        while pos < bytes.len() && bytes[pos] == b' ' {
+            pos += 1;
+        }
+        
+        pos
+    }
+
+    /// Set selection start with space exclusion
+    fn set_selection_start(&mut self, position: usize) {
+        self.selection_start = Some(self.skip_forward_spaces(position));
+    }
+
     /// Select the word at the given position
     fn select_word_at(&mut self, position: usize) {
         let content = self.buffer.to_string();
@@ -1771,12 +1832,12 @@ impl Editor {
         let mut end_char = char_pos;
         
         // Move start backward to beginning of word
-        while start_char > 0 && chars[start_char - 1].is_alphanumeric() {
+        while start_char > 0 && (chars[start_char - 1].is_alphanumeric() || chars[start_char - 1] == '_') {
             start_char -= 1;
         }
         
         // Move end forward to end of word
-        while end_char < chars.len() && chars[end_char].is_alphanumeric() {
+        while end_char < chars.len() && (chars[end_char].is_alphanumeric() || chars[end_char] == '_') {
             end_char += 1;
         }
         
@@ -1793,7 +1854,7 @@ impl Editor {
         
         // Set selection
         if start_byte < end_byte {
-            self.selection_start = Some(start_byte);
+            self.set_selection_start(start_byte);
             self.cursor = end_byte;
         }
     }
@@ -1811,7 +1872,7 @@ impl Editor {
             line_start + line_text.len()
         };
         
-        self.selection_start = Some(line_start);
+        self.set_selection_start(line_start);
         self.cursor = line_end;
     }
     
@@ -1820,7 +1881,7 @@ impl Editor {
         if self.mouse_selecting {
             if self.selection_start.is_none() {
                 // Start selection from the initial cursor position
-                self.selection_start = Some(self.cursor);
+                self.set_selection_start(self.cursor);
             }
             // Update cursor to current mouse position
             self.cursor = position;
