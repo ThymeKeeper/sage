@@ -336,6 +336,7 @@ impl Editor {
                 self.preferred_column = None; // Clear preferred column
                 
                 // Update syntax highlighting - line was inserted
+                self.syntax.line_modified(current_line); // Mark current line as dirty since its content changed
                 self.syntax.lines_inserted(current_line + 1, 1);
             }
             
