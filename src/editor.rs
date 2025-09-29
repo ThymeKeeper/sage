@@ -167,14 +167,28 @@ impl Editor {
     }
     
     fn is_file_read_only(&self, path: &str) -> bool {
-        use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            
+            if let Ok(metadata) = fs::metadata(path) {
+                let permissions = metadata.permissions();
+                // Check if file is read-only
+                permissions.readonly() || (permissions.mode() & 0o200) == 0
+            } else {
+                false // If we can't get metadata, assume it's writable (will fail on save anyway)
+            }
+        }
         
-        if let Ok(metadata) = fs::metadata(path) {
-            let permissions = metadata.permissions();
-            // Check if file is read-only
-            permissions.readonly() || (permissions.mode() & 0o200) == 0
-        } else {
-            false // If we can't get metadata, assume it's writable (will fail on save anyway)
+        #[cfg(not(unix))]
+        {
+            if let Ok(metadata) = fs::metadata(path) {
+                let permissions = metadata.permissions();
+                // On Windows, just check the readonly flag
+                permissions.readonly()
+            } else {
+                false // If we can't get metadata, assume it's writable (will fail on save anyway)
+            }
         }
     }
     
