@@ -6,6 +6,12 @@ A terminal text editor that won't make you cry. Much.
 
 thyme is a terminal-based text editor written in Rust. It's the editor you use when nano feels too bloated and vim's learning curve looks like a wall. Built with the revolutionary idea that text editors should let you edit text.
 
+<img width="1219" height="628" alt="thyme" src="https://github.com/user-attachments/assets/e0d7138b-c2c5-446b-bec7-f8bb89d335e2" />
+
+<img width="1219" height="628" alt="findreplace" src="https://github.com/user-attachments/assets/4388739b-1dea-4ec5-b7bb-3313ae0ab558" />
+
+<img width="1219" height="629" alt="saveas" src="https://github.com/user-attachments/assets/1df2f3d1-31c1-4497-b50b-cafa2fa3340c" />
+
 ## Features
 
 ### Core Editing
