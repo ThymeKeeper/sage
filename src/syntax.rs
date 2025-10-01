@@ -406,15 +406,54 @@ impl SyntaxHighlighter {
             self.line_states.push(LineState::new());
         }
         
+        // Store the exit state before insertion (if it exists)
+        let exit_state_before = if at_line > 0 && at_line - 1 < self.line_states.len() {
+            Some(self.line_states[at_line - 1].exit_state)
+        } else {
+            None
+        };
+        
         // Insert new line states
         for _ in 0..count {
             self.line_states.insert(at_line.min(self.line_states.len()), LineState::new());
         }
         
-        // Mark the inserted lines and the next line as dirty
-        for i in at_line..=at_line + count {
+        // Mark the inserted lines as dirty
+        for i in at_line..at_line + count {
             if i < self.line_states.len() {
                 self.mark_dirty(i);
+            }
+        }
+        
+        // Check if we need to mark subsequent lines as dirty
+        // If the insertion might affect the syntactic state of following lines,
+        // we need to mark them as dirty too
+        if let Some(prev_exit_state) = exit_state_before {
+            // After processing the inserted lines, their exit state might differ
+            // from what the next line expects. Mark all subsequent lines that might
+            // be affected until we find a stable point
+            let mut check_line = at_line + count;
+            while check_line < self.line_states.len() {
+                // Mark this line as dirty
+                self.mark_dirty(check_line);
+                
+                // In viewport mode, don't propagate too far
+                if self.viewport_mode && check_line > at_line + count + 100 {
+                    break;
+                }
+                
+                // For small files, we can afford to mark more lines
+                if !self.viewport_mode && check_line > at_line + count + 500 {
+                    // Stop after checking 500 lines to avoid performance issues
+                    break;
+                }
+                
+                check_line += 1;
+            }
+        } else {
+            // No previous state, just mark the immediate next line
+            if at_line + count < self.line_states.len() {
+                self.mark_dirty(at_line + count);
             }
         }
     }
@@ -436,10 +475,43 @@ impl SyntaxHighlighter {
     
     /// Called when a line is modified
     pub fn line_modified(&mut self, line_index: usize) {
+        // Store the current exit state before marking as dirty
+        let old_exit_state = if line_index < self.line_states.len() {
+            Some(self.line_states[line_index].exit_state)
+        } else {
+            None
+        };
+        
         self.mark_dirty(line_index);
-        // Also mark the next line in case our exit state changed
-        if line_index + 1 < self.line_states.len() {
-            self.mark_dirty(line_index + 1);
+        
+        // Mark subsequent lines that might be affected by state changes
+        // This is important for multi-line constructs like block comments
+        let mut check_line = line_index + 1;
+        let max_check = if self.viewport_mode {
+            line_index + 100  // Limited propagation in viewport mode
+        } else {
+            line_index + 500  // More extensive check for small files
+        };
+        
+        while check_line < self.line_states.len() && check_line <= max_check {
+            self.mark_dirty(check_line);
+            
+            // If we know the old exit state was Normal and the line had Normal entry,
+            // we might be able to stop early (optimization for future)
+            if let Some(SyntaxState::Normal) = old_exit_state {
+                if check_line < self.line_states.len() {
+                    if self.line_states[check_line].entry_state == SyntaxState::Normal {
+                        // Mark one more line and stop
+                        check_line += 1;
+                        if check_line < self.line_states.len() {
+                            self.mark_dirty(check_line);
+                        }
+                        break;
+                    }
+                }
+            }
+            
+            check_line += 1;
         }
     }
     
