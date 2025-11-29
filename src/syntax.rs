@@ -27,6 +27,7 @@ pub enum Language {
     Yaml,
     Markdown,
     Json,
+    Shell,
 }
 
 /// Represents a highlighted span within a line
@@ -97,6 +98,7 @@ impl Language {
             "yaml" | "yml" => Language::Yaml,
             "md" | "markdown" => Language::Markdown,
             "json" | "jsonl" | "jsonc" => Language::Json,
+            "sh" | "bash" | "zsh" => Language::Shell,
             _ => Language::PlainText,
         }
     }
@@ -261,6 +263,14 @@ impl SyntaxHighlighter {
             Language::Json => matches!(word,
                 "true" | "false" | "null"
             ),
+            Language::Shell => matches!(word,
+                "if" | "then" | "else" | "elif" | "fi" | "case" | "esac" | "for" | "select" |
+                "while" | "until" | "do" | "done" | "in" | "function" | "time" | "coproc" |
+                "break" | "continue" | "return" | "exit" | "export" | "readonly" | "local" |
+                "declare" | "typeset" | "unset" | "shift" | "source" | "eval" | "exec" |
+                "trap" | "wait" | "jobs" | "bg" | "fg" | "kill" | "disown" | "suspend" |
+                "alias" | "unalias" | "set" | "shopt" | "test" | "true" | "false"
+            ),
             Language::Markdown => false, // Markdown doesn't have traditional keywords
             Language::PlainText => false,
         }
@@ -297,6 +307,12 @@ impl SyntaxHighlighter {
             Language::R => matches!(word,
                 "numeric" | "integer" | "logical" | "character" | "complex" | "raw" |
                 "vector" | "matrix" | "array" | "list" | "data.frame" | "factor"
+            ),
+            Language::Shell => matches!(word,
+                "echo" | "printf" | "read" | "cd" | "pwd" | "ls" | "cp" | "mv" | "rm" |
+                "mkdir" | "rmdir" | "cat" | "grep" | "sed" | "awk" | "find" | "sort" |
+                "uniq" | "cut" | "tr" | "head" | "tail" | "wc" | "diff" | "chmod" | "chown" |
+                "tar" | "gzip" | "gunzip" | "zip" | "unzip" | "curl" | "wget" | "ssh" | "scp"
             ),
             Language::Json => false, // JSON doesn't have type keywords
             _ => false,
@@ -493,6 +509,11 @@ impl SyntaxHighlighter {
             return;
         }
 
+        // PlainText doesn't need syntax highlighting
+        if self.language == Language::PlainText {
+            return;
+        }
+
         let segment = &line_content[start..end];
         let segment_bytes = segment.as_bytes();
         let mut pos = 0;
@@ -591,8 +612,169 @@ impl SyntaxHighlighter {
         }
     }
 
+    /// Tokenize markdown content
+    fn tokenize_markdown_line(&self, _line_content: &str, entry_state: SyntaxState, bytes: &[u8]) -> (Vec<HighlightSpan>, SyntaxState) {
+        let mut new_spans = Vec::new();
+        let current_state = entry_state;
+        let mut current_pos = 0;
+
+        // Handle code blocks (```)
+        if current_state == SyntaxState::StringTriple {
+            // We're inside a code block, look for closing ```
+            if bytes.len() >= 3 && bytes[0] == b'`' && bytes[1] == b'`' && bytes[2] == b'`' {
+                // Found closing ```, highlight the line and exit code block
+                new_spans.push(HighlightSpan {
+                    start: 0,
+                    end: bytes.len(),
+                    state: SyntaxState::StringTriple,
+                });
+                return (new_spans, SyntaxState::Normal);
+            } else {
+                // Still inside code block, highlight entire line
+                new_spans.push(HighlightSpan {
+                    start: 0,
+                    end: bytes.len(),
+                    state: SyntaxState::StringTriple,
+                });
+                return (new_spans, SyntaxState::StringTriple);
+            }
+        }
+
+        // Check if line starts with ``` (code block start)
+        if bytes.len() >= 3 && bytes[0] == b'`' && bytes[1] == b'`' && bytes[2] == b'`' {
+            new_spans.push(HighlightSpan {
+                start: 0,
+                end: bytes.len(),
+                state: SyntaxState::StringTriple,
+            });
+            return (new_spans, SyntaxState::StringTriple);
+        }
+
+        // Check for headers (# ## ### etc at start of line)
+        if bytes.len() > 0 && bytes[0] == b'#' {
+            let mut hash_count = 0;
+            while hash_count < bytes.len() && bytes[hash_count] == b'#' {
+                hash_count += 1;
+            }
+            if hash_count <= 6 && (hash_count == bytes.len() || bytes[hash_count] == b' ') {
+                // Valid header
+                new_spans.push(HighlightSpan {
+                    start: 0,
+                    end: bytes.len(),
+                    state: SyntaxState::Keyword,
+                });
+                return (new_spans, SyntaxState::Normal);
+            }
+        }
+
+        // Process inline formatting (bold, italic, inline code)
+        while current_pos < bytes.len() {
+            let ch = bytes[current_pos];
+
+            // Inline code (`code`)
+            if ch == b'`' {
+                let code_start = current_pos;
+                current_pos += 1;
+                // Find closing `
+                while current_pos < bytes.len() && bytes[current_pos] != b'`' {
+                    current_pos += 1;
+                }
+                if current_pos < bytes.len() {
+                    current_pos += 1; // Include closing `
+                }
+                new_spans.push(HighlightSpan {
+                    start: code_start,
+                    end: current_pos,
+                    state: SyntaxState::StringDouble,
+                });
+                continue;
+            }
+
+            // Bold (**text** or __text__)
+            if (ch == b'*' && current_pos + 1 < bytes.len() && bytes[current_pos + 1] == b'*') ||
+               (ch == b'_' && current_pos + 1 < bytes.len() && bytes[current_pos + 1] == b'_') {
+                let marker = ch;
+                let bold_start = current_pos;
+                current_pos += 2;
+                // Find closing marker
+                while current_pos + 1 < bytes.len() {
+                    if bytes[current_pos] == marker && bytes[current_pos + 1] == marker {
+                        current_pos += 2;
+                        new_spans.push(HighlightSpan {
+                            start: bold_start,
+                            end: current_pos,
+                            state: SyntaxState::Type,
+                        });
+                        break;
+                    }
+                    current_pos += 1;
+                }
+                continue;
+            }
+
+            // Italic (*text* or _text_)
+            if (ch == b'*' || ch == b'_') &&
+               (current_pos == 0 || bytes[current_pos - 1] == b' ') {
+                let marker = ch;
+                let italic_start = current_pos;
+                current_pos += 1;
+                // Find closing marker
+                while current_pos < bytes.len() {
+                    if bytes[current_pos] == marker &&
+                       (current_pos + 1 >= bytes.len() || bytes[current_pos + 1] == b' ' ||
+                        !bytes[current_pos + 1].is_ascii_alphanumeric()) {
+                        current_pos += 1;
+                        new_spans.push(HighlightSpan {
+                            start: italic_start,
+                            end: current_pos,
+                            state: SyntaxState::Function,
+                        });
+                        break;
+                    }
+                    current_pos += 1;
+                }
+                continue;
+            }
+
+            // Links [text](url)
+            if ch == b'[' {
+                let link_start = current_pos;
+                current_pos += 1;
+                // Find ]
+                while current_pos < bytes.len() && bytes[current_pos] != b']' {
+                    current_pos += 1;
+                }
+                if current_pos < bytes.len() && current_pos + 1 < bytes.len() && bytes[current_pos + 1] == b'(' {
+                    current_pos += 2; // Skip ](
+                    // Find closing )
+                    while current_pos < bytes.len() && bytes[current_pos] != b')' {
+                        current_pos += 1;
+                    }
+                    if current_pos < bytes.len() {
+                        current_pos += 1; // Include )
+                        new_spans.push(HighlightSpan {
+                            start: link_start,
+                            end: current_pos,
+                            state: SyntaxState::Number,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            current_pos += 1;
+        }
+
+        (new_spans, SyntaxState::Normal)
+    }
+
     /// Enhanced tokenizer for programming languages
     fn tokenize_line_enhanced(&self, line_content: &str, entry_state: SyntaxState, bytes: &[u8]) -> (Vec<HighlightSpan>, SyntaxState) {
+        // Special handling for Markdown
+        if self.language == Language::Markdown {
+            return self.tokenize_markdown_line(line_content, entry_state, bytes);
+        }
+
         let mut new_spans = Vec::new();
         let mut current_state = entry_state;
         let mut current_pos = 0;
@@ -615,9 +797,9 @@ impl SyntaxHighlighter {
                         }
                     }
 
-                    // Check for Python # comments
+                    // Check for # comments (Python, R, Yaml, Shell)
                     if (self.language == Language::Python || self.language == Language::R ||
-                        self.language == Language::Yaml) && bytes[current_pos] == b'#' {
+                        self.language == Language::Yaml || self.language == Language::Shell) && bytes[current_pos] == b'#' {
                         if current_pos > span_start {
                             self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
                         }
@@ -678,9 +860,10 @@ impl SyntaxHighlighter {
                         continue;
                     }
 
-                    // Single quotes for Python, R, Rust, SQL
+                    // Single quotes for Python, R, Rust, SQL, Shell
                     if (self.language == Language::Python || self.language == Language::R ||
-                        self.language == Language::Rust || self.language == Language::Sql) && bytes[current_pos] == b'\'' {
+                        self.language == Language::Rust || self.language == Language::Sql ||
+                        self.language == Language::Shell) && bytes[current_pos] == b'\'' {
                         if current_pos > span_start {
                             self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
                         }
