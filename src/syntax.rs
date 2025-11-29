@@ -4,8 +4,29 @@ pub enum SyntaxState {
     Normal,
     StringDouble,     // Inside a double-quoted string "..."
     StringSingle,     // Inside a single-quoted string '...'
-    LineComment,      // Inside a single-line comment // or --
+    StringTriple,     // Inside a triple-quoted string (Python)
+    LineComment,      // Inside a single-line comment // or -- or #
     BlockComment,     // Inside a multi-line/block comment /* */
+    Keyword,          // Language keywords (if, for, while, etc.)
+    Type,             // Type names (int, str, bool, etc.)
+    Function,         // Function/method names
+    Number,           // Numeric literals
+    Operator,         // Operators (+, -, *, etc.)
+    Punctuation,      // Punctuation (brackets, parens, etc.)
+    MacroOrDecorator, // Rust macros or Python decorators
+}
+
+/// Language type for syntax highlighting
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    PlainText,
+    Python,
+    Sql,
+    Rust,
+    R,
+    Yaml,
+    Markdown,
+    Json,
 }
 
 /// Represents a highlighted span within a line
@@ -47,19 +68,38 @@ impl LineState {
 pub struct SyntaxHighlighter {
     /// State for each line in the buffer
     line_states: Vec<LineState>,
-    
+
     /// Lines that need to be re-highlighted (indices)
     dirty_lines: Vec<usize>,
-    
+
     /// Current viewport range for large files
     viewport_start: usize,
     viewport_end: usize,
-    
+
     /// Whether we're in viewport-only mode (for large files)
     viewport_mode: bool,
-    
+
     /// Buffer size around viewport (lines before/after to process)
     viewport_buffer: usize,
+
+    /// Current language for syntax highlighting
+    language: Language,
+}
+
+impl Language {
+    /// Detect language from file extension
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_lowercase().as_str() {
+            "py" | "pyw" => Language::Python,
+            "sql" | "mysql" | "psql" => Language::Sql,
+            "rs" => Language::Rust,
+            "r" | "rdata" | "rds" => Language::R,
+            "yaml" | "yml" => Language::Yaml,
+            "md" | "markdown" => Language::Markdown,
+            "json" | "jsonl" | "jsonc" => Language::Json,
+            _ => Language::PlainText,
+        }
+    }
 }
 
 impl SyntaxHighlighter {
@@ -71,9 +111,29 @@ impl SyntaxHighlighter {
             viewport_end: 0,
             viewport_mode: false,
             viewport_buffer: 500,
+            language: Language::PlainText,
         }
     }
-    
+
+    /// Set the language for syntax highlighting
+    pub fn set_language(&mut self, language: Language) {
+        if self.language != language {
+            self.language = language;
+            // Mark all lines as dirty when language changes
+            for i in 0..self.line_states.len() {
+                self.mark_dirty(i);
+            }
+        }
+    }
+
+    /// Set language from file path
+    pub fn set_language_from_path(&mut self, path: &str) {
+        if let Some(ext) = path.rsplit('.').next() {
+            let language = Language::from_extension(ext);
+            self.set_language(language);
+        }
+    }
+
     /// Set viewport for large file mode
     pub fn set_viewport(&mut self, start: usize, end: usize, total_lines: usize) {
         // Check if we should be in viewport mode
@@ -145,6 +205,113 @@ impl SyntaxHighlighter {
             self.mark_dirty(line);
         }
     }
+
+    /// Check if a word is a keyword for the current language
+    fn is_keyword(&self, word: &str) -> bool {
+        match self.language {
+            Language::Python => matches!(word,
+                "False" | "None" | "True" | "and" | "as" | "assert" | "async" | "await" |
+                "break" | "class" | "continue" | "def" | "del" | "elif" | "else" | "except" |
+                "finally" | "for" | "from" | "global" | "if" | "import" | "in" | "is" |
+                "lambda" | "nonlocal" | "not" | "or" | "pass" | "raise" | "return" |
+                "try" | "while" | "with" | "yield" | "match" | "case"
+            ),
+            Language::Sql => matches!(word.to_uppercase().as_str(),
+                "SELECT" | "FROM" | "WHERE" | "INSERT" | "UPDATE" | "DELETE" | "CREATE" |
+                "DROP" | "ALTER" | "TABLE" | "INDEX" | "VIEW" | "JOIN" | "LEFT" | "RIGHT" |
+                "INNER" | "OUTER" | "ON" | "AS" | "ORDER" | "BY" | "GROUP" | "HAVING" |
+                "UNION" | "AND" | "OR" | "NOT" | "IN" | "EXISTS" | "BETWEEN" | "LIKE" |
+                "IS" | "NULL" | "PRIMARY" | "KEY" | "FOREIGN" | "REFERENCES" | "CONSTRAINT" |
+                "DISTINCT" | "ALL" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "CASE" | "WHEN" |
+                "THEN" | "ELSE" | "END" | "BEGIN" | "COMMIT" | "ROLLBACK" | "TRANSACTION" |
+                "INTO" | "VALUES" | "DEFAULT" | "SET" | "OVER" | "WITH" | "PARTITION" |
+                "ROWS" | "RANGE" | "UNBOUNDED" | "PRECEDING" | "FOLLOWING" | "CURRENT" |
+                "ROW" | "WINDOW" | "RECURSIVE" | "RETURNING" | "CROSS" | "NATURAL" |
+                "USING" | "FULL" | "GRANT" | "REVOKE" | "TO" | "CASCADE" | "RESTRICT" |
+                "CHECK" | "UNIQUE" | "AUTO_INCREMENT" | "COLLATE" | "IF" | "IFNULL" |
+                "NULLIF" | "COALESCE" | "CAST" | "CONVERT" | "EXTRACT" | "SUBSTRING" |
+                "TRIM" | "UPPER" | "LOWER" | "LENGTH" | "CONCAT" | "REPLACE" | "ROUND" |
+                "FLOOR" | "CEIL" | "ABS" | "MOD" | "POWER" | "SQRT" | "NOW" | "CURRENT_DATE" |
+                "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "DATEADD" | "DATEDIFF" | "DATEPART" |
+                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "COUNT" | "SUM" |
+                "AVG" | "MIN" | "MAX" | "FIRST" | "LAST" | "RANK" | "DENSE_RANK" | "ROW_NUMBER" |
+                "LEAD" | "LAG" | "NTILE" | "CUME_DIST" | "PERCENT_RANK" | "FIRST_VALUE" |
+                "LAST_VALUE" | "NTH_VALUE" | "ANY" | "SOME" | "INTERSECT" | "EXCEPT" | "MINUS" |
+                "FOR" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "DECLARE" | "CURSOR" | "OPEN" |
+                "FETCH" | "CLOSE" | "DEALLOCATE" | "EXEC" | "EXECUTE" | "RETURNS" | "RETURN" |
+                "WHILE" | "LOOP" | "REPEAT" | "UNTIL" | "CONTINUE" | "BREAK" | "GOTO" | "LABEL" |
+                "TRY" | "CATCH" | "THROW" | "RAISERROR" | "PRINT" | "TRUNCATE" | "MERGE" |
+                "MATERIALIZED" | "TEMPORARY" | "TEMP" | "VOLATILE" | "IMMUTABLE" | "STABLE"
+            ),
+            Language::Rust => matches!(word,
+                "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" |
+                "false" | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" |
+                "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self" | "static" |
+                "struct" | "super" | "trait" | "true" | "type" | "unsafe" | "use" | "where" |
+                "while" | "async" | "await" | "dyn"
+            ),
+            Language::R => matches!(word,
+                "if" | "else" | "repeat" | "while" | "function" | "for" | "in" | "next" |
+                "break" | "TRUE" | "FALSE" | "NULL" | "Inf" | "NaN" | "NA" | "NA_integer_" |
+                "NA_real_" | "NA_complex_" | "NA_character_"
+            ),
+            Language::Yaml => matches!(word,
+                "true" | "false" | "yes" | "no" | "null" | "True" | "False" | "YES" | "NO" | "Null"
+            ),
+            Language::Json => matches!(word,
+                "true" | "false" | "null"
+            ),
+            Language::Markdown => false, // Markdown doesn't have traditional keywords
+            Language::PlainText => false,
+        }
+    }
+
+    /// Check if a word is a type for the current language
+    fn is_type(&self, word: &str) -> bool {
+        match self.language {
+            Language::Python => matches!(word,
+                "int" | "float" | "str" | "bool" | "list" | "dict" | "set" | "tuple" |
+                "bytes" | "bytearray" | "complex" | "frozenset" | "object" | "type" |
+                "range" | "slice" | "memoryview" | "property" | "classmethod" | "staticmethod" |
+                "super" | "enumerate" | "zip" | "map" | "filter" | "reversed" | "sorted" |
+                "len" | "abs" | "all" | "any" | "min" | "max" | "sum" | "round" | "pow" |
+                "iter" | "next" | "open" | "print" | "input" | "isinstance" | "issubclass" |
+                "hasattr" | "getattr" | "setattr" | "delattr" | "callable" | "dir" | "vars" |
+                "help" | "id" | "hash" | "hex" | "oct" | "bin" | "ord" | "chr" | "repr" | "ascii"
+            ),
+            Language::Sql => matches!(word.to_uppercase().as_str(),
+                "INT" | "INTEGER" | "VARCHAR" | "CHAR" | "TEXT" | "BOOLEAN" | "BOOL" |
+                "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" | "REAL" | "DATE" | "TIME" |
+                "TIMESTAMP" | "DATETIME" | "INTERVAL" | "BLOB" | "CLOB" | "JSON" | "JSONB" |
+                "UUID" | "SERIAL" | "BIGSERIAL" | "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" |
+                "LONGTEXT" | "MEDIUMTEXT" | "TINYTEXT" | "BINARY" | "VARBINARY" | "BIT" | "ENUM" |
+                "ARRAY" | "MONEY" | "XML" | "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON"
+            ),
+            Language::Rust => matches!(word,
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
+                "u8" | "u16" | "u32" | "u64" | "u128" | "usize" |
+                "f32" | "f64" | "bool" | "char" | "str" | "String" |
+                "Vec" | "Option" | "Result" | "Box" | "Rc" | "Arc" |
+                "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet"
+            ),
+            Language::R => matches!(word,
+                "numeric" | "integer" | "logical" | "character" | "complex" | "raw" |
+                "vector" | "matrix" | "array" | "list" | "data.frame" | "factor"
+            ),
+            Language::Json => false, // JSON doesn't have type keywords
+            _ => false,
+        }
+    }
+
+    /// Check if a character can be part of an identifier
+    fn is_ident_char(&self, ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_' || (self.language == Language::Python && ch == '@')
+    }
+
+    /// Check if a character can start an identifier
+    fn is_ident_start(&self, ch: char) -> bool {
+        ch.is_alphabetic() || ch == '_' || (self.language == Language::Python && ch == '@')
+    }
     
     /// Process a single line and update its state
     pub fn process_line(&mut self, line_index: usize, line_content: &str) {
@@ -152,31 +319,64 @@ impl SyntaxHighlighter {
         while self.line_states.len() <= line_index {
             self.line_states.push(LineState::new());
         }
-        
+
         // Get the entry state from the previous line
         let entry_state = if line_index > 0 && line_index - 1 < self.line_states.len() {
             self.line_states[line_index - 1].exit_state
         } else {
             SyntaxState::Normal
         };
-        
+
         // Parse the line and collect all the data we need
-        let mut new_spans = Vec::new();
         let content_hash = calculate_hash(line_content);
-        
-        // Parse the line
+        let bytes = line_content.as_bytes();
+
+        // Use the enhanced tokenizer if we're processing a programming language
+        let (new_spans, final_state) = if self.language != Language::PlainText {
+            self.tokenize_line_enhanced(line_content, entry_state, bytes)
+        } else {
+            self.tokenize_line_simple(line_content, entry_state, bytes)
+        };
+
+        // Set exit state (line comments don't carry over)
+        let new_exit_state = match final_state {
+            SyntaxState::LineComment => SyntaxState::Normal,
+            other => other,
+        };
+
+        // Check if we need to mark the next line as dirty before updating
+        let should_mark_next = if line_index + 1 < self.line_states.len() {
+            self.line_states[line_index + 1].entry_state != new_exit_state
+        } else {
+            false
+        };
+
+        // Now update the line state
+        let line_state = &mut self.line_states[line_index];
+        line_state.entry_state = entry_state;
+        line_state.exit_state = new_exit_state;
+        line_state.spans = new_spans;
+        line_state.content_hash = content_hash;
+
+        // Mark next line as dirty if needed
+        if should_mark_next {
+            self.mark_dirty(line_index + 1);
+        }
+    }
+
+    /// Simple tokenizer for plain text (existing logic)
+    fn tokenize_line_simple(&self, _line_content: &str, entry_state: SyntaxState, bytes: &[u8]) -> (Vec<HighlightSpan>, SyntaxState) {
+        let mut new_spans = Vec::new();
         let mut current_state = entry_state;
         let mut current_pos = 0;
         let mut span_start = 0;
-        let bytes = line_content.as_bytes();
-        
+
         while current_pos < bytes.len() {
             match current_state {
                 SyntaxState::Normal => {
-                    // Check for comment starts (check // and -- before /* to handle them correctly)
+                    // Check for comment starts
                     if current_pos + 1 < bytes.len() {
                         if bytes[current_pos] == b'/' && bytes[current_pos + 1] == b'/' {
-                            // Start C-style line comment
                             if current_pos > span_start {
                                 new_spans.push(HighlightSpan {
                                     start: span_start,
@@ -189,7 +389,6 @@ impl SyntaxHighlighter {
                             current_pos += 2;
                             continue;
                         } else if bytes[current_pos] == b'-' && bytes[current_pos + 1] == b'-' {
-                            // Start SQL-style line comment
                             if current_pos > span_start {
                                 new_spans.push(HighlightSpan {
                                     start: span_start,
@@ -202,7 +401,6 @@ impl SyntaxHighlighter {
                             current_pos += 2;
                             continue;
                         } else if bytes[current_pos] == b'/' && bytes[current_pos + 1] == b'*' {
-                            // Start block comment
                             if current_pos > span_start {
                                 new_spans.push(HighlightSpan {
                                     start: span_start,
@@ -216,10 +414,9 @@ impl SyntaxHighlighter {
                             continue;
                         }
                     }
-                    
+
                     // Check for string starts
                     if bytes[current_pos] == b'"' {
-                        // Start double-quoted string
                         if current_pos > span_start {
                             new_spans.push(HighlightSpan {
                                 start: span_start,
@@ -230,34 +427,15 @@ impl SyntaxHighlighter {
                         span_start = current_pos;
                         current_state = SyntaxState::StringDouble;
                         current_pos += 1;
-                    // TODO: Enable single-quote string detection for programming languages
-                    // For plain text, apostrophes are common and shouldn't be treated as strings
-                    /*
-                    } else if bytes[current_pos] == b'\'' {
-                        // Start single-quoted string
-                        if current_pos > span_start {
-                            new_spans.push(HighlightSpan {
-                                start: span_start,
-                                end: current_pos,
-                                state: SyntaxState::Normal,
-                            });
-                        }
-                        span_start = current_pos;
-                        current_state = SyntaxState::StringSingle;
-                        current_pos += 1;
-                    */
                     } else {
                         current_pos += 1;
                     }
                 }
-                
+
                 SyntaxState::StringDouble => {
-                    // Look for end of double-quoted string (handling escapes)
                     if bytes[current_pos] == b'\\' && current_pos + 1 < bytes.len() {
-                        // Skip escaped character
                         current_pos += 2;
                     } else if bytes[current_pos] == b'"' {
-                        // End of string
                         current_pos += 1;
                         new_spans.push(HighlightSpan {
                             start: span_start,
@@ -270,44 +448,14 @@ impl SyntaxHighlighter {
                         current_pos += 1;
                     }
                 }
-                
-                // TODO: Re-enable when we add language detection
-                SyntaxState::StringSingle => {
-                    // This state should never be reached with single quotes disabled
-                    // but we'll handle it gracefully just in case
-                    current_pos += 1;
-                    
-                    /* Original single-quote string handling for future use:
-                    // Look for end of single-quoted string (handling escapes)
-                    if bytes[current_pos] == b'\\' && current_pos + 1 < bytes.len() {
-                        // Skip escaped character
-                        current_pos += 2;
-                    } else if bytes[current_pos] == b'\'' {
-                        // End of string
-                        current_pos += 1;
-                        new_spans.push(HighlightSpan {
-                            start: span_start,
-                            end: current_pos,
-                            state: SyntaxState::StringSingle,
-                        });
-                        span_start = current_pos;
-                        current_state = SyntaxState::Normal;
-                    } else {
-                        current_pos += 1;
-                    }
-                    */
-                }
-                
+
                 SyntaxState::LineComment => {
-                    // Line comment continues to end of line
                     current_pos = bytes.len();
                 }
-                
+
                 SyntaxState::BlockComment => {
-                    // Look for end of block comment
-                    if current_pos + 1 < bytes.len() && 
+                    if current_pos + 1 < bytes.len() &&
                        bytes[current_pos] == b'*' && bytes[current_pos + 1] == b'/' {
-                        // End of block comment
                         current_pos += 2;
                         new_spans.push(HighlightSpan {
                             start: span_start,
@@ -320,9 +468,13 @@ impl SyntaxHighlighter {
                         current_pos += 1;
                     }
                 }
+
+                _ => {
+                    current_pos += 1;
+                }
             }
         }
-        
+
         // Add final span if needed
         if span_start < bytes.len() || (span_start == 0 && bytes.len() == 0) {
             new_spans.push(HighlightSpan {
@@ -331,31 +483,311 @@ impl SyntaxHighlighter {
                 state: current_state,
             });
         }
-        
-        // Set exit state (line comments don't carry over)
-        let new_exit_state = match current_state {
-            SyntaxState::LineComment => SyntaxState::Normal,
-            other => other,
-        };
-        
-        // Check if we need to mark the next line as dirty before updating
-        let should_mark_next = if line_index + 1 < self.line_states.len() {
-            self.line_states[line_index + 1].entry_state != new_exit_state
-        } else {
-            false
-        };
-        
-        // Now update the line state
-        let line_state = &mut self.line_states[line_index];
-        line_state.entry_state = entry_state;
-        line_state.exit_state = new_exit_state;
-        line_state.spans = new_spans;
-        line_state.content_hash = content_hash;
-        
-        // Mark next line as dirty if needed
-        if should_mark_next {
-            self.mark_dirty(line_index + 1);
+
+        (new_spans, current_state)
+    }
+
+    /// Tokenize normal code content (not inside strings/comments)
+    fn tokenize_normal_segment(&self, line_content: &str, start: usize, end: usize, spans: &mut Vec<HighlightSpan>) {
+        if start >= end {
+            return;
         }
+
+        let segment = &line_content[start..end];
+        let segment_bytes = segment.as_bytes();
+        let mut pos = 0;
+
+        while pos < segment_bytes.len() {
+            let ch = segment_bytes[pos] as char;
+            let abs_pos = start + pos;
+
+            // Skip whitespace
+            if ch.is_whitespace() {
+                pos += 1;
+                continue;
+            }
+
+            // Check for numbers
+            if ch.is_numeric() {
+                let token_start = pos;
+                while pos < segment_bytes.len() {
+                    let c = segment_bytes[pos] as char;
+                    if !c.is_numeric() && c != '.' && c != '_' {
+                        break;
+                    }
+                    pos += 1;
+                }
+                spans.push(HighlightSpan {
+                    start: start + token_start,
+                    end: start + pos,
+                    state: SyntaxState::Number,
+                });
+                continue;
+            }
+
+            // Check for identifiers/keywords
+            if ch.is_alphabetic() || ch == '_' || ch == '@' {
+                let token_start = pos;
+                while pos < segment_bytes.len() {
+                    let c = segment_bytes[pos] as char;
+                    if !c.is_alphanumeric() && c != '_' {
+                        break;
+                    }
+                    pos += 1;
+                }
+
+                let word = &segment[token_start..pos];
+
+                // Determine token type
+                let token_state = if self.is_keyword(word) {
+                    SyntaxState::Keyword
+                } else if self.is_type(word) {
+                    SyntaxState::Type
+                } else {
+                    // Check if it's a function call (followed by '(')
+                    let mut check_pos = pos;
+                    while check_pos < segment_bytes.len() && (segment_bytes[check_pos] as char).is_whitespace() {
+                        check_pos += 1;
+                    }
+                    if check_pos < segment_bytes.len() && segment_bytes[check_pos] == b'(' {
+                        SyntaxState::Function
+                    } else {
+                        SyntaxState::Normal
+                    }
+                };
+
+                spans.push(HighlightSpan {
+                    start: start + token_start,
+                    end: start + pos,
+                    state: token_state,
+                });
+                continue;
+            }
+
+            // Check for operators
+            if "+-*/%=<>!&|^~".contains(ch) {
+                spans.push(HighlightSpan {
+                    start: abs_pos,
+                    end: abs_pos + 1,
+                    state: SyntaxState::Operator,
+                });
+                pos += 1;
+                continue;
+            }
+
+            // Check for punctuation
+            if "()[]{},.;:".contains(ch) {
+                spans.push(HighlightSpan {
+                    start: abs_pos,
+                    end: abs_pos + 1,
+                    state: SyntaxState::Punctuation,
+                });
+                pos += 1;
+                continue;
+            }
+
+            // Other characters - skip
+            pos += 1;
+        }
+    }
+
+    /// Enhanced tokenizer for programming languages
+    fn tokenize_line_enhanced(&self, line_content: &str, entry_state: SyntaxState, bytes: &[u8]) -> (Vec<HighlightSpan>, SyntaxState) {
+        let mut new_spans = Vec::new();
+        let mut current_state = entry_state;
+        let mut current_pos = 0;
+        let mut span_start = 0;
+
+        while current_pos < bytes.len() {
+            match current_state {
+                SyntaxState::Normal => {
+                    // Check for Python triple-quoted strings
+                    if self.language == Language::Python && current_pos + 2 < bytes.len() {
+                        if (bytes[current_pos] == b'"' && bytes[current_pos + 1] == b'"' && bytes[current_pos + 2] == b'"') ||
+                           (bytes[current_pos] == b'\'' && bytes[current_pos + 1] == b'\'' && bytes[current_pos + 2] == b'\'') {
+                            if current_pos > span_start {
+                                self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                            }
+                            span_start = current_pos;
+                            current_state = SyntaxState::StringTriple;
+                            current_pos += 3;
+                            continue;
+                        }
+                    }
+
+                    // Check for Python # comments
+                    if (self.language == Language::Python || self.language == Language::R ||
+                        self.language == Language::Yaml) && bytes[current_pos] == b'#' {
+                        if current_pos > span_start {
+                            self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                        }
+                        span_start = current_pos;
+                        current_state = SyntaxState::LineComment;
+                        current_pos += 1;
+                        continue;
+                    }
+
+                    // Check for // comments (Rust, C-style)
+                    if (self.language == Language::Rust) && current_pos + 1 < bytes.len() {
+                        if bytes[current_pos] == b'/' && bytes[current_pos + 1] == b'/' {
+                            if current_pos > span_start {
+                                self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                            }
+                            span_start = current_pos;
+                            current_state = SyntaxState::LineComment;
+                            current_pos += 2;
+                            continue;
+                        }
+                    }
+
+                    // Check for -- comments (SQL)
+                    if self.language == Language::Sql && current_pos + 1 < bytes.len() {
+                        if bytes[current_pos] == b'-' && bytes[current_pos + 1] == b'-' {
+                            if current_pos > span_start {
+                                self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                            }
+                            span_start = current_pos;
+                            current_state = SyntaxState::LineComment;
+                            current_pos += 2;
+                            continue;
+                        }
+                    }
+
+                    // Check for /* */ comments
+                    if (self.language == Language::Rust || self.language == Language::Sql) &&
+                       current_pos + 1 < bytes.len() {
+                        if bytes[current_pos] == b'/' && bytes[current_pos + 1] == b'*' {
+                            if current_pos > span_start {
+                                self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                            }
+                            span_start = current_pos;
+                            current_state = SyntaxState::BlockComment;
+                            current_pos += 2;
+                            continue;
+                        }
+                    }
+
+                    // Check for string starts
+                    if bytes[current_pos] == b'"' {
+                        if current_pos > span_start {
+                            self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                        }
+                        span_start = current_pos;
+                        current_state = SyntaxState::StringDouble;
+                        current_pos += 1;
+                        continue;
+                    }
+
+                    // Single quotes for Python, R, Rust, SQL
+                    if (self.language == Language::Python || self.language == Language::R ||
+                        self.language == Language::Rust || self.language == Language::Sql) && bytes[current_pos] == b'\'' {
+                        if current_pos > span_start {
+                            self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                        }
+                        span_start = current_pos;
+                        current_state = SyntaxState::StringSingle;
+                        current_pos += 1;
+                        continue;
+                    }
+
+                    current_pos += 1;
+                }
+
+                SyntaxState::StringDouble => {
+                    if bytes[current_pos] == b'\\' && current_pos + 1 < bytes.len() {
+                        current_pos += 2;
+                    } else if bytes[current_pos] == b'"' {
+                        current_pos += 1;
+                        new_spans.push(HighlightSpan {
+                            start: span_start,
+                            end: current_pos,
+                            state: SyntaxState::StringDouble,
+                        });
+                        span_start = current_pos;
+                        current_state = SyntaxState::Normal;
+                    } else {
+                        current_pos += 1;
+                    }
+                }
+
+                SyntaxState::StringSingle => {
+                    if bytes[current_pos] == b'\\' && current_pos + 1 < bytes.len() {
+                        current_pos += 2;
+                    } else if bytes[current_pos] == b'\'' {
+                        current_pos += 1;
+                        new_spans.push(HighlightSpan {
+                            start: span_start,
+                            end: current_pos,
+                            state: SyntaxState::StringSingle,
+                        });
+                        span_start = current_pos;
+                        current_state = SyntaxState::Normal;
+                    } else {
+                        current_pos += 1;
+                    }
+                }
+
+                SyntaxState::StringTriple => {
+                    // Look for closing triple quote
+                    if current_pos + 2 < bytes.len() {
+                        let opening_char = if line_content[span_start..].starts_with("\"\"\"") { b'"' } else { b'\'' };
+                        if bytes[current_pos] == opening_char &&
+                           bytes[current_pos + 1] == opening_char &&
+                           bytes[current_pos + 2] == opening_char {
+                            current_pos += 3;
+                            new_spans.push(HighlightSpan {
+                                start: span_start,
+                                end: current_pos,
+                                state: SyntaxState::StringTriple,
+                            });
+                            span_start = current_pos;
+                            current_state = SyntaxState::Normal;
+                            continue;
+                        }
+                    }
+                    current_pos += 1;
+                }
+
+                SyntaxState::LineComment => {
+                    current_pos = bytes.len();
+                }
+
+                SyntaxState::BlockComment => {
+                    if current_pos + 1 < bytes.len() &&
+                       bytes[current_pos] == b'*' && bytes[current_pos + 1] == b'/' {
+                        current_pos += 2;
+                        new_spans.push(HighlightSpan {
+                            start: span_start,
+                            end: current_pos,
+                            state: SyntaxState::BlockComment,
+                        });
+                        span_start = current_pos;
+                        current_state = SyntaxState::Normal;
+                    } else {
+                        current_pos += 1;
+                    }
+                }
+
+                _ => {
+                    current_pos += 1;
+                }
+            }
+        }
+
+        // Add final span if needed
+        if current_state == SyntaxState::Normal {
+            if span_start < bytes.len() {
+                self.tokenize_normal_segment(line_content, span_start, bytes.len(), &mut new_spans);
+            }
+        } else if span_start < bytes.len() || (span_start == 0 && bytes.len() == 0) {
+            new_spans.push(HighlightSpan {
+                start: span_start,
+                end: bytes.len(),
+                state: current_state,
+            });
+        }
+
+        (new_spans, current_state)
     }
     
     /// Process all dirty lines
@@ -428,7 +860,7 @@ impl SyntaxHighlighter {
         // Check if we need to mark subsequent lines as dirty
         // If the insertion might affect the syntactic state of following lines,
         // we need to mark them as dirty too
-        if let Some(prev_exit_state) = exit_state_before {
+        if let Some(_prev_exit_state) = exit_state_before {
             // After processing the inserted lines, their exit state might differ
             // from what the next line expects. Mark all subsequent lines that might
             // be affected until we find a stable point

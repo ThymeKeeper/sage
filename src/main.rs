@@ -364,6 +364,8 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                 if !fr.is_empty() {
                                     if let Some((start, end)) = fr.next_match() {
                                         editor.select_range(start, end);
+                                        // Update current match index for highlighting
+                                        editor.set_find_matches(fr.get_all_matches().to_vec(), fr.get_current_match_index());
                                     }
                                 }
                             }
@@ -371,6 +373,8 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                 if !fr.is_empty() {
                                     if let Some((start, end)) = fr.prev_match() {
                                         editor.select_range(start, end);
+                                        // Update current match index for highlighting
+                                        editor.set_find_matches(fr.get_all_matches().to_vec(), fr.get_current_match_index());
                                     }
                                 }
                             }
@@ -380,7 +384,9 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                     if editor.replace_selection(fr.replace_text()) {
                                         // Re-search after replacement
                                         let matches = editor.find_all(fr.find_text());
-                                        fr.update_matches(matches);
+                                        fr.update_matches(matches.clone());
+                                        // Update editor's find matches for highlighting
+                                        editor.set_find_matches(matches, fr.get_current_match_index());
                                         // Move to next match
                                         if let Some((start, end)) = fr.current_match_position() {
                                             editor.select_range(start, end);
@@ -393,14 +399,15 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                     let find_text = fr.find_text().to_string();
                                     let replace_text = fr.replace_text().to_string();
                                     let matches = editor.find_all(&find_text);
-                                    
+
                                     // Replace all from last to first to maintain positions
                                     for &(start, end) in matches.iter().rev() {
                                         editor.replace_at(start, end, &replace_text);
                                     }
-                                    
+
                                     // Clear matches and update
                                     fr.update_matches(Vec::new());
+                                    editor.clear_find_matches();
                                 }
                             }
                             _ => {}
@@ -421,8 +428,9 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         match result {
                             find_replace::InputResult::Close => {
                                 find_replace = None;
-                                // Clear selection when closing find
+                                // Clear selection and find matches when closing find
                                 editor.selection_start = None;
+                                editor.clear_find_matches();
                                 // Force redraw
                                 execute!(io::stdout(), 
                                     crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
@@ -434,6 +442,8 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                 // Update search results
                                 let matches = editor.find_all(fr.find_text());
                                 fr.update_matches(matches.clone());
+                                // Update editor's find matches for highlighting
+                                editor.set_find_matches(matches, Some(0));
                                 // Select first match if any
                                 if let Some((start, end)) = fr.current_match_position() {
                                     editor.select_range(start, end);
@@ -445,6 +455,8 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                 if !fr.is_empty() {
                                     if let Some((start, end)) = fr.next_match() {
                                         editor.select_range(start, end);
+                                        // Update current match index for highlighting
+                                        editor.set_find_matches(fr.get_all_matches().to_vec(), fr.get_current_match_index());
                                     }
                                 }
                             }

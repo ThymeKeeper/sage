@@ -47,6 +47,10 @@ pub struct Editor {
     syntax: SyntaxHighlighter,       // Syntax highlighting state
     read_only: bool,                  // Whether the file is read-only
     pub status_message: Option<(String, bool)>, // Status bar message (text, is_error)
+    matching_brackets: Option<(usize, usize)>, // Positions of matching brackets
+    matching_text_positions: Vec<(usize, usize)>, // Positions of text matching the selection
+    find_matches: Vec<(usize, usize)>, // Positions of find/replace matches
+    current_find_match: Option<usize>, // Index of the current find match
 }
 
 impl Editor {
@@ -126,6 +130,10 @@ impl Editor {
             syntax: SyntaxHighlighter::new(),
             read_only: false,
             status_message: None,
+            matching_brackets: None,
+            matching_text_positions: Vec::new(),
+            find_matches: Vec::new(),
+            current_find_match: None,
         }
     }
     
@@ -148,8 +156,12 @@ impl Editor {
         
         // Initialize syntax highlighting
         self.syntax = SyntaxHighlighter::new();
+
+        // Set language based on file extension
+        self.syntax.set_language_from_path(path);
+
         let line_count = self.buffer.len_lines();
-        
+
         // For large files, use viewport mode; otherwise init all lines
         if line_count <= 50_000 {
             self.syntax.init_all_lines(line_count);
@@ -271,10 +283,26 @@ impl Editor {
     fn delete_selection(&mut self) -> bool {
         if let Some((start, end)) = self.get_selection() {
             let cursor_before = self.cursor;
+
+            // Track line changes for syntax highlighting
+            let start_line = self.buffer.byte_to_line(start);
+            let end_line = self.buffer.byte_to_line(end);
+            let lines_affected = end_line - start_line;
+
             self.buffer.delete(start, end, cursor_before, start);
             self.cursor = start;
             self.selection_start = None;
             self.modified = true;
+
+            // Update syntax highlighting
+            if lines_affected > 0 {
+                // Multiple lines were deleted
+                self.syntax.lines_deleted(start_line, lines_affected);
+            } else {
+                // Single line modification
+                self.syntax.line_modified(start_line);
+            }
+
             true
         } else {
             false
@@ -426,14 +454,27 @@ impl Editor {
                     // Otherwise delete character after cursor
                     if self.cursor < self.buffer.len_bytes() {
                         let cursor_before = self.cursor;
-                        
+                        let line_before = self.buffer.byte_to_line(self.cursor);
+
                         // Find the next character boundary
                         let char_pos = self.buffer.byte_to_char(self.cursor);
                         let next_char_pos = char_pos + 1;
                         let next_byte = self.buffer.char_to_byte(next_char_pos);
-                        
+
                         self.buffer.delete(self.cursor, next_byte, cursor_before, self.cursor);
                         self.modified = true;
+
+                        // Update syntax - check if we deleted a newline (merged lines)
+                        let line_after = self.buffer.byte_to_line(self.cursor);
+                        if line_before < self.buffer.len_lines() {
+                            // Check if a line was removed (newline was deleted)
+                            if self.buffer.len_lines() < line_before + 2 ||
+                               self.buffer.line_to_byte(line_before + 1) > next_byte {
+                                // Lines were merged
+                                self.syntax.lines_deleted(line_before, 1);
+                            }
+                            self.syntax.line_modified(line_after);
+                        }
                     }
                 }
                 self.preferred_column = None; // Clear preferred column
@@ -655,7 +696,8 @@ impl Editor {
             // Selection movement commands
             Command::SelectLeft => {
                 if self.selection_start.is_none() {
-                    self.set_selection_start(self.cursor);
+                    // Set anchor at exact cursor position (don't skip spaces)
+                    self.selection_start = Some(self.cursor);
                 }
                 if self.cursor > 0 {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
@@ -666,10 +708,11 @@ impl Editor {
                 }
                 self.preferred_column = None; // Clear on horizontal movement
             }
-            
+
             Command::SelectRight => {
                 if self.selection_start.is_none() {
-                    self.set_selection_start(self.cursor);
+                    // Set anchor at exact cursor position (don't skip spaces)
+                    self.selection_start = Some(self.cursor);
                 }
                 if self.cursor < self.buffer.len_bytes() {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
@@ -681,7 +724,8 @@ impl Editor {
             
             Command::SelectUp => {
                 if self.selection_start.is_none() {
-                    self.set_selection_start(self.cursor);
+                    // Set anchor at exact cursor position (don't skip spaces)
+                    self.selection_start = Some(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line > 0 {
@@ -749,7 +793,8 @@ impl Editor {
             
             Command::SelectDown => {
                 if self.selection_start.is_none() {
-                    self.set_selection_start(self.cursor);
+                    // Set anchor at exact cursor position (don't skip spaces)
+                    self.selection_start = Some(self.cursor);
                 }
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 if current_line < self.buffer.len_lines() - 1 {
@@ -1196,14 +1241,20 @@ impl Editor {
                     self.cursor = cursor.min(self.buffer.len_bytes());
                     self.modified = self.buffer.can_undo();
                     cursor_moved = true;
+
+                    // Reinitialize syntax highlighting after undo
+                    self.reinit_syntax_highlighting();
                 }
             }
-            
+
             Command::Redo => {
                 if let Some(cursor) = self.buffer.redo() {
                     self.cursor = cursor.min(self.buffer.len_bytes());
                     self.modified = true;
                     cursor_moved = true;
+
+                    // Reinitialize syntax highlighting after redo
+                    self.reinit_syntax_highlighting();
                 }
             }
             
@@ -1474,20 +1525,22 @@ impl Editor {
         }
         
         // Update viewport if cursor moved (but not for pure viewport scrolling)
-        if cursor_moved || matches!(cmd, 
+        if cursor_moved || matches!(cmd,
             Command::InsertChar(_) | Command::InsertNewline | Command::InsertTab |
             Command::Indent | Command::Dedent |
             Command::Backspace | Command::Delete | Command::Paste |
             Command::SelectUp | Command::SelectDown | Command::SelectLeft | Command::SelectRight |
             Command::SelectHome | Command::SelectEnd | Command::SelectAll |
-            Command::MoveWordLeft | Command::MoveWordRight | 
+            Command::MoveWordLeft | Command::MoveWordRight |
             Command::MoveParagraphUp | Command::MoveParagraphDown |
             Command::SelectWordLeft | Command::SelectWordRight |
             Command::SelectParagraphUp | Command::SelectParagraphDown
         ) {
             self.update_viewport_for_cursor();
+            // Update bracket and text matching after cursor/selection changes
+            self.update_matching();
         }
-        
+
         Ok(())
     }
     
@@ -2104,5 +2157,184 @@ impl Editor {
     /// Clear the status message
     pub fn clear_status_message(&mut self) {
         self.status_message = None;
+    }
+
+    /// Reinitialize syntax highlighting (e.g., after undo/redo that changes line count)
+    fn reinit_syntax_highlighting(&mut self) {
+        let line_count = self.buffer.len_lines();
+
+        // For large files, use viewport mode; otherwise init all lines
+        if line_count <= 50_000 {
+            self.syntax.init_all_lines(line_count);
+            self.syntax.process_dirty_lines(|line_index| {
+                if line_index < self.buffer.len_lines() {
+                    Some(self.buffer.line(line_index).to_string())
+                } else {
+                    None
+                }
+            });
+        } else {
+            // For large files, just mark all lines as dirty and let viewport mode handle it
+            self.syntax.init_all_lines(line_count);
+        }
+    }
+
+    /// Find matching bracket/parenthesis near the cursor
+    fn find_matching_brackets(&mut self) {
+        self.matching_brackets = None;
+
+        if self.cursor > self.buffer.len_bytes() {
+            return;
+        }
+
+        let text = self.buffer.to_string();
+        let bytes = text.as_bytes();
+
+        // Only check character at cursor position (when block cursor is covering the bracket)
+        if self.cursor < bytes.len() {
+            let char_at_cursor = bytes[self.cursor] as char;
+
+            // Check for opening bracket
+            if matches!(char_at_cursor, '(' | '[' | '{') {
+                if let Some(match_pos) = self.find_matching_close(bytes, self.cursor, char_at_cursor) {
+                    self.matching_brackets = Some((self.cursor, match_pos));
+                    return;
+                }
+            }
+
+            // Check for closing bracket
+            if matches!(char_at_cursor, ')' | ']' | '}') {
+                if let Some(match_pos) = self.find_matching_open(bytes, self.cursor, char_at_cursor) {
+                    self.matching_brackets = Some((match_pos, self.cursor));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Find matching opening bracket scanning backward
+    fn find_matching_open(&self, bytes: &[u8], close_pos: usize, close_char: char) -> Option<usize> {
+        let open_char = match close_char {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            _ => return None,
+        };
+
+        let mut depth = 1;
+        let mut pos = close_pos;
+
+        while pos > 0 {
+            pos -= 1;
+            let ch = bytes[pos] as char;
+
+            if ch == close_char {
+                depth += 1;
+            } else if ch == open_char {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(pos);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Find matching closing bracket scanning forward
+    fn find_matching_close(&self, bytes: &[u8], open_pos: usize, open_char: char) -> Option<usize> {
+        let close_char = match open_char {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            _ => return None,
+        };
+
+        let mut depth = 1;
+        let mut pos = open_pos + 1;
+
+        while pos < bytes.len() {
+            let ch = bytes[pos] as char;
+
+            if ch == open_char {
+                depth += 1;
+            } else if ch == close_char {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(pos);
+                }
+            }
+
+            pos += 1;
+        }
+
+        None
+    }
+
+    /// Find all occurrences of the selected text in the buffer
+    fn find_matching_text(&mut self) {
+        self.matching_text_positions.clear();
+
+        if let Some((start, end)) = self.get_selection() {
+            // Only highlight if selection is more than 2 characters
+            if end - start <= 2 {
+                return;
+            }
+
+            let selected_text = self.buffer.rope().byte_slice(start..end).to_string();
+            let buffer_text = self.buffer.to_string();
+
+            // Find all matches
+            let mut search_pos = 0;
+            while let Some(pos) = buffer_text[search_pos..].find(&selected_text) {
+                let match_start = search_pos + pos;
+                let match_end = match_start + selected_text.len();
+
+                // Don't include the current selection itself
+                if match_start != start {
+                    self.matching_text_positions.push((match_start, match_end));
+                }
+
+                search_pos = match_start + 1;
+            }
+        }
+    }
+
+    /// Update bracket matching and text matching
+    pub fn update_matching(&mut self) {
+        self.find_matching_brackets();
+        self.find_matching_text();
+    }
+
+    /// Get matching brackets for rendering
+    pub fn get_matching_brackets(&self) -> Option<(usize, usize)> {
+        self.matching_brackets
+    }
+
+    /// Get matching text positions for rendering
+    pub fn get_matching_text_positions(&self) -> &[(usize, usize)] {
+        &self.matching_text_positions
+    }
+
+    /// Set find matches from find/replace window
+    pub fn set_find_matches(&mut self, matches: Vec<(usize, usize)>, current_match: Option<usize>) {
+        self.find_matches = matches;
+        self.current_find_match = current_match;
+    }
+
+    /// Clear find matches
+    pub fn clear_find_matches(&mut self) {
+        self.find_matches.clear();
+        self.current_find_match = None;
+    }
+
+    /// Get find matches for rendering
+    pub fn get_find_matches(&self) -> &[(usize, usize)] {
+        &self.find_matches
+    }
+
+    /// Get current find match index
+    pub fn get_current_find_match(&self) -> Option<usize> {
+        self.current_find_match
     }
 }

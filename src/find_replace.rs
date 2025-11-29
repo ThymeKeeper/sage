@@ -102,7 +102,21 @@ impl FindReplace {
     pub fn is_empty(&self) -> bool {
         self.find_text.is_empty()
     }
-    
+
+    /// Get all match positions
+    pub fn get_all_matches(&self) -> &[(usize, usize)] {
+        &self.matches
+    }
+
+    /// Get current match index
+    pub fn get_current_match_index(&self) -> Option<usize> {
+        if self.total_matches > 0 {
+            Some(self.current_match)
+        } else {
+            None
+        }
+    }
+
     /// Get the current selection in the active field (start, end)
     fn get_selection(&self) -> Option<(usize, usize)> {
         self.selection_start.map(|start| {

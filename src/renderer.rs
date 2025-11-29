@@ -147,7 +147,11 @@ impl Renderer {
         let viewport_offset = editor.viewport_offset();
         let selection = editor.selection();
         let buffer = editor.buffer();
-        
+        let matching_brackets = editor.get_matching_brackets();
+        let matching_text_positions = editor.get_matching_text_positions();
+        let find_matches = editor.get_find_matches();
+        let current_find_match = editor.get_current_find_match();
+
         // Hide cursor while drawing
         #[cfg(target_os = "windows")]
         write!(self.stdout, "\x1b[?25l")?;
@@ -240,7 +244,23 @@ impl Renderer {
                                 let is_selected = selection.map_or(false, |(sel_start, sel_end)| {
                                     byte_pos >= sel_start && byte_pos < sel_end
                                 });
-                                
+
+                                // Check if this character is a matching bracket
+                                let is_matching_bracket = matching_brackets.map_or(false, |(pos1, pos2)| {
+                                    byte_pos == pos1 || byte_pos == pos2
+                                });
+
+                                // Check if this character is part of matching text
+                                let is_matching_text = matching_text_positions.iter().any(|(start, end)| {
+                                    byte_pos >= *start && byte_pos < *end
+                                });
+
+                                // Check if this character is part of a find match
+                                let (is_find_match, is_current_find_match) = find_matches.iter().enumerate()
+                                    .find(|(_, (start, end))| byte_pos >= *start && byte_pos < *end)
+                                    .map(|(idx, _)| (true, current_find_match == Some(idx)))
+                                    .unwrap_or((false, false));
+
                                 // Check syntax highlighting for this character
                                 let mut syntax_state = SyntaxState::Normal;
                                 if let Some(spans) = syntax_spans {
@@ -257,16 +277,56 @@ impl Renderer {
                                     if is_selected {
                                         // Use same cadet blue as cursor (#5F9EA0) with black text
                                         formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
+                                    } else if is_current_find_match {
+                                        // Bright orange background for current find match
+                                        formatted_line.push_str("\x1b[48;2;200;150;100m\x1b[38;2;0;0;0m"); // Bright orange + black text
+                                    } else if is_find_match {
+                                        // Dimmer orange background for other find matches
+                                        formatted_line.push_str("\x1b[48;2;120;90;60m"); // Dim orange background
+                                    } else if is_matching_bracket {
+                                        // Bright yellow for matching brackets
+                                        formatted_line.push_str("\x1b[38;2;220;220;120m\x1b[1m"); // Bright yellow + bold
+                                    } else if is_matching_text {
+                                        // Dim version of selection background for matching text
+                                        formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
                                     } else {
-                                        // Apply syntax highlighting colors for plain text
+                                        // Apply syntax highlighting colors - muted and professional
                                         match syntax_state {
-                                            SyntaxState::StringDouble | SyntaxState::StringSingle => {
-                                                // Slightly dimmer grey for strings
-                                                formatted_line.push_str("\x1b[38;2;140;140;140m"); // #8C8C8C
+                                            SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple => {
+                                                // Muted green for strings
+                                                formatted_line.push_str("\x1b[38;2;152;180;152m"); // #98B498
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Even dimmer grey for comments
+                                                // Dimmer grey for comments
                                                 formatted_line.push_str("\x1b[38;2;110;110;110m"); // #6E6E6E
+                                            }
+                                            SyntaxState::Keyword => {
+                                                // Muted blue for keywords
+                                                formatted_line.push_str("\x1b[38;2;135;160;180m"); // #87A0B4
+                                            }
+                                            SyntaxState::Type => {
+                                                // Muted teal for types
+                                                formatted_line.push_str("\x1b[38;2;132;170;170m"); // #84AAAA
+                                            }
+                                            SyntaxState::Function => {
+                                                // Muted yellow for functions
+                                                formatted_line.push_str("\x1b[38;2;200;190;150m"); // #C8BE96
+                                            }
+                                            SyntaxState::Number => {
+                                                // Muted orange for numbers
+                                                formatted_line.push_str("\x1b[38;2;200;170;140m"); // #C8AA8C
+                                            }
+                                            SyntaxState::Operator => {
+                                                // Lighter grey for operators
+                                                formatted_line.push_str("\x1b[38;2;160;160;160m"); // #A0A0A0
+                                            }
+                                            SyntaxState::Punctuation => {
+                                                // Default color for punctuation
+                                                // No need to set color
+                                            }
+                                            SyntaxState::MacroOrDecorator => {
+                                                // Muted purple for macros/decorators
+                                                formatted_line.push_str("\x1b[38;2;180;150;180m"); // #B496B4
                                             }
                                             SyntaxState::Normal => {
                                                 // Normal text - default foreground color
@@ -275,10 +335,18 @@ impl Renderer {
                                         }
                                     }
                                     formatted_line.push(ch);
-                                    if is_selected {
+                                    if is_selected || is_current_find_match || is_find_match {
                                         formatted_line.push_str("\x1b[0m");
                                         formatted_line.push_str(line_bg_color); // Reset and restore line background
-                                    } else if syntax_state != SyntaxState::Normal {
+                                    } else if is_matching_bracket {
+                                        // Reset bold and color
+                                        formatted_line.push_str("\x1b[0m");
+                                        formatted_line.push_str(line_bg_color); // Restore line background
+                                    } else if is_matching_text {
+                                        // Reset background
+                                        formatted_line.push_str("\x1b[49m");
+                                        formatted_line.push_str(line_bg_color); // Restore line background
+                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
                                         // Reset color after syntax-highlighted character
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
@@ -289,16 +357,56 @@ impl Renderer {
                                     if is_selected {
                                         // Use same cadet blue as cursor (#5F9EA0) with black text
                                         formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
+                                    } else if is_current_find_match {
+                                        // Bright orange background for current find match
+                                        formatted_line.push_str("\x1b[48;2;200;150;100m\x1b[38;2;0;0;0m"); // Bright orange + black text
+                                    } else if is_find_match {
+                                        // Dimmer orange background for other find matches
+                                        formatted_line.push_str("\x1b[48;2;120;90;60m"); // Dim orange background
+                                    } else if is_matching_bracket {
+                                        // Bright yellow for matching brackets
+                                        formatted_line.push_str("\x1b[38;2;220;220;120m\x1b[1m"); // Bright yellow + bold
+                                    } else if is_matching_text {
+                                        // Dim version of selection background for matching text
+                                        formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
                                     } else {
-                                        // Apply syntax highlighting colors for plain text
+                                        // Apply syntax highlighting colors - muted and professional
                                         match syntax_state {
-                                            SyntaxState::StringDouble | SyntaxState::StringSingle => {
-                                                // Slightly dimmer grey for strings
-                                                formatted_line.push_str("\x1b[38;2;140;140;140m"); // #8C8C8C
+                                            SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple => {
+                                                // Muted green for strings
+                                                formatted_line.push_str("\x1b[38;2;152;180;152m"); // #98B498
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Even dimmer grey for comments
+                                                // Dimmer grey for comments
                                                 formatted_line.push_str("\x1b[38;2;110;110;110m"); // #6E6E6E
+                                            }
+                                            SyntaxState::Keyword => {
+                                                // Muted blue for keywords
+                                                formatted_line.push_str("\x1b[38;2;135;160;180m"); // #87A0B4
+                                            }
+                                            SyntaxState::Type => {
+                                                // Muted teal for types
+                                                formatted_line.push_str("\x1b[38;2;132;170;170m"); // #84AAAA
+                                            }
+                                            SyntaxState::Function => {
+                                                // Muted yellow for functions
+                                                formatted_line.push_str("\x1b[38;2;200;190;150m"); // #C8BE96
+                                            }
+                                            SyntaxState::Number => {
+                                                // Muted orange for numbers
+                                                formatted_line.push_str("\x1b[38;2;200;170;140m"); // #C8AA8C
+                                            }
+                                            SyntaxState::Operator => {
+                                                // Lighter grey for operators
+                                                formatted_line.push_str("\x1b[38;2;160;160;160m"); // #A0A0A0
+                                            }
+                                            SyntaxState::Punctuation => {
+                                                // Default color for punctuation
+                                                // No need to set color
+                                            }
+                                            SyntaxState::MacroOrDecorator => {
+                                                // Muted purple for macros/decorators
+                                                formatted_line.push_str("\x1b[38;2;180;150;180m"); // #B496B4
                                             }
                                             SyntaxState::Normal => {
                                                 // Normal text - default foreground color
@@ -307,10 +415,18 @@ impl Renderer {
                                         }
                                     }
                                     formatted_line.push(ch);
-                                    if is_selected {
+                                    if is_selected || is_current_find_match || is_find_match {
                                         formatted_line.push_str("\x1b[0m");
                                         formatted_line.push_str(line_bg_color); // Reset and restore line background
-                                    } else if syntax_state != SyntaxState::Normal {
+                                    } else if is_matching_bracket {
+                                        // Reset bold and color
+                                        formatted_line.push_str("\x1b[0m");
+                                        formatted_line.push_str(line_bg_color); // Restore line background
+                                    } else if is_matching_text {
+                                        // Reset background
+                                        formatted_line.push_str("\x1b[49m");
+                                        formatted_line.push_str(line_bg_color); // Restore line background
+                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
                                         // Reset color after syntax-highlighted character
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
