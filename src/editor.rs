@@ -261,21 +261,46 @@ impl Editor {
         }
     }
     
+    /// Ensure a byte position is on a valid character boundary
+    fn ensure_char_boundary(&self, pos: usize) -> usize {
+        let char_pos = self.buffer.byte_to_char(pos);
+        self.buffer.char_to_byte(char_pos)
+    }
+
     /// Get the current selection as (start, end) byte positions
     fn get_selection(&self) -> Option<(usize, usize)> {
         self.selection_start.map(|start| {
-            if start < self.cursor {
-                (start, self.cursor)
+            // Ensure both positions are on character boundaries
+            let start = self.ensure_char_boundary(start);
+            let cursor = self.ensure_char_boundary(self.cursor);
+
+            if start < cursor {
+                (start, cursor)
             } else {
-                (self.cursor, start)
+                (cursor, start)
             }
         })
     }
     
     /// Get selected text
     fn get_selected_text(&self) -> Option<String> {
-        self.get_selection().map(|(start, end)| {
-            self.buffer.rope().byte_slice(start..end).to_string()
+        self.get_selection().and_then(|(start, end)| {
+            // Validate range before attempting byte_slice
+            if start >= end || end > self.buffer.len_bytes() {
+                return None;
+            }
+
+            // Try to get the text, catching any panics
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.buffer.rope().byte_slice(start..end).to_string()
+            })) {
+                Ok(text) => Some(text),
+                Err(_) => {
+                    eprintln!("Warning: get_selected_text failed with start={}, end={}, len={}",
+                             start, end, self.buffer.len_bytes());
+                    None
+                }
+            }
         })
     }
     
@@ -697,12 +722,15 @@ impl Editor {
             Command::SelectLeft => {
                 if self.selection_start.is_none() {
                     // Set anchor at exact cursor position (don't skip spaces)
-                    self.selection_start = Some(self.cursor);
+                    // Ensure it's on a character boundary
+                    self.selection_start = Some(self.ensure_char_boundary(self.cursor));
                 }
                 if self.cursor > 0 {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
                     if char_pos > 0 {
-                        self.cursor = self.buffer.char_to_byte(char_pos - 1);
+                        let new_cursor = self.buffer.char_to_byte(char_pos - 1);
+                        // Ensure the new cursor position is on a character boundary
+                        self.cursor = self.ensure_char_boundary(new_cursor);
                         cursor_moved = true;
                     }
                 }
@@ -712,11 +740,14 @@ impl Editor {
             Command::SelectRight => {
                 if self.selection_start.is_none() {
                     // Set anchor at exact cursor position (don't skip spaces)
-                    self.selection_start = Some(self.cursor);
+                    // Ensure it's on a character boundary
+                    self.selection_start = Some(self.ensure_char_boundary(self.cursor));
                 }
                 if self.cursor < self.buffer.len_bytes() {
                     let char_pos = self.buffer.byte_to_char(self.cursor);
-                    self.cursor = self.buffer.char_to_byte(char_pos + 1);
+                    let new_cursor = self.buffer.char_to_byte(char_pos + 1);
+                    // Ensure the new cursor position is on a character boundary
+                    self.cursor = self.ensure_char_boundary(new_cursor);
                     cursor_moved = true;
                 }
                 self.preferred_column = None; // Clear on horizontal movement
@@ -1238,7 +1269,8 @@ impl Editor {
             
             Command::Undo => {
                 if let Some(cursor) = self.buffer.undo() {
-                    self.cursor = cursor.min(self.buffer.len_bytes());
+                    let cursor = cursor.min(self.buffer.len_bytes());
+                    self.cursor = self.ensure_char_boundary(cursor);
                     self.modified = self.buffer.can_undo();
                     cursor_moved = true;
 
@@ -1249,7 +1281,8 @@ impl Editor {
 
             Command::Redo => {
                 if let Some(cursor) = self.buffer.redo() {
-                    self.cursor = cursor.min(self.buffer.len_bytes());
+                    let cursor = cursor.min(self.buffer.len_bytes());
+                    self.cursor = self.ensure_char_boundary(cursor);
                     self.modified = true;
                     cursor_moved = true;
 
@@ -2281,21 +2314,55 @@ impl Editor {
                 return;
             }
 
-            let selected_text = self.buffer.rope().byte_slice(start..end).to_string();
+            // Ensure start and end are on character boundaries by converting through char positions
+            let start_char = self.buffer.byte_to_char(start);
+            let end_char = self.buffer.byte_to_char(end);
+            let start = self.buffer.char_to_byte(start_char);
+            let end = self.buffer.char_to_byte(end_char);
+
+            // Validate the range
+            if start >= end || end > self.buffer.len_bytes() {
+                return;
+            }
+
+            // Try to get the selected text, but handle any potential panics gracefully
+            let selected_text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.buffer.rope().byte_slice(start..end).to_string()
+            })) {
+                Ok(text) => text,
+                Err(_) => {
+                    // If byte_slice panics, just skip highlighting
+                    eprintln!("Warning: byte_slice failed with start={}, end={}, len={}",
+                             start, end, self.buffer.len_bytes());
+                    return;
+                }
+            };
             let buffer_text = self.buffer.to_string();
 
             // Find all matches
             let mut search_pos = 0;
-            while let Some(pos) = buffer_text[search_pos..].find(&selected_text) {
-                let match_start = search_pos + pos;
-                let match_end = match_start + selected_text.len();
-
-                // Don't include the current selection itself
-                if match_start != start {
-                    self.matching_text_positions.push((match_start, match_end));
+            while search_pos < buffer_text.len() {
+                // Ensure search_pos is on a character boundary before slicing
+                if !buffer_text.is_char_boundary(search_pos) {
+                    search_pos += 1;
+                    continue;
                 }
 
-                search_pos = match_start + 1;
+                if let Some(pos) = buffer_text[search_pos..].find(&selected_text) {
+                    let match_start = search_pos + pos;
+                    let match_end = match_start + selected_text.len();
+
+                    // Don't include the current selection itself
+                    if match_start != start {
+                        self.matching_text_positions.push((match_start, match_end));
+                    }
+
+                    // Move to next position, ensuring we stay on character boundaries
+                    // Use the length of the selected text to skip past this match
+                    search_pos = match_start + selected_text.len();
+                } else {
+                    break;
+                }
             }
         }
     }

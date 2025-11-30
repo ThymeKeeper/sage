@@ -88,9 +88,16 @@ impl Buffer {
     
     /// Convert byte position to char position
     pub fn byte_to_char(&self, byte_pos: usize) -> usize {
-        self.rope.byte_to_char(byte_pos.min(self.rope.len_bytes()))
+        let clamped_pos = byte_pos.min(self.rope.len_bytes());
+        // Ensure we're on a character boundary by checking if this is a valid char start
+        if clamped_pos > 0 && clamped_pos < self.rope.len_bytes() {
+            // If not at a char boundary, ropey's byte_to_char will round down
+            self.rope.byte_to_char(clamped_pos)
+        } else {
+            self.rope.byte_to_char(clamped_pos)
+        }
     }
-    
+
     /// Convert char position to byte position
     pub fn char_to_byte(&self, char_pos: usize) -> usize {
         self.rope.char_to_byte(char_pos.min(self.rope.len_chars()))
