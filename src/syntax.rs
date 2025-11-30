@@ -28,6 +28,7 @@ pub enum Language {
     Markdown,
     Json,
     Shell,
+    Toml,
 }
 
 /// Represents a highlighted span within a line
@@ -99,6 +100,7 @@ impl Language {
             "md" | "markdown" => Language::Markdown,
             "json" | "jsonl" | "jsonc" => Language::Json,
             "sh" | "bash" | "zsh" => Language::Shell,
+            "toml" => Language::Toml,
             _ => Language::PlainText,
         }
     }
@@ -262,6 +264,9 @@ impl SyntaxHighlighter {
             ),
             Language::Json => matches!(word,
                 "true" | "false" | "null"
+            ),
+            Language::Toml => matches!(word,
+                "true" | "false"
             ),
             Language::Shell => matches!(word,
                 "if" | "then" | "else" | "elif" | "fi" | "case" | "esac" | "for" | "select" |
@@ -797,9 +802,10 @@ impl SyntaxHighlighter {
                         }
                     }
 
-                    // Check for # comments (Python, R, Yaml, Shell)
+                    // Check for # comments (Python, R, Yaml, Shell, Toml)
                     if (self.language == Language::Python || self.language == Language::R ||
-                        self.language == Language::Yaml || self.language == Language::Shell) && bytes[current_pos] == b'#' {
+                        self.language == Language::Yaml || self.language == Language::Shell ||
+                        self.language == Language::Toml) && bytes[current_pos] == b'#' {
                         if current_pos > span_start {
                             self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
                         }
