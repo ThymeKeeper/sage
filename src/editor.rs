@@ -502,6 +502,7 @@ impl Editor {
                     if self.cursor < self.buffer.len_bytes() {
                         let cursor_before = self.cursor;
                         let line_before = self.buffer.byte_to_line(self.cursor);
+                        let lines_before = self.buffer.len_lines();
 
                         // Find the next character boundary
                         let char_pos = self.buffer.byte_to_char(self.cursor);
@@ -512,16 +513,13 @@ impl Editor {
                         self.modified = true;
 
                         // Update syntax - check if we deleted a newline (merged lines)
-                        let line_after = self.buffer.byte_to_line(self.cursor);
-                        if line_before < self.buffer.len_lines() {
-                            // Check if a line was removed (newline was deleted)
-                            if self.buffer.len_lines() < line_before + 2 ||
-                               self.buffer.line_to_byte(line_before + 1) > next_byte {
-                                // Lines were merged
-                                self.syntax.lines_deleted(line_before, 1);
-                            }
-                            self.syntax.line_modified(line_after);
+                        let lines_after = self.buffer.len_lines();
+                        if lines_after < lines_before {
+                            // A newline was deleted, lines were merged
+                            // The line after line_before was merged into line_before
+                            self.syntax.lines_deleted(line_before + 1, lines_before - lines_after);
                         }
+                        self.syntax.line_modified(line_before);
                     }
                 }
                 self.preferred_column = None; // Clear preferred column
