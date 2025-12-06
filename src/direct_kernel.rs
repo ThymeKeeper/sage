@@ -92,53 +92,71 @@ while True:
             print(json.dumps({"type": "stdout", "data": captured}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
 
-        # Collect namespace completions for autocomplete (only if code contains import)
+        # Collect namespace completions for autocomplete
         # IMPORTANT: Send completions BEFORE the success/result marker
         try:
             completions = []
 
-            # Only introspect if the code contained an import statement
-            if 'import' in code:
-                # Take a snapshot of globals to avoid "dictionary changed size during iteration"
-                globals_snapshot = dict(globals())
+            # Take a snapshot of globals to avoid "dictionary changed size during iteration"
+            globals_snapshot = dict(globals())
 
-                # Get all names from globals snapshot
-                for name in globals_snapshot:
-                    # Skip private/internal names
-                    if name.startswith('_') or name.startswith('SAGE_'):
-                        continue
+            # Get all names from globals snapshot
+            for name in globals_snapshot:
+                # Skip private/internal names
+                if name.startswith('_') or name.startswith('SAGE_'):
+                    continue
 
-                    obj = globals_snapshot[name]
-                    obj_type = type(obj).__name__
+                obj = globals_snapshot[name]
+                obj_type = type(obj).__name__
 
-                    # Check if it's a module
-                    if obj_type == 'module':
-                        # Add module name
-                        completions.append({"name": name, "type": "module"})
+                # Check if it's a module
+                if obj_type == 'module':
+                    # Add module name
+                    completions.append({"name": name, "type": "module"})
 
-                        # Add module members (functions, classes, constants)
-                        try:
-                            members = dir(obj)
-                            for member in members:
-                                if not member.startswith('_'):
-                                    try:
-                                        member_obj = getattr(obj, member)
-                                        member_type = type(member_obj).__name__
-                                        # Add as "module.member"
-                                        completions.append({
-                                            "name": f"{name}.{member}",
-                                            "type": member_type
-                                        })
-                                    except:
-                                        pass
-                        except:
-                            pass
-                    elif obj_type in ['function', 'builtin_function_or_method', 'type', 'ABCMeta']:
-                        # User-defined or built-in functions and classes
-                        completions.append({"name": name, "type": obj_type})
-                    else:
-                        # Variables (includes DataFrames, Series, etc.)
-                        completions.append({"name": name, "type": obj_type})
+                    # Add module members (functions, classes, constants)
+                    try:
+                        members = dir(obj)
+                        for member in members:
+                            if not member.startswith('_'):
+                                try:
+                                    member_obj = getattr(obj, member)
+                                    member_type = type(member_obj).__name__
+                                    # Add as "module.member"
+                                    completions.append({
+                                        "name": f"{name}.{member}",
+                                        "type": member_type
+                                    })
+                                except:
+                                    pass
+                    except:
+                        pass
+                elif obj_type in ['function', 'builtin_function_or_method', 'type', 'ABCMeta']:
+                    # User-defined or built-in functions and classes
+                    completions.append({"name": name, "type": obj_type})
+                else:
+                    # Variables (includes DataFrames, Series, etc.)
+                    completions.append({"name": name, "type": obj_type})
+
+                    # Add methods/attributes for common data types
+                    # Introspect: DataFrames, Series, lists, dicts, sets, and other objects
+                    try:
+                        # Get attributes/methods of the object
+                        members = dir(obj)
+                        for member in members:
+                            if not member.startswith('_'):
+                                try:
+                                    member_obj = getattr(obj, member)
+                                    member_type = type(member_obj).__name__
+                                    # Add as "variable.method" or "variable.attribute"
+                                    completions.append({
+                                        "name": f"{name}.{member}",
+                                        "type": member_type
+                                    })
+                                except:
+                                    pass
+                    except:
+                        pass
 
             # Send completions
             print("SAGE_OUTPUT_START", flush=True)

@@ -12,6 +12,7 @@ pub struct Autocomplete {
     visible: bool,
     filter_text: String,
     dynamic_completions: Vec<String>, // Completions from Python namespace
+    viewport_offset: usize, // Scroll offset for the visible window
 }
 
 impl Autocomplete {
@@ -22,6 +23,7 @@ impl Autocomplete {
             visible: false,
             filter_text: String::new(),
             dynamic_completions: Vec::new(),
+            viewport_offset: 0,
         }
     }
 
@@ -88,6 +90,7 @@ impl Autocomplete {
         self.suggestions = all_suggestions;
         self.visible = !self.suggestions.is_empty();
         self.selected_index = 0;
+        self.viewport_offset = 0;
     }
 
     /// Show autocomplete at cursor position
@@ -100,6 +103,7 @@ impl Autocomplete {
         self.visible = false;
         self.suggestions.clear();
         self.selected_index = 0;
+        self.viewport_offset = 0;
     }
 
     /// Is autocomplete visible?
@@ -115,6 +119,14 @@ impl Autocomplete {
             } else {
                 self.selected_index - 1
             };
+
+            // Adjust viewport to keep selection visible
+            const MAX_VISIBLE: usize = 10;
+            if self.selected_index < self.viewport_offset {
+                self.viewport_offset = self.selected_index;
+            } else if self.selected_index >= self.viewport_offset + MAX_VISIBLE {
+                self.viewport_offset = self.selected_index.saturating_sub(MAX_VISIBLE - 1);
+            }
         }
     }
 
@@ -122,6 +134,14 @@ impl Autocomplete {
     pub fn select_next(&mut self) {
         if !self.suggestions.is_empty() {
             self.selected_index = (self.selected_index + 1) % self.suggestions.len();
+
+            // Adjust viewport to keep selection visible
+            const MAX_VISIBLE: usize = 10;
+            if self.selected_index < self.viewport_offset {
+                self.viewport_offset = self.selected_index;
+            } else if self.selected_index >= self.viewport_offset + MAX_VISIBLE {
+                self.viewport_offset = self.selected_index.saturating_sub(MAX_VISIBLE - 1);
+            }
         }
     }
 
@@ -147,8 +167,13 @@ impl Autocomplete {
         }
 
         // Show up to 10 suggestions
-        let max_suggestions = 10.min(self.suggestions.len());
-        let dropdown_height = max_suggestions as u16;
+        const MAX_VISIBLE: usize = 10;
+        let visible_count = MAX_VISIBLE.min(self.suggestions.len());
+        let dropdown_height = visible_count as u16;
+
+        // Calculate the range of suggestions to show
+        let start_idx = self.viewport_offset;
+        let end_idx = (start_idx + visible_count).min(self.suggestions.len());
 
         // Position dropdown below cursor (or above if not enough space)
         let dropdown_row = if cursor_row + dropdown_height + 1 < max_row {
@@ -157,18 +182,19 @@ impl Autocomplete {
             cursor_row.saturating_sub(dropdown_height)
         };
 
-        // Find longest suggestion for width
-        let max_width = self.suggestions[..max_suggestions]
+        // Find longest suggestion for width (only check visible ones)
+        let max_width = self.suggestions[start_idx..end_idx]
             .iter()
             .map(|s| s.len())
             .max()
             .unwrap_or(20)
             .max(20);
 
-        // Draw each suggestion
-        for (idx, suggestion) in self.suggestions.iter().take(max_suggestions).enumerate() {
-            let row = dropdown_row + idx as u16;
-            let is_selected = idx == self.selected_index;
+        // Draw each visible suggestion
+        for (display_idx, actual_idx) in (start_idx..end_idx).enumerate() {
+            let suggestion = &self.suggestions[actual_idx];
+            let row = dropdown_row + display_idx as u16;
+            let is_selected = actual_idx == self.selected_index;
 
             execute!(writer, cursor::MoveTo(cursor_col, row))?;
 

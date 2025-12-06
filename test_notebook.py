@@ -1,21 +1,22 @@
-##$$ 1
+##$$ 1 ---------------------------------------------------------------------------
 import duckdb as db
 import pandas as pd
 import matplotlib.pyplot as plt
+import math
 
-##$$ 2
+##$$ 2 ---------------------------------------------------------------------------
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 10000)
 
-##$$ 3
+##$$ 3 ---------------------------------------------------------------------------
 customers_file = "/home/thyme/code/customers.csv"
 orders_file    = "/home/thyme/code/orders.csv"
 
-##$$ 4
+##$$ 4 ---------------------------------------------------------------------------
 print(db.sql(f"""SELECT * FROM '{customers_file}' limit 3""").fetchdf())
 print(db.sql(f"""SELECT * FROM '{orders_file}'    limit 3""").fetchdf())
 
-##$$ 5
+##$$ 5 ---------------------------------------------------------------------------
 df = db.sql(f"""
     SELECT
         *,
@@ -27,7 +28,7 @@ df = db.sql(f"""
 """).fetchdf()
 print(df.head(50))
 
-##$$ 6
+##$$ 6 ---------------------------------------------------------------------------
 # plt.figure(figsize=(8, 6))
 plt.scatter(df['signup_date'], df['rolling_sum_amount'])
 # plt.xlabel('Quantity')
@@ -37,9 +38,7 @@ plt.scatter(df['signup_date'], df['rolling_sum_amount'])
 # plt.savefig('scatter.png', dpi=100, bbox_inches='tight')
 plt.show()
 
-##$$ 7
-
+##$$ 7 ---------------------------------------------------------------------------
 for idx, row in df.iterrows():
     if row['amount'] > 100:
         print(row['name'], row['amount'])
-        
