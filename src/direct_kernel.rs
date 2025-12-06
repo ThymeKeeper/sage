@@ -81,37 +81,9 @@ while True:
             with contextlib.redirect_stdout(stdout_capture):
                 _sage_result = eval(code, globals())
         except SyntaxError:
-            # If eval fails, try exec with smart handling of last expression
-            try:
-                # Split code into statements
-                lines = [line for line in code_lines if line.strip()]
-
-                if lines:
-                    # Try to exec all but last line, then eval the last line
-                    if len(lines) > 1:
-                        # Execute all but the last line
-                        prefix_code = '\n'.join(lines[:-1])
-                        with contextlib.redirect_stdout(stdout_capture):
-                            exec(prefix_code, globals())
-
-                        # Try to eval the last line to get result
-                        try:
-                            with contextlib.redirect_stdout(stdout_capture):
-                                _sage_result = eval(lines[-1], globals())
-                        except SyntaxError:
-                            # Last line is not an expression, just exec it
-                            with contextlib.redirect_stdout(stdout_capture):
-                                exec(lines[-1], globals())
-                    else:
-                        # Single line that's not an expression, just exec it
-                        with contextlib.redirect_stdout(stdout_capture):
-                            exec(code, globals())
-                else:
-                    # Empty code
-                    pass
-            except Exception as e:
-                # Re-raise to be caught by outer exception handler
-                raise
+            # If eval fails, just exec the entire code block
+            with contextlib.redirect_stdout(stdout_capture):
+                exec(code, globals())
 
         # Send captured stdout if any
         captured = stdout_capture.getvalue()
