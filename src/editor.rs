@@ -1510,7 +1510,12 @@ impl Editor {
                 if let Some(ref mut sel_start) = self.selection_start {
                     *sel_start += selection_start_adjustment;
                 }
-                
+
+                // Mark affected lines as dirty for syntax highlighting
+                for line in start_line..=end_line {
+                    self.syntax.mark_dirty(line);
+                }
+
                 self.modified = true;
             }
             
@@ -1572,7 +1577,12 @@ impl Editor {
                 if let Some(sel) = original_selection_start {
                     self.set_selection_start(sel.saturating_sub(selection_adjustment));
                 }
-                
+
+                // Mark affected lines as dirty for syntax highlighting
+                for line in start_line..=end_line {
+                    self.syntax.mark_dirty(line);
+                }
+
                 self.modified = true;
             }
             
@@ -2456,6 +2466,21 @@ impl Editor {
         self.kernel.as_ref().map(|k| k.info().display_name)
     }
 
+    /// Take ownership of the kernel (for background execution)
+    pub fn take_kernel(&mut self) -> Option<Box<dyn Kernel>> {
+        self.kernel.take()
+    }
+
+    /// Get reference to cells
+    pub fn get_cells_ref(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    /// Get reference to buffer rope
+    pub fn buffer_rope(&self) -> &ropey::Rope {
+        self.buffer.rope()
+    }
+
     /// Update cells by parsing the buffer
     pub fn update_cells(&mut self) {
         self.cells = parse_cells(self.buffer.rope());
@@ -2466,9 +2491,111 @@ impl Editor {
         &self.cells
     }
 
+    /// Execute all cells within selection (or current cell if no selection)
+    /// Returns: Vec<(execution_count, cell_line, output_text, is_error, elapsed_secs)>
+    pub fn execute_selected_cells_with_output(&mut self) -> Vec<(usize, usize, String, bool, f64)> {
+        use crate::cell::{get_cell_at_position, get_cell_content};
+
+        let mut results = Vec::new();
+
+        if !self.repl_mode || self.kernel.is_none() {
+            return results;
+        }
+
+        // Parse cells
+        self.update_cells();
+
+        // Find cells to execute
+        let cells_to_execute: Vec<usize> = if let Some((sel_start, sel_end)) = self.get_selection() {
+            // Execute all cells that overlap with the selection
+            self.cells.iter().enumerate()
+                .filter(|(_, cell)| {
+                    // Cell overlaps with selection if:
+                    // cell.start < sel_end && cell.end > sel_start
+                    cell.start < sel_end && cell.end > sel_start
+                })
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            // No selection - execute current cell only
+            if let Some(cell_idx) = get_cell_at_position(&self.cells, self.cursor) {
+                vec![cell_idx]
+            } else {
+                vec![]
+            }
+        };
+
+        // Execute each cell in order
+        for cell_idx in cells_to_execute {
+            let cell = &self.cells[cell_idx];
+            let code = get_cell_content(self.buffer.rope(), cell);
+            let cell_number = cell_idx + 1; // Cell number is 1-indexed
+
+            // Execute code with timing
+            if let Some(kernel) = self.kernel.as_mut() {
+                let start_time = std::time::Instant::now();
+
+                match kernel.execute(&code) {
+                    Ok(result) => {
+                        let elapsed = start_time.elapsed().as_secs_f64();
+
+                        // Store result in cell
+                        self.cells[cell_idx].output = Some(result.clone());
+
+                        let execution_count = result.execution_count.unwrap_or(0);
+                        let output_text = crate::cell::format_output(&result);
+                        let is_error = !result.success;
+
+                        results.push((execution_count, cell_number, output_text, is_error, elapsed));
+                    }
+                    Err(e) => {
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        results.push((0, cell_number, format!("Error: {}", e), true, elapsed));
+                    }
+                }
+            }
+        }
+
+        // Set status message
+        if !results.is_empty() {
+            if results.len() == 1 {
+                let (_, cell_num, _, is_error, elapsed) = &results[0];
+                if *is_error {
+                    self.status_message = Some((format!("Cell {} error ({:.3}s)", cell_num, elapsed), true));
+                } else {
+                    self.status_message = Some((format!("Cell {} executed ({:.3}s)", cell_num, elapsed), false));
+                }
+            } else {
+                let error_count = results.iter().filter(|(_, _, _, is_err, _)| *is_err).count();
+                let total_time: f64 = results.iter().map(|(_, _, _, _, elapsed)| elapsed).sum();
+                if error_count > 0 {
+                    self.status_message = Some((
+                        format!("Executed {} cells ({} errors, {:.3}s)", results.len(), error_count, total_time),
+                        true
+                    ));
+                } else {
+                    self.status_message = Some((
+                        format!("Executed {} cells ({:.3}s)", results.len(), total_time),
+                        false
+                    ));
+                }
+            }
+            self.status_message_persistent = false;
+        }
+
+        results
+    }
+
     /// Execute the current cell and return output info for output pane
-    /// Returns: Option<(execution_count, cell_line, output_text, is_error)>
-    pub fn execute_current_cell_with_output(&mut self) -> Option<(usize, usize, String, bool)> {
+    /// Returns: Option<(execution_count, cell_line, output_text, is_error, elapsed_secs)>
+    pub fn execute_current_cell_with_output(&mut self) -> Option<(usize, usize, String, bool, f64)> {
+        // Use the new method and return first result
+        let results = self.execute_selected_cells_with_output();
+        results.into_iter().next()
+    }
+
+    // Legacy method - kept for compatibility
+    fn _execute_single_cell_with_output(&mut self) -> Option<(usize, usize, String, bool)> {
         use crate::cell::{get_cell_at_position, get_cell_content};
 
         if !self.repl_mode || self.kernel.is_none() {
@@ -2482,7 +2609,7 @@ impl Editor {
         if let Some(cell_idx) = get_cell_at_position(&self.cells, self.cursor) {
             let cell = &self.cells[cell_idx];
             let code = get_cell_content(self.buffer.rope(), cell);
-            let cell_line = self.buffer.rope().byte_to_line(cell.start) + 1;
+            let cell_number = cell_idx + 1; // Cell number is 1-indexed
 
             // Execute code
             if let Some(kernel) = self.kernel.as_mut() {
@@ -2492,24 +2619,31 @@ impl Editor {
                         self.cells[cell_idx].output = Some(result.clone());
 
                         let execution_count = result.execution_count.unwrap_or(0);
-                        let output_text = self.format_execution_output(&result);
+                        // Use format_output from cell.rs for proper multi-line formatting
+                        let output_text = crate::cell::format_output(&result);
                         let is_error = !result.success;
 
-                        // Also set status message
+                        // Set status message with summary (single line for status bar)
                         if result.success {
-                            self.status_message = Some((format!("Cell {} executed", cell_line), false));
+                            let status_summary = self.format_execution_output(&result);
+                            let status_msg = if status_summary.is_empty() {
+                                format!("Cell {} executed", cell_number)
+                            } else {
+                                format!("Cell {} executed: {}", cell_number, status_summary)
+                            };
+                            self.status_message = Some((status_msg, false));
                             self.status_message_persistent = false;
                         } else {
-                            self.status_message = Some((format!("Cell {} error", cell_line), true));
+                            self.status_message = Some((format!("Cell {} error", cell_number), true));
                             self.status_message_persistent = false;
                         }
 
-                        return Some((execution_count, cell_line, output_text, is_error));
+                        return Some((execution_count, cell_number, output_text, is_error));
                     }
                     Err(e) => {
                         self.status_message = Some((format!("Execution error: {}", e), true));
                         self.status_message_persistent = false;
-                        return Some((0, cell_line, format!("Error: {}", e), true));
+                        return Some((0, cell_number, format!("Error: {}", e), true));
                     }
                 }
             }

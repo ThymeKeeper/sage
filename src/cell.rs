@@ -26,7 +26,7 @@ pub enum CellType {
 }
 
 /// Cell delimiter marker
-pub const CELL_DELIMITER: &str = "# %%";
+pub const CELL_DELIMITER: &str = "##$$";
 
 /// Parse buffer into cells
 pub fn parse_cells(buffer: &Rope) -> Vec<Cell> {
@@ -124,33 +124,72 @@ pub fn get_cell_content(buffer: &Rope, cell: &Cell) -> String {
     buffer.slice(content_start..cell.end).to_string()
 }
 
-/// Format output for display
+/// Format output for display (Jupyter-style)
 pub fn format_output(result: &ExecutionResult) -> String {
     let mut output = String::new();
+    let exec_count = result.execution_count.unwrap_or(0);
 
     for exec_output in &result.outputs {
         match exec_output {
             crate::kernel::ExecutionOutput::Stdout(text) => {
-                output.push_str(text);
-                output.push('\n');
+                // Stdout is displayed as-is (from print statements)
+                if !text.is_empty() {
+                    output.push_str(text);
+                    if !text.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
             }
             crate::kernel::ExecutionOutput::Stderr(text) => {
-                output.push_str("stderr: ");
-                output.push_str(text);
-                output.push('\n');
+                // Stderr with clear prefix
+                if !text.is_empty() {
+                    output.push_str("stderr: ");
+                    output.push_str(text);
+                    if !text.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
             }
             crate::kernel::ExecutionOutput::Result(text) => {
-                output.push_str(text);
-                output.push('\n');
+                // Display result without prefix
+                if !text.is_empty() {
+                    output.push_str(text);
+                    if !text.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
             }
             crate::kernel::ExecutionOutput::Error {
                 ename,
                 evalue,
                 traceback,
             } => {
-                output.push_str(&format!("{}: {}\n", ename, evalue));
+                // Error with formatted traceback
+                output.push_str(&format!("\x1b[31m{}\x1b[0m: {}\n", ename, evalue));
+
+                // Filter and format traceback to be more concise
+                let mut skip_internal = false;
                 for line in traceback {
-                    if !line.is_empty() {
+                    let trimmed = line.trim();
+
+                    // Skip empty lines
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    // Skip internal REPL lines (SAGE_EXEC markers)
+                    if trimmed.contains("SAGE_EXEC") || trimmed.contains("<string>") {
+                        skip_internal = true;
+                        continue;
+                    }
+
+                    // Skip the "during handling" lines that are noise
+                    if trimmed.starts_with("During handling of") {
+                        continue;
+                    }
+
+                    // Show file lines and the actual error lines
+                    if trimmed.starts_with("File") || trimmed.starts_with("Traceback") || !skip_internal {
                         output.push_str(line);
                         output.push('\n');
                     }
@@ -162,5 +201,13 @@ pub fn format_output(result: &ExecutionResult) -> String {
         }
     }
 
-    output
+    // Remove trailing newline for cleaner display
+    let formatted = output.trim_end().to_string();
+
+    // If no output and execution was successful, show a message
+    if formatted.is_empty() && result.success {
+        return "\x1b[90m(executed successfully)\x1b[0m".to_string();
+    }
+
+    formatted
 }

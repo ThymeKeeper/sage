@@ -120,6 +120,9 @@ fn main() -> io::Result<()> {
     
     let mut editor = editor::Editor::new();
     let mut renderer = renderer::Renderer::new()?;
+
+    // Set initial help message
+    editor.status_message = Some(("Press Ctrl+K to select kernel, Ctrl+E to execute cell".to_string(), false));
     
     // Load file if provided
     if let Some(path) = std::env::args().nth(1) {
@@ -205,16 +208,153 @@ fn launch_in_terminal(terminal: &str, command: &[&str]) -> bool {
     result.is_ok()
 }
 
+/// Spawn background execution and return channel to receive results
+/// Returns: (rx for results, kernel_info for recreation if needed)
+fn spawn_background_execution(
+    editor: &mut editor::Editor,
+) -> Option<(std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>)>, kernel::KernelInfo)> {
+    // Extract kernel from editor (temporarily)
+    let mut kernel = editor.take_kernel()?;
+
+    // Store kernel info for potential recreation
+    let kernel_info = kernel.info().clone();
+
+    // Get selection or current cell position
+    let selection = editor.selection();
+    let cursor_offset = editor.cursor();  // Get byte offset, not line/col
+
+    // Clone cell data we need
+    editor.update_cells();
+    let cells: Vec<(usize, usize, String)> = {
+        use crate::cell::{get_cell_at_position, get_cell_content};
+
+        // Find cells to execute (same logic as execute_selected_cells_with_output)
+        let cells_to_execute: Vec<usize> = if let Some((sel_start, sel_end)) = selection {
+            editor.get_cells_ref().iter().enumerate()
+                .filter(|(_, cell)| cell.start < sel_end && cell.end > sel_start)
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            if let Some(cell_idx) = get_cell_at_position(editor.get_cells_ref(), cursor_offset) {
+                vec![cell_idx]
+            } else {
+                vec![]
+            }
+        };
+
+        // Extract cell contents
+        cells_to_execute.iter().map(|&idx| {
+            let cell = &editor.get_cells_ref()[idx];
+            let code = get_cell_content(editor.buffer_rope(), cell);
+            let cell_number = idx + 1;
+            (idx, cell_number, code)
+        }).collect()
+    };
+
+    if cells.is_empty() {
+        editor.set_kernel(kernel);
+        return None;
+    }
+
+    // Spawn background thread
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut results = Vec::new();
+
+        for (cell_idx, cell_number, code) in cells {
+            let start_time = std::time::Instant::now();
+
+            match kernel.execute(&code) {
+                Ok(result) => {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let execution_count = result.execution_count.unwrap_or(0);
+                    let output_text = cell::format_output(&result);
+                    let is_error = !result.success;
+                    results.push((execution_count, cell_number, output_text, is_error, elapsed));
+                }
+                Err(e) => {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    results.push((0, cell_number, format!("Error: {}", e), true, elapsed));
+                }
+            }
+        }
+
+        // Send back both kernel and results
+        let _ = tx.send((kernel, results));
+    });
+
+    Some((rx, kernel_info))
+}
+
 fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
     let mut output_pane = output_pane::OutputPane::new();
-    let mut output_pane_visible = false;
+    let mut output_pane_visible = true; // Visible by default
     let mut output_pane_height = 8; // Default height in lines
     let mut needs_redraw = true; // Track if we need to redraw
     let mut skip_event_read = false; // Skip event read to force immediate redraw
 
+    // State for background execution with live timer
+    let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>)>> = None;
+    let mut execution_start_time: Option<std::time::Instant> = None;
+    let mut executing_kernel_info: Option<kernel::KernelInfo> = None;
+
     loop {
         debug_log(&format!("Loop iteration start"));
+
+        // Check if background execution is complete
+        if let Some(ref rx) = execution_rx {
+            match rx.try_recv() {
+                Ok((kernel, results)) => {
+                    // Execution complete! Put kernel back and process results
+                    editor.set_kernel(kernel);
+                    execution_rx = None;
+                    executing_kernel_info = None;
+                    let elapsed = execution_start_time.take().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+
+                    // Add outputs to pane
+                    for (count, line, output, is_error, cell_elapsed) in results {
+                        output_pane.add_output(output_pane::OutputEntry {
+                            execution_count: count,
+                            cell_line: line,
+                            output,
+                            is_error,
+                            elapsed_secs: cell_elapsed,
+                        });
+                    }
+
+                    // Update status message with final time
+                    editor.status_message = Some((format!("Executed ({:.3}s)", elapsed), false));
+
+                    // Show output pane if needed
+                    output_pane.set_focused(false);
+                    if !output_pane_visible {
+                        output_pane_visible = true;
+                        editor.update_viewport_for_cursor_with_bottom(output_pane_height);
+                    }
+
+                    renderer.force_redraw();
+                    needs_redraw = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still executing - update status bar with elapsed time
+                    if let Some(start_time) = execution_start_time {
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        editor.status_message = Some((format!("Executing... {:.1}s", elapsed), false));
+                        needs_redraw = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Thread panicked or channel closed unexpectedly
+                    editor.status_message = Some(("Execution failed".to_string(), true));
+                    execution_rx = None;
+                    execution_start_time = None;
+                    executing_kernel_info = None;
+                    needs_redraw = true;
+                }
+            }
+        }
+
         // Only draw if needed
         if needs_redraw {
             debug_log(&format!("needs_redraw is true, starting draw"));
@@ -239,10 +379,13 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
             } else if output_pane_visible {
                 debug_log(&format!("Drawing output_pane"));
                 let (width, height) = crossterm::terminal::size()?;
-                let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+                // Output pane starts after the status bar
+                let output_start_row = height.saturating_sub(output_pane_height as u16);
                 output_pane.draw(&mut io::stdout(), output_start_row, output_pane_height, width)?;
-                // Reposition cursor back to editor after drawing output pane
-                renderer.reposition_cursor(editor)?;
+                // Only reposition cursor to editor if output pane doesn't have focus
+                if !output_pane.is_focused() {
+                    renderer.reposition_cursor(editor)?;
+                }
                 debug_log(&format!("output_pane draw completed"));
             }
 
@@ -259,7 +402,20 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
         }
 
         debug_log(&format!("About to read event"));
-        // Handle input
+        // Handle input - use polling with timeout when execution is running
+        let event_available = if execution_rx.is_some() {
+            // Poll with 100ms timeout to update timer frequently
+            event::poll(std::time::Duration::from_millis(100))?
+        } else {
+            // Block waiting for event when not executing
+            event::poll(std::time::Duration::from_secs(3600))? // 1 hour timeout (effectively blocking)
+        };
+
+        if !event_available {
+            // No event, continue loop to update timer
+            continue;
+        }
+
         let event = event::read()?;
         debug_log(&format!("Event read completed: {:?}", match &event {
             Event::Key(k) => format!("Key({:?})", k.code),
@@ -277,17 +433,28 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     // Handle mouse events for text selection
                     match mouse_event.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
-                            // Start selection
-                            if let Some(position) = editor.screen_to_buffer_position(
-                                mouse_event.column as usize,
-                                mouse_event.row as usize,
-                            ) {
-                                editor.start_mouse_selection(position);
-                                // Update viewport with correct bottom window height
-                                let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
-                                editor.update_viewport_for_cursor_with_bottom(bottom_height);
-                                renderer.force_redraw();
-                                needs_redraw = true; // Need to redraw for selection
+                            // Check if click is in output pane area
+                            let (_, height) = crossterm::terminal::size()?;
+                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+
+                            if output_pane_visible && mouse_event.row >= output_start_row {
+                                // Click is in output pane - focus it
+                                output_pane.set_focused(true);
+                                needs_redraw = true;
+                            } else {
+                                // Click is in editor - unfocus output pane and start selection
+                                output_pane.set_focused(false);
+                                if let Some(position) = editor.screen_to_buffer_position(
+                                    mouse_event.column as usize,
+                                    mouse_event.row as usize,
+                                ) {
+                                    editor.start_mouse_selection(position);
+                                    // Update viewport with correct bottom window height
+                                    let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
+                                    editor.update_viewport_for_cursor_with_bottom(bottom_height);
+                                    renderer.force_redraw();
+                                    needs_redraw = true; // Need to redraw for selection
+                                }
                             }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
@@ -312,7 +479,14 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             needs_redraw = true; // Need to redraw to finalize selection
                         }
                         MouseEventKind::ScrollDown => {
-                            if shift_held {
+                            // Check if mouse is over output pane
+                            let (_, height) = crossterm::terminal::size()?;
+                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+
+                            if output_pane_visible && mouse_event.row >= output_start_row {
+                                // Scroll output pane
+                                output_pane.scroll_down();
+                            } else if shift_held {
                                 // Shift+scroll = horizontal scroll right
                                 editor.scroll_viewport_horizontal(5);
                             } else {
@@ -322,8 +496,15 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             needs_redraw = true; // Need to redraw for scroll
                         }
                         MouseEventKind::ScrollUp => {
-                            if shift_held {
-                                // Shift+scroll = horizontal scroll left  
+                            // Check if mouse is over output pane
+                            let (_, height) = crossterm::terminal::size()?;
+                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+
+                            if output_pane_visible && mouse_event.row >= output_start_row {
+                                // Scroll output pane
+                                output_pane.scroll_up();
+                            } else if shift_held {
+                                // Shift+scroll = horizontal scroll left
                                 editor.scroll_viewport_horizontal(-5);
                             } else {
                                 // Normal scroll = vertical scroll up
@@ -532,6 +713,15 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                 
                 
                 let cmd = match key.code {
+                    // Esc - Toggle output pane focus
+                    KeyCode::Esc => {
+                        if output_pane_visible {
+                            output_pane.toggle_focus();
+                            needs_redraw = true;
+                        }
+                        commands::Command::None
+                    }
+
                     // Quit
                     KeyCode::Char('q') | KeyCode::Char('Q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if editor.is_modified() {
@@ -627,11 +817,64 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     
-                    // Clipboard operations
-                    KeyCode::Char('c') | KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        commands::Command::Copy
+                    // Aggressive Cancellation (Ctrl+Backspace)
+                    // TODO: Implement graceful interruption (SIGINT) to preserve kernel state
+                    // Currently this does a hard reset which loses all Python variables/state
+                    KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+Backspace = AGGRESSIVE CANCEL
+                        if execution_rx.is_some() {
+                            // Drop the channel - abandons the background thread
+                            execution_rx = None;
+                            execution_start_time = None;
+
+                            // Recreate a fresh kernel using stored info
+                            if let Some(kernel_info) = executing_kernel_info.take() {
+                                match kernel_info.kernel_type {
+                                    kernel::KernelType::Direct => {
+                                        let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
+                                            kernel_info.python_path.clone(),
+                                            kernel_info.name.clone(),
+                                            kernel_info.display_name.clone(),
+                                        ));
+                                        // Connect the new kernel
+                                        if new_kernel.connect().is_ok() {
+                                            editor.set_kernel(new_kernel);
+                                            editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
+                                        } else {
+                                            editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
+                                        }
+                                    }
+                                    _ => {
+                                        // For Jupyter or other kernel types, just report cancellation
+                                        editor.status_message = Some(("Execution cancelled - please reconnect kernel".to_string(), true));
+                                    }
+                                }
+                            } else {
+                                editor.status_message = Some(("Execution cancelled".to_string(), true));
+                            }
+
+                            renderer.force_redraw();
+                            needs_redraw = true;
+                        }
+                        commands::Command::None
                     }
-                    
+
+                    KeyCode::Char('c') | KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Check if output pane has focus and has selected text
+                        if output_pane_visible && output_pane.is_focused() {
+                            if let Some(selected_text) = output_pane.get_selected_text() {
+                                // Copy to system clipboard
+                                use arboard::Clipboard;
+                                if let Ok(mut clipboard) = Clipboard::new() {
+                                    let _ = clipboard.set_text(selected_text);
+                                }
+                            }
+                            commands::Command::None
+                        } else {
+                            commands::Command::Copy
+                        }
+                    }
+
                     KeyCode::Char('x') | KeyCode::Char('X') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         commands::Command::Cut
                     }
@@ -652,45 +895,38 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
 
                     // Execute Cell (Ctrl+E as alternative)
                     KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Execute current cell and capture output
-                        let execution_result = editor.execute_current_cell_with_output();
-
-                        // Add output to pane if in REPL mode
-                        if let Some((count, line, output, is_error)) = execution_result {
-                            output_pane.add_output(output_pane::OutputEntry {
-                                execution_count: count,
-                                cell_line: line,
-                                output,
-                                is_error,
-                            });
-                            // Auto-show output pane on first execution
-                            if !output_pane_visible {
-                                output_pane_visible = true;
-                                // Update viewport to account for new bottom window height
-                                editor.update_viewport_for_cursor_with_bottom(output_pane_height);
+                        // Check if already executing
+                        if execution_rx.is_some() {
+                            editor.status_message = Some(("Already executing (Ctrl+Backspace to cancel - WARNING: resets kernel)".to_string(), true));
+                            needs_redraw = true;
+                        } else {
+                            // Start background execution
+                            if let Some((rx, kernel_info)) = spawn_background_execution(editor) {
+                                execution_rx = Some(rx);
+                                execution_start_time = Some(std::time::Instant::now());
+                                executing_kernel_info = Some(kernel_info);
+                                editor.status_message = Some(("Executing...".to_string(), false));
+                                needs_redraw = true;
                             }
                         }
+                        commands::Command::None
+                    }
 
-                        // Force complete refresh: clear screen state and force full redraw
-                        renderer.force_redraw();
-                        skip_event_read = true;
+                    // Clear Output Pane (Ctrl+L)
+                    KeyCode::Char('l') | KeyCode::Char('L') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        output_pane.clear();
+                        editor.status_message = Some(("Output cleared".to_string(), false));
+                        needs_redraw = true;
                         commands::Command::None
                     }
 
                     // Toggle Output Pane (Ctrl+O)
-                    KeyCode::Char('o') | KeyCode::Char('O') if key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    KeyCode::Char('o') | KeyCode::Char('O') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         output_pane_visible = !output_pane_visible;
                         // Update viewport to account for new bottom window height
                         let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
                         editor.update_viewport_for_cursor_with_bottom(bottom_height);
                         renderer.force_redraw();
-                        commands::Command::None
-                    }
-
-                    // Clear Output Pane (Ctrl+Shift+O)
-                    KeyCode::Char('o') | KeyCode::Char('O') if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        output_pane.clear();
-                        editor.status_message = Some(("Output cleared".to_string(), false));
                         commands::Command::None
                     }
 
@@ -801,9 +1037,17 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
 
                     // Movement (with selection support)
                     KeyCode::Up => {
-                        if key.modifiers.contains(KeyModifiers::ALT) {
+                        if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
+                            // When output pane is focused, Up moves cursor
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.move_cursor_up(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::ALT) {
                             // Alt+Up = Increase output pane height
-                            if output_pane_visible && output_pane_height < 20 {
+                            let (_, term_height) = crossterm::terminal::size()?;
+                            let max_height = (term_height as usize).saturating_sub(3); // Leave 3 lines for editor
+                            if output_pane_visible && output_pane_height < max_height {
                                 output_pane_height += 1;
                                 // Update viewport to account for new bottom window height
                                 editor.update_viewport_for_cursor_with_bottom(output_pane_height);
@@ -822,7 +1066,13 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     KeyCode::Down => {
-                        if key.modifiers.contains(KeyModifiers::ALT) {
+                        if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
+                            // When output pane is focused, Down moves cursor
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.move_cursor_down(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::ALT) {
                             // Alt+Down = Decrease output pane height
                             if output_pane_visible && output_pane_height > 3 {
                                 output_pane_height -= 1;
@@ -843,7 +1093,12 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     KeyCode::Left => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                        if output_pane_visible && output_pane.is_focused() {
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.move_cursor_left(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
                             commands::Command::SelectWordLeft
                         } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                             commands::Command::MoveWordLeft
@@ -854,7 +1109,12 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     KeyCode::Right => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                        if output_pane_visible && output_pane.is_focused() {
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.move_cursor_right(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
                             commands::Command::SelectWordRight
                         } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                             commands::Command::MoveWordRight
@@ -865,49 +1125,69 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     KeyCode::Home => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        if output_pane_visible && output_pane.is_focused() {
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.move_cursor_home(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             commands::Command::SelectHome
                         } else {
                             commands::Command::MoveHome
                         }
                     }
                     KeyCode::End => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        if output_pane_visible && output_pane.is_focused() {
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.move_cursor_end(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             commands::Command::SelectEnd
                         } else {
                             commands::Command::MoveEnd
                         }
                     }
-                    KeyCode::PageUp => commands::Command::PageUp,
-                    KeyCode::PageDown => commands::Command::PageDown,
+                    KeyCode::PageUp => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) && output_pane_visible {
+                            // Shift+PageUp = Scroll output pane up
+                            output_pane.scroll_up();
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else {
+                            commands::Command::PageUp
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) && output_pane_visible {
+                            // Shift+PageDown = Scroll output pane down
+                            output_pane.scroll_down();
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else {
+                            commands::Command::PageDown
+                        }
+                    }
                     
                     // Editing
                     KeyCode::Char(c) => commands::Command::InsertChar(c),
                     KeyCode::Enter => {
                         // Ctrl+Enter = Execute cell (primary binding)
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            // Execute current cell and capture output
-                            let execution_result = editor.execute_current_cell_with_output();
-
-                            // Add output to pane if in REPL mode
-                            if let Some((count, line, output, is_error)) = execution_result {
-                                output_pane.add_output(output_pane::OutputEntry {
-                                    execution_count: count,
-                                    cell_line: line,
-                                    output,
-                                    is_error,
-                                });
-                                // Auto-show output pane on first execution
-                                if !output_pane_visible {
-                                    output_pane_visible = true;
-                                    // Update viewport to account for new bottom window height
-                                    editor.update_viewport_for_cursor_with_bottom(output_pane_height);
+                            // Check if already executing
+                            if execution_rx.is_some() {
+                                editor.status_message = Some(("Already executing (Ctrl+Backspace to cancel - WARNING: resets kernel)".to_string(), true));
+                                needs_redraw = true;
+                            } else {
+                                // Start background execution
+                                if let Some((rx, kernel_info)) = spawn_background_execution(editor) {
+                                    execution_rx = Some(rx);
+                                    execution_start_time = Some(std::time::Instant::now());
+                                    executing_kernel_info = Some(kernel_info);
+                                    editor.status_message = Some(("Executing...".to_string(), false));
+                                    needs_redraw = true;
                                 }
                             }
-
-                            // Force complete refresh: clear screen state and force full redraw
-                            renderer.force_redraw();
-                            skip_event_read = true;
                             commands::Command::None
                         } else {
                             commands::Command::InsertNewline

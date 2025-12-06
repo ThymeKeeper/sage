@@ -74,12 +74,12 @@ while True:
         # Execute code with stdout capture
         # Use Jupyter-style execution: try eval, then try exec with last expression
         stdout_capture = io.StringIO()
-        result = None
+        _sage_result = None
 
         try:
             # First, try to eval the entire code (for simple expressions)
             with contextlib.redirect_stdout(stdout_capture):
-                result = eval(code, globals())
+                _sage_result = eval(code, globals())
         except SyntaxError:
             # If eval fails, try exec with smart handling of last expression
             try:
@@ -97,7 +97,7 @@ while True:
                         # Try to eval the last line to get result
                         try:
                             with contextlib.redirect_stdout(stdout_capture):
-                                result = eval(lines[-1], globals())
+                                _sage_result = eval(lines[-1], globals())
                         except SyntaxError:
                             # Last line is not an expression, just exec it
                             with contextlib.redirect_stdout(stdout_capture):
@@ -120,12 +120,32 @@ while True:
             print(json.dumps({"type": "stdout", "data": captured}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
 
-        # Send result
-        if result is not None:
+        # Send result (only if not None, matching Jupyter behavior)
+        if _sage_result is not None:
+            # Format result in a Jupyter-like way
+            try:
+                # Import pprint for better formatting
+                import pprint
+
+                # Use a more intelligent formatting strategy
+                if isinstance(_sage_result, str):
+                    # For strings, use repr to show quotes
+                    formatted = repr(_sage_result)
+                elif isinstance(_sage_result, (list, dict, tuple, set)):
+                    # For collections, use pprint for nice formatting
+                    formatted = pprint.pformat(_sage_result, width=80, compact=True)
+                else:
+                    # For other types, try repr first, fallback to str
+                    formatted = repr(_sage_result)
+            except Exception:
+                # If formatting fails, use str as last resort
+                formatted = str(_sage_result)
+
             print("SAGE_OUTPUT_START", flush=True)
-            print(json.dumps({"type": "result", "data": repr(result)}), flush=True)
+            print(json.dumps({"type": "result", "data": formatted}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
         else:
+            # No result to show (None result) - just signal success
             print("SAGE_OUTPUT_START", flush=True)
             print(json.dumps({"type": "success"}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
