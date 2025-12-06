@@ -16,12 +16,21 @@ pub enum ExecutionOutput {
     Display { data: String, mime_type: String },
 }
 
+/// Completion item for autocomplete
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionItem {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+}
+
 /// Execution result with combined output
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
     pub outputs: Vec<ExecutionOutput>,
     pub execution_count: Option<usize>,
     pub success: bool,
+    pub completions: Vec<CompletionItem>,
 }
 
 /// Information about an available Python kernel

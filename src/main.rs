@@ -11,6 +11,7 @@ mod direct_kernel;
 mod cell;
 mod kernel_selector;
 mod output_pane;
+mod autocomplete;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton, EnableBracketedPaste, DisableBracketedPaste},
@@ -209,10 +210,10 @@ fn launch_in_terminal(terminal: &str, command: &[&str]) -> bool {
 }
 
 /// Spawn background execution and return channel to receive results
-/// Returns: (rx for results, kernel_info for recreation if needed)
+/// Returns: (rx for (kernel, results, completions), kernel_info for recreation if needed)
 fn spawn_background_execution(
     editor: &mut editor::Editor,
-) -> Option<(std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>)>, kernel::KernelInfo)> {
+) -> Option<(std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>)>, kernel::KernelInfo)> {
     // Extract kernel from editor (temporarily)
     let mut kernel = editor.take_kernel()?;
 
@@ -260,8 +261,9 @@ fn spawn_background_execution(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut results = Vec::new();
+        let mut all_completions = Vec::new();
 
-        for (cell_idx, cell_number, code) in cells {
+        for (_cell_idx, cell_number, code) in cells {
             let start_time = std::time::Instant::now();
 
             match kernel.execute(&code) {
@@ -270,6 +272,10 @@ fn spawn_background_execution(
                     let execution_count = result.execution_count.unwrap_or(0);
                     let output_text = cell::format_output(&result);
                     let is_error = !result.success;
+
+                    // Collect completions from this execution
+                    all_completions.extend(result.completions);
+
                     results.push((execution_count, cell_number, output_text, is_error, elapsed));
                 }
                 Err(e) => {
@@ -279,8 +285,8 @@ fn spawn_background_execution(
             }
         }
 
-        // Send back both kernel and results
-        let _ = tx.send((kernel, results));
+        // Send back kernel, results, and completions
+        let _ = tx.send((kernel, results, all_completions));
     });
 
     Some((rx, kernel_info))
@@ -295,9 +301,12 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
     let mut skip_event_read = false; // Skip event read to force immediate redraw
 
     // State for background execution with live timer
-    let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>)>> = None;
+    let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>)>> = None;
     let mut execution_start_time: Option<std::time::Instant> = None;
     let mut executing_kernel_info: Option<kernel::KernelInfo> = None;
+
+    // Autocomplete
+    let mut autocomplete = autocomplete::Autocomplete::new();
 
     loop {
         debug_log(&format!("Loop iteration start"));
@@ -305,7 +314,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
         // Check if background execution is complete
         if let Some(ref rx) = execution_rx {
             match rx.try_recv() {
-                Ok((kernel, results)) => {
+                Ok((kernel, results, completions)) => {
                     // Execution complete! Put kernel back and process results
                     editor.set_kernel(kernel);
                     execution_rx = None;
@@ -321,6 +330,18 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             is_error,
                             elapsed_secs: cell_elapsed,
                         });
+                    }
+
+                    // Update autocomplete with dynamic completions
+                    if !completions.is_empty() {
+                        let completion_names: Vec<String> = completions.iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                        debug_log(&format!("Received {} completions, adding to autocomplete", completion_names.len()));
+                        debug_log(&format!("First 5 completions: {:?}", completion_names.iter().take(5).collect::<Vec<_>>()));
+                        autocomplete.add_dynamic_completions(completion_names);
+                    } else {
+                        debug_log("No completions received from execution");
                     }
 
                     // Update status message with final time
@@ -387,6 +408,15 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     renderer.reposition_cursor(editor)?;
                 }
                 debug_log(&format!("output_pane draw completed"));
+            }
+
+            // Draw autocomplete dropdown if visible
+            if autocomplete.is_visible() {
+                let (screen_col, screen_row) = editor.cursor_screen_position();
+                let (_, height) = crossterm::terminal::size()?;
+                autocomplete.draw(&mut io::stdout(), screen_row as u16, screen_col as u16, height)?;
+                // Reposition cursor after drawing autocomplete
+                renderer.reposition_cursor(editor)?;
             }
 
             needs_redraw = false; // Reset flag after drawing
@@ -713,9 +743,12 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                 
                 
                 let cmd = match key.code {
-                    // Esc - Toggle output pane focus
+                    // Esc - Hide autocomplete, or toggle output pane focus
                     KeyCode::Esc => {
-                        if output_pane_visible {
+                        if autocomplete.is_visible() {
+                            autocomplete.hide();
+                            needs_redraw = true;
+                        } else if output_pane_visible {
                             output_pane.toggle_focus();
                             needs_redraw = true;
                         }
@@ -1037,7 +1070,16 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
 
                     // Movement (with selection support)
                     KeyCode::Up => {
-                        if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
+                        debug_log(&format!("Up pressed: autocomplete.is_visible()={}, has_alt={}",
+                            autocomplete.is_visible(),
+                            key.modifiers.contains(KeyModifiers::ALT)));
+                        if autocomplete.is_visible() && !key.modifiers.contains(KeyModifiers::ALT) {
+                            debug_log("Navigating autocomplete UP");
+                            // Navigate autocomplete dropdown
+                            autocomplete.select_previous();
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
                             // When output pane is focused, Up moves cursor
                             let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
                             output_pane.move_cursor_up(with_selection);
@@ -1066,7 +1108,16 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     KeyCode::Down => {
-                        if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
+                        debug_log(&format!("Down pressed: autocomplete.is_visible()={}, has_alt={}",
+                            autocomplete.is_visible(),
+                            key.modifiers.contains(KeyModifiers::ALT)));
+                        if autocomplete.is_visible() && !key.modifiers.contains(KeyModifiers::ALT) {
+                            debug_log("Navigating autocomplete DOWN");
+                            // Navigate autocomplete dropdown
+                            autocomplete.select_next();
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
                             // When output pane is focused, Down moves cursor
                             let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
                             output_pane.move_cursor_down(with_selection);
@@ -1194,7 +1245,22 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     KeyCode::Tab => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        if autocomplete.is_visible() && !key.modifiers.contains(KeyModifiers::SHIFT) {
+                            // Accept autocomplete suggestion
+                            if let Some(suggestion) = autocomplete.get_selected() {
+                                let prefix = editor.get_word_at_cursor();
+                                // Delete the prefix and insert the full suggestion
+                                for _ in 0..prefix.len() {
+                                    editor.execute(commands::Command::Backspace)?;
+                                }
+                                for ch in suggestion.chars() {
+                                    editor.execute(commands::Command::InsertChar(ch))?;
+                                }
+                                autocomplete.hide();
+                                needs_redraw = true;
+                            }
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             // Shift+Tab = dedent
                             commands::Command::Dedent
                         } else if editor.selection().is_some() {
@@ -1284,6 +1350,11 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         // (it may have been explicitly set to true by event handlers)
                     }
                     _ => {
+                        // Update autocomplete after text-modifying commands (before executing to avoid move)
+                        let should_update_autocomplete = matches!(cmd, commands::Command::InsertChar(_));
+                        let should_check_backspace_delete = matches!(cmd, commands::Command::Backspace | commands::Command::Delete);
+                        let should_hide_autocomplete = !matches!(cmd, commands::Command::None) && !should_update_autocomplete && !should_check_backspace_delete;
+
                         // All other commands are handled normally
                         editor.execute(cmd)?;
                         // Update viewport with correct bottom window height after movement commands
@@ -1295,6 +1366,21 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             0
                         };
                         editor.update_viewport_for_cursor_with_bottom(bottom_height);
+
+                        // Apply autocomplete updates based on command type
+                        if should_update_autocomplete {
+                            let prefix = editor.get_word_at_cursor();
+                            autocomplete.update(&prefix);
+                        } else if should_check_backspace_delete {
+                            let prefix = editor.get_word_at_cursor();
+                            if prefix.is_empty() {
+                                autocomplete.hide();
+                            } else {
+                                autocomplete.update(&prefix);
+                            }
+                        } else if should_hide_autocomplete {
+                            autocomplete.hide();
+                        }
                     }
                 }
             }

@@ -21,22 +21,18 @@ result = db.sql("""
     *
     FROM df a
     left join df1 b on a.customer_id = b.customer_id
-    where a.customer_id = 3
+    --where a.customer_id = 3
+    where quantity is not null and amount is not null
 """).fetchdf()
-    
 print(result.head(50))
 
 
-##$$
-
-# Simple scatter plot: quantity vs amount
+##$$ 6
 plt.figure(figsize=(8, 6))
 plt.scatter(result['quantity'], result['amount'])
 plt.xlabel('Quantity')
 plt.ylabel('Amount ($)')
 plt.title('Order Quantity vs Amount')
 plt.grid(True, alpha=0.3)
-
-# Save and show
 plt.savefig('scatter.png', dpi=100, bbox_inches='tight')
-plt.show()  # This will open in your system's default image viewer
+plt.show()

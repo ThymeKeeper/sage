@@ -2481,6 +2481,48 @@ impl Editor {
         self.buffer.rope()
     }
 
+    /// Get cursor screen position (for drawing overlays like autocomplete)
+    pub fn cursor_screen_position(&self) -> (usize, usize) {
+        let (cursor_line, cursor_col) = self.cursor_position();
+        let (viewport_row, viewport_col) = self.viewport_offset();
+
+        // Calculate screen position (add 2 for virtual lines before buffer)
+        let logical_cursor_line = cursor_line + 2;
+        let screen_row = logical_cursor_line.saturating_sub(viewport_row);
+        let screen_col = cursor_col.saturating_sub(viewport_col);
+
+        (screen_col, screen_row)
+    }
+
+    /// Get the word at cursor position (for autocomplete)
+    /// Supports dot-completion (e.g., "pandas.read_csv")
+    pub fn get_word_at_cursor(&self) -> String {
+        let rope = self.buffer.rope();
+        let cursor_pos = self.cursor;
+
+        // Find start of word (alphanumeric, underscore, or dot)
+        let mut start = cursor_pos;
+        while start > 0 {
+            let char_idx = rope.byte_to_char(start.saturating_sub(1));
+            if let Some(ch) = rope.get_char(char_idx) {
+                if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+                    start -= ch.len_utf8();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Extract word from start to cursor
+        if start < cursor_pos {
+            rope.slice(start..cursor_pos).to_string()
+        } else {
+            String::new()
+        }
+    }
+
     /// Update cells by parsing the buffer
     pub fn update_cells(&mut self) {
         self.cells = parse_cells(self.buffer.rope());

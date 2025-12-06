@@ -120,6 +120,86 @@ while True:
             print(json.dumps({"type": "stdout", "data": captured}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
 
+        # Collect namespace completions for autocomplete (only if code contains import)
+        # IMPORTANT: Send completions BEFORE the success/result marker
+        try:
+            completions = []
+            debug_info = []
+
+            # Only introspect if the code contained an import statement
+            if 'import' in code:
+                debug_info.append(f"Code contains 'import', checking globals")
+                # Take a snapshot of globals to avoid "dictionary changed size during iteration"
+                globals_snapshot = dict(globals())
+                debug_info.append(f"Found {len(globals_snapshot)} items in globals")
+
+                # Get all names from globals snapshot
+                for name in globals_snapshot:
+                    # Skip private/internal names
+                    if name.startswith('_') or name.startswith('SAGE_'):
+                        continue
+
+                    obj = globals_snapshot[name]
+                    obj_type = type(obj).__name__
+
+                    # Check if it's a module
+                    if obj_type == 'module':
+                        debug_info.append(f"Found module: {name}")
+                        # Add module name
+                        completions.append({"name": name, "type": "module"})
+
+                        # Add module members (functions, classes, constants)
+                        try:
+                            members = dir(obj)
+                            member_count = 0
+                            for member in members:
+                                if not member.startswith('_'):
+                                    try:
+                                        member_obj = getattr(obj, member)
+                                        member_type = type(member_obj).__name__
+                                        # Add as "module.member"
+                                        completions.append({
+                                            "name": f"{name}.{member}",
+                                            "type": member_type
+                                        })
+                                        member_count += 1
+                                    except:
+                                        pass
+                            debug_info.append(f"  Added {member_count} members from {name}")
+                        except Exception as e:
+                            debug_info.append(f"  Error getting members: {e}")
+                    elif obj_type in ['function', 'builtin_function_or_method', 'type', 'ABCMeta']:
+                        # User-defined or built-in functions and classes
+                        completions.append({"name": name, "type": obj_type})
+                        debug_info.append(f"Found {obj_type}: {name}")
+                    else:
+                        # Variables (includes DataFrames, Series, etc.)
+                        completions.append({"name": name, "type": obj_type})
+                        debug_info.append(f"Found variable ({obj_type}): {name}")
+
+                debug_info.append(f"Total completions: {len(completions)}")
+            else:
+                debug_info.append("Code does not contain 'import', skipping completion collection")
+
+            # Send debug info as stdout if we have any
+            if debug_info:
+                print("SAGE_OUTPUT_START", flush=True)
+                print(json.dumps({"type": "stdout", "data": "[COMPLETION DEBUG]\n" + "\n".join(debug_info)}), flush=True)
+                print("SAGE_OUTPUT_END", flush=True)
+
+            # Send completions
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "completions", "data": completions}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+        except Exception as e:
+            # If completion gathering fails, don't crash - send debug info and empty completions
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "stdout", "data": f"[COMPLETION ERROR] {e}\n{traceback.format_exc()}"}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "completions", "data": []}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+
         # Send result (only if not None, matching Jupyter behavior)
         if _sage_result is not None:
             # Format result in a Jupyter-like way
@@ -182,7 +262,7 @@ impl Kernel for DirectKernel {
             .arg(Self::get_repl_script())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())  // Ignore stderr to avoid broken pipe
             .env("TERM", "dumb")  // Prevent terminal control codes
             .env_remove("TERM_PROGRAM")  // Remove any terminal program settings
             .spawn()
@@ -190,7 +270,6 @@ impl Kernel for DirectKernel {
 
         let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
-        let mut stderr = child.stderr.take().ok_or("Failed to get stderr")?;
 
         // Wait for ready signal with timeout
         let mut reader = BufReader::new(stdout);
@@ -199,27 +278,20 @@ impl Kernel for DirectKernel {
         // Try to read the ready signal
         match reader.read_line(&mut line) {
             Ok(0) => {
-                // EOF - process probably died, check stderr
-                let mut error_msg = String::new();
-                std::io::Read::read_to_string(&mut stderr, &mut error_msg).ok();
-                return Err(format!("Python process died immediately. Error: {}", error_msg).into());
+                // EOF - process probably died
+                return Err("Python process died immediately".into());
             }
             Ok(_) => {
                 if !line.trim().starts_with("SAGE_KERNEL_READY") {
-                    // Got unexpected output, check stderr too
-                    let mut error_msg = String::new();
-                    std::io::Read::read_to_string(&mut stderr, &mut error_msg).ok();
+                    // Got unexpected output
                     return Err(format!(
-                        "Kernel failed to start. Got: '{}'. Error: {}",
-                        line.trim(),
-                        error_msg
+                        "Kernel failed to start. Got: '{}'",
+                        line.trim()
                     ).into());
                 }
             }
             Err(e) => {
-                let mut error_msg = String::new();
-                std::io::Read::read_to_string(&mut stderr, &mut error_msg).ok();
-                return Err(format!("Failed to read from Python: {}. Error: {}", e, error_msg).into());
+                return Err(format!("Failed to read from Python: {}", e).into());
             }
         }
 
@@ -251,6 +323,7 @@ impl Kernel for DirectKernel {
 
         // Read outputs - there can be multiple output blocks (stdout, result, etc)
         let mut outputs = Vec::new();
+        let mut completions = Vec::new();
         let mut success = false;
         let mut finished = false;
         let mut line = String::new();
@@ -270,6 +343,8 @@ impl Kernel for DirectKernel {
             reader.read_line(&mut line)?;
 
             let output_data: serde_json::Value = serde_json::from_str(line.trim())?;
+
+            eprintln!("DEBUG: Received output type: {:?}", output_data["type"]);
 
             match output_data["type"].as_str() {
                 Some("stdout") => {
@@ -308,6 +383,23 @@ impl Kernel for DirectKernel {
                     success = false;
                     finished = true;
                 }
+                Some("completions") => {
+                    // Parse completions for autocomplete
+                    if let Some(data) = output_data["data"].as_array() {
+                        eprintln!("DEBUG: Received completions array with {} items", data.len());
+                        for item in data {
+                            if let Ok(completion) = serde_json::from_value::<crate::kernel::CompletionItem>(item.clone()) {
+                                completions.push(completion);
+                            } else {
+                                eprintln!("DEBUG: Failed to parse completion item: {:?}", item);
+                            }
+                        }
+                        eprintln!("DEBUG: Successfully parsed {} completions", completions.len());
+                    } else {
+                        eprintln!("DEBUG: Completions data is not an array: {:?}", output_data);
+                    }
+                    // Don't set finished - continue reading for success/result markers
+                }
                 _ => {
                     finished = true;
                 }
@@ -322,6 +414,7 @@ impl Kernel for DirectKernel {
             outputs,
             execution_count: Some(self.execution_count),
             success,
+            completions,
         })
     }
 
