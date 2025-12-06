@@ -1,6 +1,8 @@
 use crate::buffer::Buffer;
 use crate::commands::Command;
 use crate::syntax::SyntaxHighlighter;
+use crate::cell::{Cell, parse_cells};
+use crate::kernel::Kernel;
 use arboard::Clipboard;
 use std::fs;
 use std::io;
@@ -47,10 +49,15 @@ pub struct Editor {
     syntax: SyntaxHighlighter,       // Syntax highlighting state
     read_only: bool,                  // Whether the file is read-only
     pub status_message: Option<(String, bool)>, // Status bar message (text, is_error)
+    status_message_persistent: bool, // Whether status message should persist until cleared
     matching_brackets: Option<(usize, usize)>, // Positions of matching brackets
     matching_text_positions: Vec<(usize, usize)>, // Positions of text matching the selection
     find_matches: Vec<(usize, usize)>, // Positions of find/replace matches
     current_find_match: Option<usize>, // Index of the current find match
+    // REPL/Notebook fields
+    cells: Vec<Cell>,                  // Parsed cells for notebook mode
+    kernel: Option<Box<dyn Kernel>>,   // Active Python kernel
+    repl_mode: bool,                   // Whether we're in REPL mode
 }
 
 impl Editor {
@@ -134,6 +141,10 @@ impl Editor {
             matching_text_positions: Vec::new(),
             find_matches: Vec::new(),
             current_find_match: None,
+            cells: Vec::new(),
+            kernel: None,
+            repl_mode: false,
+            status_message_persistent: false,
         }
     }
     
@@ -335,6 +346,17 @@ impl Editor {
     }
     
     pub fn execute(&mut self, cmd: Command) -> io::Result<()> {
+        // Clear non-persistent status messages on user action
+        if !self.status_message_persistent {
+            if matches!(cmd,
+                Command::InsertChar(_) | Command::InsertNewline |
+                Command::Backspace | Command::Delete |
+                Command::MoveUp | Command::MoveDown | Command::MoveLeft | Command::MoveRight
+            ) {
+                self.status_message = None;
+            }
+        }
+
         // Clear mouse selection mode on any keyboard input
         self.mouse_selecting = false;
         
@@ -1824,11 +1846,17 @@ impl Editor {
     }
     
     /// Update viewport to follow cursor - call this when cursor moves
+    /// bottom_window_height: height of any bottom window (output pane, find/replace, etc.)
     pub fn update_viewport_for_cursor(&mut self) {
+        self.update_viewport_for_cursor_with_bottom(0);
+    }
+
+    /// Update viewport to follow cursor with bottom window
+    pub fn update_viewport_for_cursor_with_bottom(&mut self, bottom_window_height: usize) {
         // Get terminal size
         if let Ok((width, height)) = crossterm::terminal::size() {
-            // Account for status bar
-            let viewport_height = (height - 1) as usize;
+            // Account for status bar and bottom window (output pane, find/replace, etc.)
+            let viewport_height = (height as usize).saturating_sub(1 + bottom_window_height);
             let viewport_width = width as usize;
             self.update_viewport(viewport_height, viewport_width);
         }
@@ -2403,5 +2431,218 @@ impl Editor {
     /// Get current find match index
     pub fn get_current_find_match(&self) -> Option<usize> {
         self.current_find_match
+    }
+
+    // REPL/Notebook Methods
+
+    /// Enable REPL mode
+    pub fn enable_repl_mode(&mut self) {
+        self.repl_mode = true;
+        self.update_cells();
+    }
+
+    /// Check if in REPL mode
+    pub fn is_repl_mode(&self) -> bool {
+        self.repl_mode
+    }
+
+    /// Set the active kernel
+    pub fn set_kernel(&mut self, kernel: Box<dyn Kernel>) {
+        self.kernel = Some(kernel);
+    }
+
+    /// Get kernel info
+    pub fn get_kernel_info(&self) -> Option<String> {
+        self.kernel.as_ref().map(|k| k.info().display_name)
+    }
+
+    /// Update cells by parsing the buffer
+    pub fn update_cells(&mut self) {
+        self.cells = parse_cells(self.buffer.rope());
+    }
+
+    /// Get cells for rendering
+    pub fn get_cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    /// Execute the current cell and return output info for output pane
+    /// Returns: Option<(execution_count, cell_line, output_text, is_error)>
+    pub fn execute_current_cell_with_output(&mut self) -> Option<(usize, usize, String, bool)> {
+        use crate::cell::{get_cell_at_position, get_cell_content};
+
+        if !self.repl_mode || self.kernel.is_none() {
+            return None;
+        }
+
+        // Parse cells
+        self.update_cells();
+
+        // Find cell at cursor position
+        if let Some(cell_idx) = get_cell_at_position(&self.cells, self.cursor) {
+            let cell = &self.cells[cell_idx];
+            let code = get_cell_content(self.buffer.rope(), cell);
+            let cell_line = self.buffer.rope().byte_to_line(cell.start) + 1;
+
+            // Execute code
+            if let Some(kernel) = self.kernel.as_mut() {
+                match kernel.execute(&code) {
+                    Ok(result) => {
+                        // Store result in cell
+                        self.cells[cell_idx].output = Some(result.clone());
+
+                        let execution_count = result.execution_count.unwrap_or(0);
+                        let output_text = self.format_execution_output(&result);
+                        let is_error = !result.success;
+
+                        // Also set status message
+                        if result.success {
+                            self.status_message = Some((format!("Cell {} executed", cell_line), false));
+                            self.status_message_persistent = false;
+                        } else {
+                            self.status_message = Some((format!("Cell {} error", cell_line), true));
+                            self.status_message_persistent = false;
+                        }
+
+                        return Some((execution_count, cell_line, output_text, is_error));
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Execution error: {}", e), true));
+                        self.status_message_persistent = false;
+                        return Some((0, cell_line, format!("Error: {}", e), true));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Execute the current cell (cell containing cursor) - legacy method
+    pub fn execute_current_cell(&mut self) -> io::Result<()> {
+        use crate::cell::{get_cell_at_position, get_cell_content};
+
+        if !self.repl_mode {
+            self.status_message = Some(("Not in REPL mode. Press Ctrl+K to select a kernel.".to_string(), true));
+            return Ok(());
+        }
+
+        if self.kernel.is_none() {
+            self.status_message = Some(("No kernel connected. Press Ctrl+K to select a kernel.".to_string(), true));
+            return Ok(());
+        }
+
+        // Parse cells
+        self.update_cells();
+
+        // Find cell at cursor position
+        if let Some(cell_idx) = get_cell_at_position(&self.cells, self.cursor) {
+            let cell = &self.cells[cell_idx];
+            let code = get_cell_content(self.buffer.rope(), cell);
+
+            // Get cell line number for display
+            let cell_line = self.buffer.rope().byte_to_line(cell.start) + 1;
+
+            // Execute code
+            if let Some(kernel) = self.kernel.as_mut() {
+                match kernel.execute(&code) {
+                    Ok(result) => {
+                        // Store result in cell
+                        self.cells[cell_idx].output = Some(result.clone());
+
+                        if result.success {
+                            // Format output for display
+                            let output_text = self.format_execution_output(&result);
+                            if output_text.is_empty() {
+                                self.status_message = Some((format!("Cell {} executed (no output)", cell_line), false));
+                            } else {
+                                self.status_message = Some((format!("Cell {}: {}", cell_line, output_text), false));
+                            }
+                            self.status_message_persistent = false; // Will clear on next action
+                        } else {
+                            // Show error (keep persistent until user acknowledges)
+                            let error_text = self.format_execution_output(&result);
+                            self.status_message = Some((format!("Cell {} error: {}", cell_line, error_text), true));
+                            self.status_message_persistent = true; // Errors stay visible
+                        }
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Cell {} error: {}", cell_line, e), true));
+                    }
+                }
+            }
+        } else {
+            self.status_message = Some(("Cursor not in a cell. Use # %% to define cells.".to_string(), true));
+        }
+
+        Ok(())
+    }
+
+    /// Format execution output for status display
+    fn format_execution_output(&self, result: &crate::kernel::ExecutionResult) -> String {
+        let mut parts = Vec::new();
+
+        for exec_output in &result.outputs {
+            match exec_output {
+                crate::kernel::ExecutionOutput::Result(text) => {
+                    parts.push(text.trim().to_string());
+                }
+                crate::kernel::ExecutionOutput::Stdout(text) => {
+                    // Replace newlines with space to keep output on single line
+                    let formatted = text.trim().replace('\n', " ");
+                    if !formatted.is_empty() {
+                        parts.push(formatted);
+                    }
+                }
+                crate::kernel::ExecutionOutput::Stderr(text) => {
+                    let formatted = text.trim().replace('\n', " ");
+                    if !formatted.is_empty() {
+                        parts.push(formatted);
+                    }
+                }
+                crate::kernel::ExecutionOutput::Error { ename, evalue, .. } => {
+                    parts.push(format!("{}: {}", ename, evalue));
+                }
+                crate::kernel::ExecutionOutput::Display { data, .. } => {
+                    let formatted = data.trim().replace('\n', " ");
+                    if !formatted.is_empty() {
+                        parts.push(formatted);
+                    }
+                }
+            }
+        }
+
+        // Join parts with separator to distinguish different outputs
+        let output = parts.join(" → ");
+
+        // Truncate if too long
+        if output.len() > 200 {
+            format!("{}...", &output[..200])
+        } else {
+            output
+        }
+    }
+
+    /// Check if kernel is connected
+    pub fn is_kernel_connected(&self) -> bool {
+        self.kernel.as_ref().map(|k| k.is_connected()).unwrap_or(false)
+    }
+
+    /// Connect to the kernel
+    pub fn connect_kernel(&mut self) -> Result<(), String> {
+        if let Some(kernel) = self.kernel.as_mut() {
+            kernel.connect().map_err(|e| e.to_string())?;
+            self.status_message = Some((format!("Connected to kernel: {}", kernel.info().display_name), false));
+        }
+        Ok(())
+    }
+
+    /// Disconnect kernel
+    pub fn disconnect_kernel(&mut self) -> Result<(), String> {
+        if let Some(kernel) = self.kernel.as_mut() {
+            kernel.disconnect().map_err(|e| e.to_string())?;
+            self.status_message = Some(("Kernel disconnected".to_string(), false));
+        }
+        Ok(())
     }
 }

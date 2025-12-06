@@ -1,10 +1,10 @@
-# thyme
+# sage
 
-A terminal text editor that won't make you cry. Much.
+A Python REPL and pseudo Jupyter notebook in your terminal.
 
 ## Overview
 
-thyme is a terminal-based text editor written in Rust. It's the editor you use when nano feels too bloated and vim's learning curve looks like a wall. Built with the revolutionary idea that text editors should let you edit text.
+sage is a terminal-based Python REPL and pseudo Jupyter notebook written in Rust. It combines a text editor with interactive Python execution, allowing you to write code in cells and execute them with live feedback - all in your terminal.
 
 <img width="1219" height="628" alt="thyme" src="https://github.com/user-attachments/assets/e0d7138b-c2c5-446b-bec7-f8bb89d335e2" />
 
@@ -14,6 +14,13 @@ thyme is a terminal-based text editor written in Rust. It's the editor you use w
 
 ## Features
 
+### Python REPL & Notebook
+- **Cell-based execution**: Organize code into cells using `# %%` delimiters
+- **Kernel selection**: Connect to any Python interpreter or Jupyter kernel
+- **Interactive execution**: Execute cells with Shift+Enter and see results instantly
+- **Multiple kernel support**: Switch between different Python environments
+- **Persistent state**: Variables persist across cell executions within a session
+
 ### Core Editing
 - Open and save files
 - Create new files with automatic parent directory creation
@@ -21,6 +28,7 @@ thyme is a terminal-based text editor written in Rust. It's the editor you use w
 - Text selection with keyboard and mouse
 - Find and replace functionality
 - Unicode support
+- Syntax highlighting for Python, Rust, JavaScript, TypeScript, Bash, Markdown, and TOML
 
 ### Input & Navigation
 - Arrow keys for navigation
@@ -56,26 +64,33 @@ thyme is a terminal-based text editor written in Rust. It's the editor you use w
 Requires Rust 1.70 or later.
 
 ```bash
-git clone https://github.com/yourusername/thyme.git
-cd thyme
+git clone https://github.com/yourusername/sage.git
+cd sage
 cargo build --release
 ```
 
-The binary will be in `target/release/thyme` (or `thyme.exe` on Windows).
+The binary will be in `target/release/sage` (or `sage.exe` on Windows).
 
 ## Usage
 
 ### Basic usage
 ```bash
-# Open a file
-thyme filename.txt
+# Start sage
+sage
 
-# Create a new file
-thyme
+# Open a Python file
+sage script.py
 ```
 
 ### Keyboard Shortcuts
 
+#### REPL/Notebook Commands
+| Action | Shortcut |
+|--------|----------|
+| Select Python Kernel | Ctrl+K |
+| Execute Current Cell | Ctrl+Enter or Ctrl+E |
+
+#### Editor Commands
 | Action | Shortcut |
 |--------|----------|
 | Save | Ctrl+S |
@@ -95,9 +110,29 @@ thyme
 | Indent | Tab (with selection) |
 | Dedent | Shift+Tab |
 
-### Selection
+### Using sage as a Python REPL
 
-Hold Shift while using arrow keys, Home, or End to select text. Or just use your mouse like a normal person.
+1. **Create cells** in your Python file using `# %%` as a delimiter:
+   ```python
+   # %% Cell 1
+   x = 10
+   y = 20
+   x + y
+
+   # %% Cell 2
+   result = x * y
+   print(result)
+   ```
+
+2. **Select a Python kernel** by pressing `Ctrl+K`. sage will discover available Python interpreters on your system.
+
+3. **Execute cells** by placing your cursor in a cell and pressing `Ctrl+Enter` (or `Ctrl+E` as alternative). The result will be shown in the status bar.
+
+4. **Variables persist** across cell executions, just like in Jupyter notebooks!
+
+### Text Selection
+
+Hold Shift while using arrow keys, Home, or End to select text. Or just use your mouse.
 
 ## Technical Details
 
@@ -106,8 +141,11 @@ Built with:
 - **crossterm** - Cross-platform terminal manipulation
 - **arboard** - System clipboard integration
 - **unicode-width** - Proper Unicode character width handling
+- **zmq** - ZeroMQ for Jupyter kernel protocol
+- **tokio** - Async runtime for kernel communication
+- **serde/serde_json** - JSON serialization for kernel messages
 
-The editor uses a rope data structure for efficient text operations on large files and maintains a complete undo/redo history.
+sage uses a rope data structure for efficient text operations, maintains complete undo/redo history, and communicates with Python kernels using either direct subprocess communication or the Jupyter kernel protocol.
 
 ## Contributing
 

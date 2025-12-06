@@ -81,6 +81,7 @@ impl Renderer {
     }
     
     pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize) -> io::Result<()> {
+        crate::debug_log("draw_with_bottom_window: start");
         // Update cursor style based on selection - but only if find/replace is closed
         if bottom_window_height == 0 {
             let desired_style = if editor.selection().is_some() {
@@ -88,7 +89,7 @@ impl Renderer {
             } else {
                 CursorStyle::Block
             };
-            
+
             // Always write the cursor style to ensure it's correct
             match desired_style {
                 CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
@@ -96,26 +97,31 @@ impl Renderer {
             }
             self.last_cursor_style = desired_style;
         }
-        
+
+        crate::debug_log("draw_with_bottom_window: getting file_name");
         // Update terminal title with filename and modified indicator
         let file_name = editor.file_name();
+        crate::debug_log("draw_with_bottom_window: getting is_modified");
         let modified_indicator = if editor.is_modified() { " *" } else { "" };
-        
+
+        crate::debug_log("draw_with_bottom_window: formatting title");
         let title = if file_name == "[No Name]" {
             format!("No Name{}", modified_indicator)
         } else {
             format!("{}{}", file_name, modified_indicator)
         };
-        
+
         if title != self.last_title {
             execute!(self.stdout, SetTitle(&title))?;
             self.last_title = title;
         }
-        
+
+        crate::debug_log("draw_with_bottom_window: getting terminal size");
         let (width, height) = terminal::size()?;
-        
+
         // Handle resize
         if (width, height) != self.last_size {
+            crate::debug_log("draw_with_bottom_window: handling resize");
             self.last_size = (width, height);
             self.last_screen = vec![String::new(); height as usize];
             self.last_status.clear();
@@ -129,38 +135,56 @@ impl Renderer {
                 self.needs_full_redraw = true;
             }
         }
-        
+
+        crate::debug_log("draw_with_bottom_window: calculating content_height");
         // Get viewport dimensions for rendering
         let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize; // Reserve for status and bottom window
         // Note: viewport is only updated when cursor moves, not on every render
-        
+
+        crate::debug_log("draw_with_bottom_window: about to update_syntax_viewport");
         // Process syntax highlighting first (requires mutable borrow)
         // Update viewport for large files
         let viewport_height = content_height;
         editor.update_syntax_viewport(viewport_height);
+        crate::debug_log("draw_with_bottom_window: update_syntax_viewport complete");
         // Only update syntax highlighting if we have work to do
+        crate::debug_log(&format!("draw_with_bottom_window: has_syntax_work = {}", editor.has_syntax_work()));
         if editor.has_syntax_work() {
+            crate::debug_log("draw_with_bottom_window: about to update_syntax_highlighting");
             editor.update_syntax_highlighting();
+            crate::debug_log("draw_with_bottom_window: update_syntax_highlighting complete");
         }
-        
+
+        crate::debug_log("draw_with_bottom_window: getting viewport_offset");
         // Now get all the data we need with immutable borrows
         let viewport_offset = editor.viewport_offset();
+        crate::debug_log("draw_with_bottom_window: getting selection");
         let selection = editor.selection();
+        crate::debug_log("draw_with_bottom_window: getting buffer");
         let buffer = editor.buffer();
+        crate::debug_log("draw_with_bottom_window: getting matching_brackets");
         let matching_brackets = editor.get_matching_brackets();
+        crate::debug_log("draw_with_bottom_window: getting matching_text_positions");
         let matching_text_positions = editor.get_matching_text_positions();
+        crate::debug_log("draw_with_bottom_window: getting find_matches");
         let find_matches = editor.get_find_matches();
+        crate::debug_log("draw_with_bottom_window: getting current_find_match");
         let current_find_match = editor.get_current_find_match();
 
+        crate::debug_log("draw_with_bottom_window: hiding cursor");
         // Hide cursor while drawing
         #[cfg(target_os = "windows")]
         write!(self.stdout, "\x1b[?25l")?;
-        
+
         #[cfg(not(target_os = "windows"))]
         execute!(self.stdout, Hide)?;
-        
+
+        crate::debug_log(&format!("draw_with_bottom_window: starting line drawing loop, content_height = {}", content_height));
         // Draw all lines
         for screen_row in 0..content_height {
+            if screen_row == 0 || screen_row == content_height - 1 || screen_row % 10 == 0 {
+                crate::debug_log(&format!("draw_with_bottom_window: drawing screen_row {}", screen_row));
+            }
             let mut line_content = String::with_capacity(width as usize);
             
             // Calculate which logical line we're displaying
@@ -494,13 +518,19 @@ impl Renderer {
                 }
             }
         }
-        
+
+        crate::debug_log("draw_with_bottom_window: drawing loop completed, building status line");
         // Build status line - position it above any bottom window
         let status_row = (height - 1 - bottom_window_height as u16) as usize;
+        crate::debug_log("draw_with_bottom_window: calling is_modified");
         let modified_indicator = if editor.is_modified() { "*" } else { "" };
+        crate::debug_log("draw_with_bottom_window: calling is_read_only");
         let read_only_indicator = if editor.is_read_only() { " [RO]" } else { "" };
+        crate::debug_log("draw_with_bottom_window: calling file_name");
         let file_name = editor.file_name();
+        crate::debug_log("draw_with_bottom_window: calling cursor_position");
         let (line, col) = editor.cursor_position();
+        crate::debug_log("draw_with_bottom_window: calling buffer.len_lines");
         let total_lines = buffer.len_lines();
         
         // Check for status messages (errors)
@@ -510,53 +540,104 @@ impl Renderer {
             ("", false)
         };
         
+        crate::debug_log("draw_with_bottom_window: formatting left_status");
         let left_status = if !status_msg.is_empty() {
             // Show error message instead of filename
             format!(" {} ", status_msg)
         } else {
             format!(" {}{}{} ", file_name, modified_indicator, read_only_indicator)
         };
-        
+
+        crate::debug_log("draw_with_bottom_window: calling is_repl_mode");
+        // Add kernel info if in REPL mode
+        let mut kernel_info = if editor.is_repl_mode() {
+            crate::debug_log("draw_with_bottom_window: in REPL mode, calling get_kernel_info");
+            if let Some(kernel_name) = editor.get_kernel_info() {
+                format!(" [{}] ", kernel_name)
+            } else {
+                " [No kernel] ".to_string()
+            }
+        } else {
+            String::new()
+        };
+        crate::debug_log("draw_with_bottom_window: kernel_info formatted");
+
+        crate::debug_log("draw_with_bottom_window: formatting right_status");
         // Format the right status with fixed-width fields
         // Right-align the entire row/total as one unit (19 chars) and column (4 chars)
         // This accommodates up to 999,999,999 lines (9 digits + "/" + 9 digits)
         let row_info = format!("{}/{}", line + 1, total_lines);
-        let right_status = format!(" {:>19}  {:>4} ", 
-            row_info, 
+        let right_status = format!(" {:>19}  {:>4} ",
+            row_info,
             col + 1
         );
-        
+
+        crate::debug_log("draw_with_bottom_window: building full status_line");
+        // Calculate available space and truncate kernel_info if needed
+        let min_width = left_status.len() + right_status.len();
+        let max_kernel_width = if min_width < width as usize {
+            (width as usize).saturating_sub(min_width)
+        } else {
+            0
+        };
+
+        // Truncate kernel_info if it's too long
+        if kernel_info.len() > max_kernel_width {
+            if max_kernel_width > 4 {
+                // Truncate and add "..."
+                let truncate_to = max_kernel_width.saturating_sub(3);
+                kernel_info = kernel_info.chars().take(truncate_to).collect::<String>() + "...";
+            } else {
+                kernel_info.clear();
+            }
+        }
+
         let mut status_line = String::with_capacity(width as usize);
         status_line.push_str(&left_status);
-        let padding = width as usize - left_status.len() - right_status.len();
+        status_line.push_str(&kernel_info);
+        // Calculate padding - ensure we never exceed width
+        let used_width = left_status.chars().count() + kernel_info.chars().count() + right_status.chars().count();
+        let padding = if used_width < width as usize {
+            width as usize - used_width
+        } else {
+            0
+        };
         for _ in 0..padding {
             status_line.push(' ');
         }
         status_line.push_str(&right_status);
-        
+
+        // Final safety check: ensure status line doesn't exceed width
+        let status_chars: Vec<char> = status_line.chars().collect();
+        if status_chars.len() > width as usize {
+            status_line = status_chars.iter().take(width as usize).collect();
+        }
+
+        crate::debug_log("draw_with_bottom_window: about to write status line to stdout");
         // Only update status if it changed
         #[cfg(target_os = "windows")]
         {
             if self.needs_full_redraw || status_line != self.last_status {
                 if is_error {
                     // Red background for errors
-                    write!(self.stdout, 
-                        "\x1b[{};1H\x1b[48;5;196m\x1b[38;5;15m{}\x1b[0m", 
+                    write!(self.stdout,
+                        "\x1b[{};1H\x1b[48;5;196m\x1b[38;5;15m{}\x1b[0m",
                         height, status_line)?;
                 } else {
                     // Normal dark grey background
-                    write!(self.stdout, 
-                        "\x1b[{};1H\x1b[48;5;238m\x1b[38;5;15m{}\x1b[0m", 
+                    write!(self.stdout,
+                        "\x1b[{};1H\x1b[48;5;238m\x1b[38;5;15m{}\x1b[0m",
                         height, status_line)?;
                 }
                 self.last_status = status_line;
             }
             self.needs_full_redraw = false;
         }
-        
+
         #[cfg(not(target_os = "windows"))]
         {
             if status_line != self.last_status {
+                crate::debug_log("draw_with_bottom_window: status line changed, executing crossterm commands");
                 if is_error {
                     // Red background for errors
                     execute!(
@@ -578,9 +659,13 @@ impl Renderer {
                         crossterm::style::ResetColor
                     )?;
                 }
+                crate::debug_log("draw_with_bottom_window: status line written");
                 self.last_status = status_line;
+            } else {
+                crate::debug_log("draw_with_bottom_window: status line unchanged, skipping write");
             }
         }
+        crate::debug_log("draw_with_bottom_window: status line complete");
         
         // Position cursor - map buffer position to screen position
         // Only show cursor if there's no bottom window (find/replace is closed)
@@ -624,5 +709,34 @@ impl Renderer {
         {
             self.needs_full_redraw = true;
         }
+    }
+
+    /// Reposition and show cursor at editor position (call after drawing output pane)
+    pub fn reposition_cursor(&mut self, editor: &Editor) -> io::Result<()> {
+        let (width, height) = terminal::size()?;
+        let (cursor_line, cursor_col) = editor.cursor_position();
+        let (viewport_row, viewport_col) = editor.viewport_offset();
+
+        // Calculate screen position (add 2 for virtual lines before buffer)
+        let logical_cursor_line = cursor_line + 2;
+        let screen_row = logical_cursor_line.saturating_sub(viewport_row);
+        let screen_col = cursor_col.saturating_sub(viewport_col);
+
+        // Only show cursor if it's within the visible area
+        if screen_row < height as usize && screen_col < width as usize {
+            #[cfg(target_os = "windows")]
+            write!(self.stdout, "\x1b[{};{}H\x1b[?25h",
+                screen_row + 1, screen_col + 1)?;
+
+            #[cfg(not(target_os = "windows"))]
+            execute!(
+                self.stdout,
+                MoveTo(screen_col as u16, screen_row as u16),
+                Show
+            )?;
+        }
+
+        self.stdout.flush()?;
+        Ok(())
     }
 }

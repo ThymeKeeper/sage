@@ -32,5 +32,6 @@ __pycache__/
 *.log
 
 # Compiled binaries
-thyme.exe
+sage
+sage.exe
 *.pdb
