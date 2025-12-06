@@ -66,9 +66,6 @@ impl Autocomplete {
             return;
         }
 
-        crate::debug_log(&format!("Autocomplete update: prefix='{}', {} dynamic completions available",
-            prefix, self.dynamic_completions.len()));
-
         // Merge static and dynamic completions
         let mut all_suggestions = Vec::new();
 
@@ -79,8 +76,6 @@ impl Autocomplete {
             }
         }
 
-        crate::debug_log(&format!("Found {} matching dynamic completions", all_suggestions.len()));
-
         // Add static Python completions (if not already present)
         let static_completions = Self::get_python_completions();
         for completion in static_completions {
@@ -88,11 +83,6 @@ impl Autocomplete {
             if comp_str.starts_with(prefix) && !all_suggestions.contains(&comp_str) {
                 all_suggestions.push(comp_str);
             }
-        }
-
-        crate::debug_log(&format!("Total suggestions after merging: {}", all_suggestions.len()));
-        if !all_suggestions.is_empty() {
-            crate::debug_log(&format!("First 5 suggestions: {:?}", all_suggestions.iter().take(5).collect::<Vec<_>>()));
         }
 
         self.suggestions = all_suggestions;
@@ -146,7 +136,7 @@ impl Autocomplete {
 
     /// Draw autocomplete dropdown at given position
     pub fn draw<W: Write>(
-        &self,
+        &mut self,
         writer: &mut W,
         cursor_row: u16,
         cursor_col: u16,

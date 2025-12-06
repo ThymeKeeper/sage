@@ -307,6 +307,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
 
     // Autocomplete
     let mut autocomplete = autocomplete::Autocomplete::new();
+    let mut suppress_autocomplete_once = false; // Suppress after Tab completion
 
     loop {
         debug_log(&format!("Loop iteration start"));
@@ -337,11 +338,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         let completion_names: Vec<String> = completions.iter()
                             .map(|c| c.name.clone())
                             .collect();
-                        debug_log(&format!("Received {} completions, adding to autocomplete", completion_names.len()));
-                        debug_log(&format!("First 5 completions: {:?}", completion_names.iter().take(5).collect::<Vec<_>>()));
                         autocomplete.add_dynamic_completions(completion_names);
-                    } else {
-                        debug_log("No completions received from execution");
                     }
 
                     // Update status message with final time
@@ -463,6 +460,12 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     // Handle mouse events for text selection
                     match mouse_event.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
+                            // Hide autocomplete on any mouse click
+                            if autocomplete.is_visible() {
+                                autocomplete.hide();
+                                needs_redraw = true;
+                            }
+
                             // Check if click is in output pane area
                             let (_, height) = crossterm::terminal::size()?;
                             let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
@@ -740,8 +743,10 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                     }
                     // If it's undo/redo, fall through to normal command processing
                 }
-                
-                
+
+                // Note: suppress_autocomplete_once flag (if set by Tab completion) will be
+                // checked and cleared in the autocomplete update logic below
+
                 let cmd = match key.code {
                     // Esc - Hide autocomplete, or toggle output pane focus
                     KeyCode::Esc => {
@@ -940,6 +945,10 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                 executing_kernel_info = Some(kernel_info);
                                 editor.status_message = Some(("Executing...".to_string(), false));
                                 needs_redraw = true;
+                            } else {
+                                // No kernel connected
+                                editor.status_message = Some(("No kernel connected. Press Ctrl+K to select a kernel.".to_string(), true));
+                                needs_redraw = true;
                             }
                         }
                         commands::Command::None
@@ -1070,11 +1079,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
 
                     // Movement (with selection support)
                     KeyCode::Up => {
-                        debug_log(&format!("Up pressed: autocomplete.is_visible()={}, has_alt={}",
-                            autocomplete.is_visible(),
-                            key.modifiers.contains(KeyModifiers::ALT)));
                         if autocomplete.is_visible() && !key.modifiers.contains(KeyModifiers::ALT) {
-                            debug_log("Navigating autocomplete UP");
                             // Navigate autocomplete dropdown
                             autocomplete.select_previous();
                             needs_redraw = true;
@@ -1108,11 +1113,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         }
                     }
                     KeyCode::Down => {
-                        debug_log(&format!("Down pressed: autocomplete.is_visible()={}, has_alt={}",
-                            autocomplete.is_visible(),
-                            key.modifiers.contains(KeyModifiers::ALT)));
                         if autocomplete.is_visible() && !key.modifiers.contains(KeyModifiers::ALT) {
-                            debug_log("Navigating autocomplete DOWN");
                             // Navigate autocomplete dropdown
                             autocomplete.select_next();
                             needs_redraw = true;
@@ -1257,6 +1258,8 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                     editor.execute(commands::Command::InsertChar(ch))?;
                                 }
                                 autocomplete.hide();
+                                renderer.force_redraw(); // Force full redraw to clear autocomplete artifacts
+                                suppress_autocomplete_once = true; // Don't show autocomplete on next key
                                 needs_redraw = true;
                             }
                             commands::Command::None
@@ -1368,18 +1371,25 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                         editor.update_viewport_for_cursor_with_bottom(bottom_height);
 
                         // Apply autocomplete updates based on command type
-                        if should_update_autocomplete {
+                        if suppress_autocomplete_once {
+                            // Skip autocomplete update this cycle (after Tab completion)
+                            suppress_autocomplete_once = false;
+                        } else if should_update_autocomplete {
                             let prefix = editor.get_word_at_cursor();
                             autocomplete.update(&prefix);
+                            renderer.force_redraw(); // Clear artifacts when menu changes
                         } else if should_check_backspace_delete {
                             let prefix = editor.get_word_at_cursor();
                             if prefix.is_empty() {
                                 autocomplete.hide();
+                                renderer.force_redraw();
                             } else {
                                 autocomplete.update(&prefix);
+                                renderer.force_redraw(); // Clear artifacts when menu changes
                             }
                         } else if should_hide_autocomplete {
                             autocomplete.hide();
+                            renderer.force_redraw();
                         }
                     }
                 }

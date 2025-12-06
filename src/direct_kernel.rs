@@ -124,14 +124,11 @@ while True:
         # IMPORTANT: Send completions BEFORE the success/result marker
         try:
             completions = []
-            debug_info = []
 
             # Only introspect if the code contained an import statement
             if 'import' in code:
-                debug_info.append(f"Code contains 'import', checking globals")
                 # Take a snapshot of globals to avoid "dictionary changed size during iteration"
                 globals_snapshot = dict(globals())
-                debug_info.append(f"Found {len(globals_snapshot)} items in globals")
 
                 # Get all names from globals snapshot
                 for name in globals_snapshot:
@@ -144,14 +141,12 @@ while True:
 
                     # Check if it's a module
                     if obj_type == 'module':
-                        debug_info.append(f"Found module: {name}")
                         # Add module name
                         completions.append({"name": name, "type": "module"})
 
                         # Add module members (functions, classes, constants)
                         try:
                             members = dir(obj)
-                            member_count = 0
                             for member in members:
                                 if not member.startswith('_'):
                                     try:
@@ -162,40 +157,23 @@ while True:
                                             "name": f"{name}.{member}",
                                             "type": member_type
                                         })
-                                        member_count += 1
                                     except:
                                         pass
-                            debug_info.append(f"  Added {member_count} members from {name}")
-                        except Exception as e:
-                            debug_info.append(f"  Error getting members: {e}")
+                        except:
+                            pass
                     elif obj_type in ['function', 'builtin_function_or_method', 'type', 'ABCMeta']:
                         # User-defined or built-in functions and classes
                         completions.append({"name": name, "type": obj_type})
-                        debug_info.append(f"Found {obj_type}: {name}")
                     else:
                         # Variables (includes DataFrames, Series, etc.)
                         completions.append({"name": name, "type": obj_type})
-                        debug_info.append(f"Found variable ({obj_type}): {name}")
-
-                debug_info.append(f"Total completions: {len(completions)}")
-            else:
-                debug_info.append("Code does not contain 'import', skipping completion collection")
-
-            # Send debug info as stdout if we have any
-            if debug_info:
-                print("SAGE_OUTPUT_START", flush=True)
-                print(json.dumps({"type": "stdout", "data": "[COMPLETION DEBUG]\n" + "\n".join(debug_info)}), flush=True)
-                print("SAGE_OUTPUT_END", flush=True)
 
             # Send completions
             print("SAGE_OUTPUT_START", flush=True)
             print(json.dumps({"type": "completions", "data": completions}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
         except Exception as e:
-            # If completion gathering fails, don't crash - send debug info and empty completions
-            print("SAGE_OUTPUT_START", flush=True)
-            print(json.dumps({"type": "stdout", "data": f"[COMPLETION ERROR] {e}\n{traceback.format_exc()}"}), flush=True)
-            print("SAGE_OUTPUT_END", flush=True)
+            # If completion gathering fails, don't crash - just send empty completions
             print("SAGE_OUTPUT_START", flush=True)
             print(json.dumps({"type": "completions", "data": []}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
@@ -344,8 +322,6 @@ impl Kernel for DirectKernel {
 
             let output_data: serde_json::Value = serde_json::from_str(line.trim())?;
 
-            eprintln!("DEBUG: Received output type: {:?}", output_data["type"]);
-
             match output_data["type"].as_str() {
                 Some("stdout") => {
                     if let Some(data) = output_data["data"].as_str() {
@@ -386,17 +362,11 @@ impl Kernel for DirectKernel {
                 Some("completions") => {
                     // Parse completions for autocomplete
                     if let Some(data) = output_data["data"].as_array() {
-                        eprintln!("DEBUG: Received completions array with {} items", data.len());
                         for item in data {
                             if let Ok(completion) = serde_json::from_value::<crate::kernel::CompletionItem>(item.clone()) {
                                 completions.push(completion);
-                            } else {
-                                eprintln!("DEBUG: Failed to parse completion item: {:?}", item);
                             }
                         }
-                        eprintln!("DEBUG: Successfully parsed {} completions", completions.len());
-                    } else {
-                        eprintln!("DEBUG: Completions data is not an array: {:?}", output_data);
                     }
                     // Don't set finished - continue reading for success/result markers
                 }
