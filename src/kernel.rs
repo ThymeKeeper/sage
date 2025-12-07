@@ -456,43 +456,88 @@ fn check_system_paths(
         "/usr/local/Cellar/python*/*/bin",
     ];
 
-    let python_names = vec![
-        "python3", "python", "python3.13", "python3.12", "python3.11", "python3.10", "python3.9",
-    ];
+    // Check common names first, then dynamically discover versioned pythons
+    let priority_names = vec!["python3", "python"];
 
     for dir in system_dirs {
-        // Handle glob patterns
+        // Handle glob patterns (e.g., homebrew cellar)
         if dir.contains('*') {
             if let Ok(paths) = glob::glob(dir) {
                 for path in paths.flatten() {
-                    for python_name in &python_names {
-                        let python_path = path.join(python_name);
-                        if python_path.exists() {
-                            add_interpreter(
-                                interpreters,
-                                seen_inodes,
-                                python_path.to_string_lossy().to_string(),
-                                python_name,
-                            );
-                        }
-                    }
+                    check_pythons_in_dir(&path, interpreters, seen_inodes);
                 }
             }
         } else {
-            for python_name in &python_names {
-                let python_path = format!("{}/{}", dir, python_name);
-                if std::path::Path::new(&python_path).exists() {
-                    // Don't canonicalize - keep the original path (e.g., /usr/bin/python vs /usr/bin/python3.12)
-                    // add_interpreter will use metadata to deduplicate by inode
-                    add_interpreter(
-                        interpreters,
-                        seen_inodes,
-                        python_path,
-                        python_name,
-                    );
+            check_pythons_in_dir(std::path::Path::new(dir), interpreters, seen_inodes);
+        }
+    }
+}
+
+/// Check for Python interpreters in a specific directory
+fn check_pythons_in_dir(
+    dir: &std::path::Path,
+    interpreters: &mut Vec<KernelInfo>,
+    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+) {
+    if !dir.exists() {
+        return;
+    }
+
+    // Collect all python* executables first
+    let mut python_paths = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+
+            // Match actual Python interpreters, not tools like python3-config, python3-coverage
+            let is_python = if let Some(rest) = name_str.strip_prefix("python") {
+                // After "python", must be: empty OR only digits and dots (version number)
+                // NOT dashes, letters, or other chars (e.g., python3.12-config has dash)
+                rest.is_empty() ||
+                rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+            } else if let Some(rest) = name_str.strip_prefix("pypy") {
+                // Same for pypy
+                rest.is_empty() ||
+                rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+            } else {
+                false
+            };
+
+            if is_python {
+                let python_path = entry.path();
+                // Check it's an executable file (or symlink to one)
+                if python_path.is_file() || python_path.is_symlink() {
+                    python_paths.push((python_path, name_str.to_string()));
                 }
             }
         }
+    }
+
+    // Sort to prioritize common names first: python3, python, then versioned, then others
+    python_paths.sort_by_key(|(_, name)| {
+        match name.as_str() {
+            "python3" => 0,
+            "python" => 1,
+            "python2" => 2,
+            s if s.starts_with("python3.") => 3,
+            s if s.starts_with("python4.") => 4,
+            s if s.starts_with("python2.") => 5,
+            "pypy3" => 6,
+            "pypy" => 7,
+            _ => 8,
+        }
+    });
+
+    // Add them in priority order
+    for (python_path, name) in python_paths {
+        add_interpreter(
+            interpreters,
+            seen_inodes,
+            python_path.to_string_lossy().to_string(),
+            &name,
+        );
     }
 }
 
@@ -501,9 +546,11 @@ fn check_path_pythons(
     interpreters: &mut Vec<KernelInfo>,
     seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
 ) {
-    let python_names = vec!["python3", "python", "python3.13", "python3.12", "python3.11", "python3.10", "python3.9"];
+    // Check common python names in PATH (system dirs already scanned all python* files)
+    // This catches pythons in non-standard locations that are in PATH
+    let priority_names = vec!["python3", "python", "python2", "pypy3", "pypy"];
 
-    for name in python_names {
+    for name in priority_names {
         if let Ok(output) = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("command -v {}", name))
