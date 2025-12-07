@@ -1050,7 +1050,7 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                                     debug_log(&format!("Connected successfully"));
                                     editor.set_kernel(kernel);
                                     editor.enable_repl_mode();
-                                    editor.status_message = Some((format!("Connected to: {}", kernel_info.display_name), false));
+                                    editor.status_message = Some(("Connected to kernel".to_string(), false));
                                     debug_log(&format!("Kernel set"));
                                 }
                                 Err(e) => {

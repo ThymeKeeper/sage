@@ -2806,7 +2806,7 @@ impl Editor {
     pub fn connect_kernel(&mut self) -> Result<(), String> {
         if let Some(kernel) = self.kernel.as_mut() {
             kernel.connect().map_err(|e| e.to_string())?;
-            self.status_message = Some((format!("Connected to kernel: {}", kernel.info().display_name), false));
+            self.status_message = Some(("Connected to kernel".to_string(), false));
         }
         Ok(())
     }
