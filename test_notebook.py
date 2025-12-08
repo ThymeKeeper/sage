@@ -1,5 +1,8 @@
 #!/home/thyme/venv/bin/python
 
+##$$
+#source /home/thyme/venv/bin/activate && pip install matplotlib
+
 ##$$ 1 ---------------------------------------------------------------------------
  
 import duckdb as db
