@@ -14,6 +14,8 @@ mod output_pane;
 mod autocomplete;
 mod event_loop;
 
+use kernel::Kernel;
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton, EnableBracketedPaste, DisableBracketedPaste},
     execute,
@@ -132,19 +134,105 @@ fn execute_file(file_path: Option<String>, python_path: Option<String>) -> io::R
         }
     };
 
-    // Execute the Python file
-    let status = std::process::Command::new(&python_executable)
-        .arg(&file_path)
-        .status()
+    // Read file content
+    let file_content = std::fs::read_to_string(&file_path)
         .map_err(|e| {
-            eprintln!("Error executing Python: {}", e);
+            eprintln!("Error reading file '{}': {}", file_path, e);
             e
         })?;
 
-    // Exit with the same status code as the Python process
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    // Parse file into cells
+    let rope = ropey::Rope::from_str(&file_content);
+    let cells = cell::parse_cells(&rope);
+
+    // If no cells with delimiters, just run the whole file with Python directly
+    if cells.len() == 1 && cells[0].start == 0 && cells[0].end == rope.len_bytes() {
+        // No cell delimiters found - execute as a regular Python script
+        let status = std::process::Command::new(&python_executable)
+            .arg(&file_path)
+            .status()
+            .map_err(|e| {
+                eprintln!("Error executing Python: {}", e);
+                e
+            })?;
+
+        // Exit with the same status code as the Python process
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        return Ok(());
     }
+
+    // File has cells - execute them one by one with kernel
+    let kernel_name = format!("Python ({})", python_executable);
+    let mut kernel = direct_kernel::DirectKernel::new(
+        python_executable.clone(),
+        kernel_name.clone(),
+        kernel_name,
+    );
+
+    // Connect to kernel
+    if let Err(e) = kernel.connect() {
+        eprintln!("Error connecting to Python kernel: {}", e);
+        return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to connect to kernel: {}", e)));
+    }
+
+    // Execute each cell in order
+    for (cell_idx, cell) in cells.iter().enumerate() {
+        let cell_number = cell_idx + 1;
+        let code = cell::get_cell_content(&rope, cell);
+
+        // Skip empty cells
+        if code.trim().is_empty() {
+            continue;
+        }
+
+        // Execute cell
+        match kernel.execute(&code) {
+            Ok(result) => {
+                // Print outputs
+                for output in &result.outputs {
+                    match output {
+                        kernel::ExecutionOutput::Stdout(text) => {
+                            print!("{}", text);
+                        }
+                        kernel::ExecutionOutput::Stderr(text) => {
+                            eprint!("{}", text);
+                        }
+                        kernel::ExecutionOutput::Result(text) => {
+                            println!("{}", text);
+                        }
+                        kernel::ExecutionOutput::Error { ename, evalue, traceback } => {
+                            eprintln!("Cell {} error: {}: {}", cell_number, ename, evalue);
+                            for line in traceback {
+                                if !line.trim().is_empty() {
+                                    eprintln!("{}", line);
+                                }
+                            }
+                        }
+                        kernel::ExecutionOutput::Display { data, .. } => {
+                            println!("{}", data);
+                        }
+                    }
+                }
+
+                // Stop on error
+                if !result.success {
+                    eprintln!("\nExecution stopped at cell {} due to error", cell_number);
+                    let _ = kernel.disconnect();
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("Cell {} kernel error: {}", cell_number, e);
+                let _ = kernel.disconnect();
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Disconnect kernel
+    let _ = kernel.disconnect();
 
     Ok(())
 }

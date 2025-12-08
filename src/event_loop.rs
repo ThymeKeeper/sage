@@ -1252,10 +1252,17 @@ fn spawn_background_execution(
                     all_completions.extend(result.completions);
 
                     results.push((execution_count, cell_number, output_text, is_error, elapsed));
+
+                    // Stop execution if this cell had an error
+                    if is_error {
+                        break;
+                    }
                 }
                 Err(e) => {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     results.push((0, cell_number, format!("Error: {}", e), true, elapsed));
+                    // Stop execution on kernel error
+                    break;
                 }
             }
         }

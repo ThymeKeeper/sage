@@ -112,6 +112,9 @@ impl Editor {
             }
         };
 
+        // Save total cell count before loop consumes the vector
+        let total_cells_to_execute = cells_to_execute.len();
+
         // Execute each cell in order
         for cell_idx in cells_to_execute {
             let cell = &self.cells[cell_idx];
@@ -134,10 +137,17 @@ impl Editor {
                         let is_error = !result.success;
 
                         results.push((execution_count, cell_number, output_text, is_error, elapsed));
+
+                        // Stop execution if this cell had an error
+                        if is_error {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let elapsed = start_time.elapsed().as_secs_f64();
                         results.push((0, cell_number, format!("Error: {}", e), true, elapsed));
+                        // Stop execution on kernel error
+                        break;
                     }
                 }
             }
@@ -155,11 +165,20 @@ impl Editor {
             } else {
                 let error_count = results.iter().filter(|(_, _, _, is_err, _)| *is_err).count();
                 let total_time: f64 = results.iter().map(|(_, _, _, _, elapsed)| elapsed).sum();
+
                 if error_count > 0 {
-                    self.status_message = Some((
-                        format!("Executed {} cells ({} errors, {:.3}s)", results.len(), error_count, total_time),
-                        true
-                    ));
+                    // Check if execution stopped early due to error
+                    if results.len() < total_cells_to_execute {
+                        self.status_message = Some((
+                            format!("Executed {} of {} cells (stopped on error, {:.3}s)", results.len(), total_cells_to_execute, total_time),
+                            true
+                        ));
+                    } else {
+                        self.status_message = Some((
+                            format!("Executed {} cells ({} errors, {:.3}s)", results.len(), error_count, total_time),
+                            true
+                        ));
+                    }
                 } else {
                     self.status_message = Some((
                         format!("Executed {} cells ({:.3}s)", results.len(), total_time),
