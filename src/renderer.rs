@@ -316,7 +316,7 @@ impl Renderer {
                                     } else {
                                         // Apply syntax highlighting colors - muted and professional
                                         match syntax_state {
-                                            SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple => {
+                                            SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
                                                 // Muted green for strings
                                                 formatted_line.push_str("\x1b[38;2;152;180;152m"); // #98B498
                                             }
@@ -396,7 +396,7 @@ impl Renderer {
                                     } else {
                                         // Apply syntax highlighting colors - muted and professional
                                         match syntax_state {
-                                            SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple => {
+                                            SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
                                                 // Muted green for strings
                                                 formatted_line.push_str("\x1b[38;2;152;180;152m"); // #98B498
                                             }

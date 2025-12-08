@@ -5,6 +5,7 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetForegroundColor},
 };
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct OutputEntry {
@@ -26,6 +27,11 @@ pub struct OutputPane {
     selection_start: Option<(usize, usize)>, // Selection start (line, col)
     viewport_height: usize, // Height of visible area for scrolling
     viewport_width: usize, // Width of visible area for horizontal scrolling
+    mouse_selecting: bool, // True while dragging a selection
+    last_click_time: Option<Instant>, // Track time of last click for double click
+    click_count: usize, // Count consecutive clicks
+    last_click_position: Option<(usize, usize)>, // Last click position (line, col)
+    output_start_row: u16, // Starting row of output pane on screen
 }
 
 impl OutputPane {
@@ -41,6 +47,11 @@ impl OutputPane {
             selection_start: None,
             viewport_height: 10, // Default, will be updated in draw
             viewport_width: 80, // Default, will be updated in draw
+            mouse_selecting: false,
+            last_click_time: None,
+            click_count: 0,
+            last_click_position: None,
+            output_start_row: 0,
         }
     }
 
@@ -250,6 +261,51 @@ impl OutputPane {
         }
     }
 
+    /// Ensure cursor is visible with scrolloff zones for drag selection
+    fn ensure_cursor_visible_with_scrolloff(&mut self) {
+        let scrolloff = 2; // Number of lines/cols to keep as margin
+        let total_lines = self.count_total_lines();
+
+        // Vertical scrolling with scrolloff
+        let cursor_relative_line = self.cursor_line.saturating_sub(self.scroll_offset);
+
+        // Scroll up if cursor is in the top scrolloff zone
+        if cursor_relative_line < scrolloff && self.scroll_offset > 0 {
+            self.scroll_offset = self.cursor_line.saturating_sub(scrolloff);
+        }
+        // Scroll down if cursor is in the bottom scrolloff zone
+        else if cursor_relative_line >= self.viewport_height.saturating_sub(scrolloff) {
+            let target_offset = self.cursor_line + scrolloff;
+            if target_offset >= self.viewport_height {
+                self.scroll_offset = target_offset - self.viewport_height;
+            }
+            // Don't scroll past the end
+            let max_offset = total_lines.saturating_sub(self.viewport_height);
+            if self.scroll_offset > max_offset {
+                self.scroll_offset = max_offset;
+            }
+        }
+
+        // Horizontal scrolling with scrolloff
+        let indent = 4;
+        let visible_width = self.viewport_width.saturating_sub(indent + 2);
+
+        if visible_width > 0 {
+            // Scroll left if cursor is in the left scrolloff zone
+            if self.cursor_col < self.horizontal_offset + scrolloff {
+                self.horizontal_offset = self.cursor_col.saturating_sub(scrolloff);
+            }
+            // Scroll right if cursor is in the right scrolloff zone
+            else if self.cursor_col >= self.horizontal_offset + visible_width.saturating_sub(scrolloff) {
+                if self.cursor_col >= visible_width.saturating_sub(scrolloff) {
+                    self.horizontal_offset = self.cursor_col + scrolloff - visible_width;
+                } else {
+                    self.horizontal_offset = 0;
+                }
+            }
+        }
+    }
+
     /// Get the length of a specific line (in characters, not bytes)
     fn get_line_length(&self, line_idx: usize) -> usize {
         let lines = self.get_all_lines();
@@ -346,6 +402,9 @@ impl OutputPane {
     }
 
     pub fn draw<W: Write>(&mut self, writer: &mut W, start_row: u16, height: usize, width: u16) -> io::Result<()> {
+        // Save start row for mouse position calculations
+        self.output_start_row = start_row;
+
         // Clear all rows in the output pane area first (to handle resizing)
         for row in start_row..=(start_row + height as u16) {
             execute!(
@@ -596,5 +655,246 @@ impl OutputPane {
 
         writer.flush()?;
         Ok(())
+    }
+
+    /// Convert screen coordinates to (line, col) position in output
+    pub fn screen_to_position(&self, screen_col: usize, screen_row: usize) -> Option<(usize, usize)> {
+        // Check if screen row is within the output pane
+        if screen_row <= self.output_start_row as usize {
+            return None;
+        }
+
+        let relative_row = screen_row - self.output_start_row as usize;
+
+        // Row 0 is the separator line, content starts at row 1
+        if relative_row < 1 {
+            return None;
+        }
+
+        // Calculate which line this corresponds to
+        let display_lines = self.viewport_height;
+        let total_lines = self.count_total_lines();
+        let line_offset = if self.auto_scroll {
+            total_lines.saturating_sub(display_lines)
+        } else {
+            self.scroll_offset.min(total_lines.saturating_sub(1))
+        };
+
+        let line_idx = line_offset + (relative_row - 1); // -1 for separator line
+
+        if line_idx >= total_lines {
+            return None;
+        }
+
+        // Get the line to determine indent
+        let lines = self.get_all_lines();
+        if line_idx >= lines.len() {
+            return None;
+        }
+
+        let (line_text, is_header, _) = &lines[line_idx];
+        let indent = if *is_header { 2 } else { 4 };
+
+        // Calculate column position considering horizontal scroll and indent
+        let col = if screen_col < indent {
+            0
+        } else {
+            let visible_col = screen_col - indent;
+            visible_col + self.horizontal_offset
+        };
+
+        // Clamp to line length
+        let line_len = line_text.chars().count();
+        let col = col.min(line_len);
+
+        Some((line_idx, col))
+    }
+
+    /// Start a mouse selection
+    pub fn start_mouse_selection(&mut self, screen_col: usize, screen_row: usize) {
+        let now = Instant::now();
+        let double_click_time = Duration::from_millis(500);
+
+        if let Some((line, col)) = self.screen_to_position(screen_col, screen_row) {
+            // Check for double click
+            if let Some(last_time) = self.last_click_time {
+                if now.duration_since(last_time) < double_click_time {
+                    if let Some(last_pos) = self.last_click_position {
+                        // Check if clicking near the same position
+                        let line_diff = if line > last_pos.0 {
+                            line - last_pos.0
+                        } else {
+                            last_pos.0 - line
+                        };
+                        let col_diff = if col > last_pos.1 {
+                            col - last_pos.1
+                        } else {
+                            last_pos.1 - col
+                        };
+
+                        if line_diff == 0 && col_diff <= 3 {
+                            self.click_count += 1;
+                            if self.click_count > 3 {
+                                self.click_count = 1;
+                            }
+                        } else {
+                            self.click_count = 1;
+                        }
+                    } else {
+                        self.click_count = 1;
+                    }
+                } else {
+                    self.click_count = 1;
+                }
+            } else {
+                self.click_count = 1;
+            }
+
+            self.last_click_time = Some(now);
+            self.last_click_position = Some((line, col));
+
+            match self.click_count {
+                2 => {
+                    // Double click - select word
+                    self.select_word_at(line, col);
+                    self.mouse_selecting = false;
+                }
+                3 => {
+                    // Triple click - select line
+                    self.select_line_at(line);
+                    self.mouse_selecting = false;
+                }
+                _ => {
+                    // Single click - start normal selection
+                    self.cursor_line = line;
+                    self.cursor_col = col;
+                    self.selection_start = None;
+                    self.mouse_selecting = true;
+                    self.auto_scroll = false;
+                    self.ensure_cursor_visible();
+                }
+            }
+        }
+    }
+
+    /// Update mouse selection while dragging
+    pub fn update_mouse_selection(&mut self, screen_col: usize, screen_row: usize) {
+        if self.mouse_selecting {
+            if self.selection_start.is_none() {
+                // Start selection from the initial cursor position
+                self.selection_start = Some((self.cursor_line, self.cursor_col));
+            }
+
+            // Handle dragging above the output pane (scroll up)
+            if screen_row < self.output_start_row as usize + 1 {
+                // Move cursor to first visible line
+                if self.scroll_offset > 0 {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                }
+                let total_lines = self.count_total_lines();
+                let line_offset = if self.auto_scroll {
+                    total_lines.saturating_sub(self.viewport_height)
+                } else {
+                    self.scroll_offset.min(total_lines.saturating_sub(1))
+                };
+                self.cursor_line = line_offset;
+                self.cursor_col = 0;
+                self.auto_scroll = false;
+            }
+            // Handle dragging below the output pane (scroll down)
+            else if screen_row >= self.output_start_row as usize + self.viewport_height {
+                // Move cursor to last visible line and scroll down
+                let total_lines = self.count_total_lines();
+                if self.scroll_offset + self.viewport_height < total_lines {
+                    self.scroll_offset += 1;
+                }
+                let line_offset = if self.auto_scroll {
+                    total_lines.saturating_sub(self.viewport_height)
+                } else {
+                    self.scroll_offset.min(total_lines.saturating_sub(1))
+                };
+                self.cursor_line = (line_offset + self.viewport_height - 1).min(total_lines.saturating_sub(1));
+                let lines = self.get_all_lines();
+                if self.cursor_line < lines.len() {
+                    self.cursor_col = lines[self.cursor_line].0.chars().count();
+                }
+                self.auto_scroll = false;
+            }
+            // Normal case: mouse is within the output pane
+            else if let Some((line, col)) = self.screen_to_position(screen_col, screen_row) {
+                // Update cursor to current mouse position
+                self.cursor_line = line;
+                self.cursor_col = col;
+                self.auto_scroll = false;
+                self.ensure_cursor_visible_with_scrolloff();
+            }
+        }
+    }
+
+    /// Finish mouse selection
+    pub fn finish_mouse_selection(&mut self) {
+        self.mouse_selecting = false;
+        // If selection start equals cursor, clear the selection
+        if let Some(start) = self.selection_start {
+            if start == (self.cursor_line, self.cursor_col) {
+                self.selection_start = None;
+            }
+        }
+    }
+
+    /// Select the word at the given position
+    fn select_word_at(&mut self, line: usize, col: usize) {
+        let lines = self.get_all_lines();
+        if line >= lines.len() {
+            return;
+        }
+
+        let line_text = &lines[line].0;
+        let chars: Vec<char> = line_text.chars().collect();
+
+        if col >= chars.len() {
+            return;
+        }
+
+        // Find word boundaries
+        let mut start_col = col;
+        let mut end_col = col;
+
+        // Move start backward to beginning of word
+        while start_col > 0 && (chars[start_col - 1].is_alphanumeric() || chars[start_col - 1] == '_') {
+            start_col -= 1;
+        }
+
+        // Move end forward to end of word
+        while end_col < chars.len() && (chars[end_col].is_alphanumeric() || chars[end_col] == '_') {
+            end_col += 1;
+        }
+
+        // Set selection
+        if start_col < end_col {
+            self.selection_start = Some((line, start_col));
+            self.cursor_line = line;
+            self.cursor_col = end_col;
+            self.auto_scroll = false;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    /// Select the entire line at the given position
+    fn select_line_at(&mut self, line: usize) {
+        let lines = self.get_all_lines();
+        if line >= lines.len() {
+            return;
+        }
+
+        let line_text = &lines[line].0;
+        let line_len = line_text.chars().count();
+
+        // Select from start to end of line
+        self.selection_start = Some((line, 0));
+        self.cursor_line = line;
+        self.cursor_col = line_len;
+        self.auto_scroll = false;
+        self.ensure_cursor_visible();
     }
 }

@@ -456,12 +456,16 @@ impl Editor {
             Command::InsertTab => {
                 // Delete selection first if any
                 self.delete_selection();
-                
+
                 let cursor_before = self.cursor;
+                let line = self.buffer.byte_to_line(self.cursor);
                 self.buffer.insert(self.cursor, "    ", cursor_before, self.cursor + 4);
                 self.cursor += 4;
                 self.modified = true;
                 self.preferred_column = None; // Clear preferred column
+
+                // Mark line as dirty for syntax highlighting
+                self.syntax.mark_dirty(line);
             }
             
             Command::Backspace => {

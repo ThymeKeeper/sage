@@ -2,18 +2,19 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxState {
     Normal,
-    StringDouble,     // Inside a double-quoted string "..."
-    StringSingle,     // Inside a single-quoted string '...'
-    StringTriple,     // Inside a triple-quoted string (Python)
-    LineComment,      // Inside a single-line comment // or -- or #
-    BlockComment,     // Inside a multi-line/block comment /* */
-    Keyword,          // Language keywords (if, for, while, etc.)
-    Type,             // Type names (int, str, bool, etc.)
-    Function,         // Function/method names
-    Number,           // Numeric literals
-    Operator,         // Operators (+, -, *, etc.)
-    Punctuation,      // Punctuation (brackets, parens, etc.)
-    MacroOrDecorator, // Rust macros or Python decorators
+    StringDouble,       // Inside a double-quoted string "..."
+    StringSingle,       // Inside a single-quoted string '...'
+    StringTriple,       // Inside a triple-quoted string (Python) - """
+    StringTripleSingle, // Inside a triple-quoted string (Python) - '''
+    LineComment,        // Inside a single-line comment // or -- or #
+    BlockComment,       // Inside a multi-line/block comment /* */
+    Keyword,            // Language keywords (if, for, while, etc.)
+    Type,               // Type names (int, str, bool, etc.)
+    Function,           // Function/method names
+    Number,             // Numeric literals
+    Operator,           // Operators (+, -, *, etc.)
+    Punctuation,        // Punctuation (brackets, parens, etc.)
+    MacroOrDecorator,   // Rust macros or Python decorators
 }
 
 /// Language type for syntax highlighting
@@ -624,14 +625,14 @@ impl SyntaxHighlighter {
         let mut current_pos = 0;
 
         // Handle code blocks (```)
-        if current_state == SyntaxState::StringTriple {
+        if current_state == SyntaxState::StringTriple || current_state == SyntaxState::StringTripleSingle {
             // We're inside a code block, look for closing ```
             if bytes.len() >= 3 && bytes[0] == b'`' && bytes[1] == b'`' && bytes[2] == b'`' {
                 // Found closing ```, highlight the line and exit code block
                 new_spans.push(HighlightSpan {
                     start: 0,
                     end: bytes.len(),
-                    state: SyntaxState::StringTriple,
+                    state: current_state,
                 });
                 return (new_spans, SyntaxState::Normal);
             } else {
@@ -639,9 +640,9 @@ impl SyntaxHighlighter {
                 new_spans.push(HighlightSpan {
                     start: 0,
                     end: bytes.len(),
-                    state: SyntaxState::StringTriple,
+                    state: current_state,
                 });
-                return (new_spans, SyntaxState::StringTriple);
+                return (new_spans, current_state);
             }
         }
 
@@ -790,13 +791,20 @@ impl SyntaxHighlighter {
                 SyntaxState::Normal => {
                     // Check for Python triple-quoted strings
                     if self.language == Language::Python && current_pos + 2 < bytes.len() {
-                        if (bytes[current_pos] == b'"' && bytes[current_pos + 1] == b'"' && bytes[current_pos + 2] == b'"') ||
-                           (bytes[current_pos] == b'\'' && bytes[current_pos + 1] == b'\'' && bytes[current_pos + 2] == b'\'') {
+                        if bytes[current_pos] == b'"' && bytes[current_pos + 1] == b'"' && bytes[current_pos + 2] == b'"' {
                             if current_pos > span_start {
                                 self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
                             }
                             span_start = current_pos;
                             current_state = SyntaxState::StringTriple;
+                            current_pos += 3;
+                            continue;
+                        } else if bytes[current_pos] == b'\'' && bytes[current_pos + 1] == b'\'' && bytes[current_pos + 2] == b'\'' {
+                            if current_pos > span_start {
+                                self.tokenize_normal_segment(line_content, span_start, current_pos, &mut new_spans);
+                            }
+                            span_start = current_pos;
+                            current_state = SyntaxState::StringTripleSingle;
                             current_pos += 3;
                             continue;
                         }
@@ -917,22 +925,39 @@ impl SyntaxHighlighter {
                 }
 
                 SyntaxState::StringTriple => {
-                    // Look for closing triple quote
-                    if current_pos + 2 < bytes.len() {
-                        let opening_char = if line_content[span_start..].starts_with("\"\"\"") { b'"' } else { b'\'' };
-                        if bytes[current_pos] == opening_char &&
-                           bytes[current_pos + 1] == opening_char &&
-                           bytes[current_pos + 2] == opening_char {
-                            current_pos += 3;
-                            new_spans.push(HighlightSpan {
-                                start: span_start,
-                                end: current_pos,
-                                state: SyntaxState::StringTriple,
-                            });
-                            span_start = current_pos;
-                            current_state = SyntaxState::Normal;
-                            continue;
-                        }
+                    // Look for closing """
+                    if current_pos + 2 < bytes.len() &&
+                       bytes[current_pos] == b'"' &&
+                       bytes[current_pos + 1] == b'"' &&
+                       bytes[current_pos + 2] == b'"' {
+                        current_pos += 3;
+                        new_spans.push(HighlightSpan {
+                            start: span_start,
+                            end: current_pos,
+                            state: SyntaxState::StringTriple,
+                        });
+                        span_start = current_pos;
+                        current_state = SyntaxState::Normal;
+                        continue;
+                    }
+                    current_pos += 1;
+                }
+
+                SyntaxState::StringTripleSingle => {
+                    // Look for closing '''
+                    if current_pos + 2 < bytes.len() &&
+                       bytes[current_pos] == b'\'' &&
+                       bytes[current_pos + 1] == b'\'' &&
+                       bytes[current_pos + 2] == b'\'' {
+                        current_pos += 3;
+                        new_spans.push(HighlightSpan {
+                            start: span_start,
+                            end: current_pos,
+                            state: SyntaxState::StringTripleSingle,
+                        });
+                        span_start = current_pos;
+                        current_state = SyntaxState::Normal;
+                        continue;
                     }
                     current_pos += 1;
                 }

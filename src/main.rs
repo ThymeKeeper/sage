@@ -106,8 +106,9 @@ fn main() -> io::Result<()> {
     
     // Enable bracketed paste mode
     execute!(io::stdout(), event::EnableBracketedPaste)?;
-    
-    // Enable enhanced keyboard protocol for better key combination support (especially in Kitty)
+
+    // Enable enhanced keyboard protocol for better key combination support
+    // This helps disambiguate Ctrl+Backspace from Ctrl+H
     if let Ok(_) = execute!(
         io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
@@ -471,8 +472,12 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
 
                             if output_pane_visible && mouse_event.row >= output_start_row {
-                                // Click is in output pane - focus it
+                                // Click is in output pane - focus it and start mouse selection
                                 output_pane.set_focused(true);
+                                output_pane.start_mouse_selection(
+                                    mouse_event.column as usize,
+                                    mouse_event.row as usize,
+                                );
                                 needs_redraw = true;
                             } else {
                                 // Click is in editor - unfocus output pane and start selection
@@ -491,21 +496,35 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
-                            // Update selection
-                            if let Some(position) = editor.screen_to_buffer_position(
-                                mouse_event.column as usize,
-                                mouse_event.row as usize,
-                            ) {
-                                editor.update_mouse_selection(position);
-                                // Update viewport with correct bottom window height
-                                let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
-                                editor.update_viewport_for_cursor_with_bottom(bottom_height);
-                                needs_redraw = true; // Need to redraw for selection update
+                            // Check if we're dragging in the output pane
+                            let (_, height) = crossterm::terminal::size()?;
+                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+
+                            if output_pane.is_focused() && output_pane_visible && mouse_event.row >= output_start_row {
+                                // Update selection in output pane
+                                output_pane.update_mouse_selection(
+                                    mouse_event.column as usize,
+                                    mouse_event.row as usize,
+                                );
+                                needs_redraw = true;
+                            } else {
+                                // Update selection in editor
+                                if let Some(position) = editor.screen_to_buffer_position(
+                                    mouse_event.column as usize,
+                                    mouse_event.row as usize,
+                                ) {
+                                    editor.update_mouse_selection(position);
+                                    // Update viewport with correct bottom window height
+                                    let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
+                                    editor.update_viewport_for_cursor_with_bottom(bottom_height);
+                                    needs_redraw = true; // Need to redraw for selection update
+                                }
                             }
                         }
                         MouseEventKind::Up(MouseButton::Left) => {
-                            // Finish selection
+                            // Finish selection in both editor and output pane
                             editor.finish_mouse_selection();
+                            output_pane.finish_mouse_selection();
                             // Update viewport with correct bottom window height
                             let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
                             editor.update_viewport_for_cursor_with_bottom(bottom_height);
@@ -893,6 +912,9 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
 
                             renderer.force_redraw();
                             needs_redraw = true;
+                        } else {
+                            // Not executing - just show message to confirm Ctrl+Backspace was detected
+                            editor.status_message = Some(("No execution to cancel".to_string(), false));
                         }
                         commands::Command::None
                     }
@@ -1220,8 +1242,45 @@ fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Re
                             commands::Command::PageDown
                         }
                     }
-                    
+
                     // Editing
+                    // Ctrl+H is often sent by terminals for Ctrl+Backspace - handle cancellation
+                    KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) && find_replace.is_none() => {
+                        // Same cancellation logic as Ctrl+Backspace
+                        if execution_rx.is_some() {
+                            execution_rx = None;
+                            execution_start_time = None;
+
+                            if let Some(kernel_info) = executing_kernel_info.take() {
+                                match kernel_info.kernel_type {
+                                    kernel::KernelType::Direct => {
+                                        let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
+                                            kernel_info.python_path.clone(),
+                                            kernel_info.name.clone(),
+                                            kernel_info.display_name.clone(),
+                                        ));
+                                        if new_kernel.connect().is_ok() {
+                                            editor.set_kernel(new_kernel);
+                                            editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
+                                        } else {
+                                            editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
+                                        }
+                                    }
+                                    _ => {
+                                        editor.status_message = Some(("Execution cancelled - please reconnect kernel".to_string(), true));
+                                    }
+                                }
+                            } else {
+                                editor.status_message = Some(("Execution cancelled".to_string(), true));
+                            }
+
+                            renderer.force_redraw();
+                            needs_redraw = true;
+                        } else {
+                            editor.status_message = Some(("No execution to cancel".to_string(), false));
+                        }
+                        commands::Command::None
+                    }
                     KeyCode::Char(c) => commands::Command::InsertChar(c),
                     KeyCode::Enter => {
                         // Ctrl+Enter = Execute cell (primary binding)
