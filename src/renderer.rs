@@ -82,15 +82,16 @@ impl Renderer {
     
     pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize) -> io::Result<()> {
         crate::debug_log("draw_with_bottom_window: start");
-        // Update cursor style based on selection - but only if find/replace is closed
-        if bottom_window_height == 0 {
-            let desired_style = if editor.selection().is_some() {
-                CursorStyle::Underline
-            } else {
-                CursorStyle::Block
-            };
+        // Update cursor style based on selection
+        // Note: Output pane handles its own cursor style when focused
+        let desired_style = if editor.selection().is_some() {
+            CursorStyle::Underline
+        } else {
+            CursorStyle::Block
+        };
 
-            // Always write the cursor style to ensure it's correct
+        // Always write the cursor style to ensure it's correct
+        if self.last_cursor_style != desired_style {
             match desired_style {
                 CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
                 CursorStyle::Underline => write!(self.stdout, "\x1b[4 q")?,
@@ -716,6 +717,21 @@ impl Renderer {
         let (width, height) = terminal::size()?;
         let (cursor_line, cursor_col) = editor.cursor_position();
         let (viewport_row, viewport_col) = editor.viewport_offset();
+
+        // Update cursor style based on editor selection
+        let desired_style = if editor.selection().is_some() {
+            CursorStyle::Underline
+        } else {
+            CursorStyle::Block
+        };
+
+        if self.last_cursor_style != desired_style {
+            match desired_style {
+                CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
+                CursorStyle::Underline => write!(self.stdout, "\x1b[4 q")?,
+            }
+            self.last_cursor_style = desired_style;
+        }
 
         // Calculate screen position (add 2 for virtual lines before buffer)
         let logical_cursor_line = cursor_line + 2;

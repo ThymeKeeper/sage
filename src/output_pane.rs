@@ -868,6 +868,14 @@ impl OutputPane {
         // Show cursor if focused and visible (AFTER drawing scroll indicator)
         if self.focused {
             if let (Some(row), Some(col)) = (cursor_screen_row, cursor_screen_col) {
+                // Set cursor style based on whether we have a selection
+                if self.selection_start.is_some() {
+                    // Underline cursor when selecting
+                    write!(writer, "\x1b[4 q")?;
+                } else {
+                    // Block cursor when not selecting
+                    write!(writer, "\x1b[2 q")?;
+                }
                 execute!(writer, cursor::MoveTo(col, row), crossterm::cursor::Show)?;
             }
         }
