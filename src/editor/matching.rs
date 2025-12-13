@@ -195,6 +195,12 @@ impl Editor {
 
     /// Find all occurrences of a string in the buffer
     pub fn find_all(&self, search_text: &str) -> Vec<(usize, usize)> {
+        // Skip search if text is too short to avoid performance issues
+        // (single characters can match thousands of times in large files)
+        if search_text.len() < 2 {
+            return Vec::new();
+        }
+
         let buffer_text = self.buffer.to_string();
         let mut matches = Vec::new();
         let mut pos = 0;

@@ -161,6 +161,7 @@ impl Autocomplete {
         cursor_row: u16,
         cursor_col: u16,
         max_row: u16,
+        max_col: u16,
     ) -> io::Result<()> {
         if !self.visible || self.suggestions.is_empty() {
             return Ok(());
@@ -190,13 +191,24 @@ impl Autocomplete {
             .unwrap_or(20)
             .max(20);
 
+        // Calculate dropdown width including padding (space + content + space)
+        let dropdown_width = max_width + 2;
+
+        // Adjust column position to prevent wrapping at viewport edge
+        let dropdown_col = if cursor_col as usize + dropdown_width > max_col as usize {
+            // Nudge left to keep within viewport
+            (max_col as usize).saturating_sub(dropdown_width) as u16
+        } else {
+            cursor_col
+        };
+
         // Draw each visible suggestion
         for (display_idx, actual_idx) in (start_idx..end_idx).enumerate() {
             let suggestion = &self.suggestions[actual_idx];
             let row = dropdown_row + display_idx as u16;
             let is_selected = actual_idx == self.selected_index;
 
-            execute!(writer, cursor::MoveTo(cursor_col, row))?;
+            execute!(writer, cursor::MoveTo(dropdown_col, row))?;
 
             if is_selected {
                 // Highlight selected item

@@ -132,8 +132,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
             // Draw autocomplete dropdown if visible
             if autocomplete.is_visible() {
                 let (screen_col, screen_row) = editor.cursor_screen_position();
-                let (_, height) = crossterm::terminal::size()?;
-                autocomplete.draw(&mut io::stdout(), screen_row as u16, screen_col as u16, height)?;
+                let (width, height) = crossterm::terminal::size()?;
+                autocomplete.draw(&mut io::stdout(), screen_row as u16, screen_col as u16, height, width)?;
                 // Reposition cursor after drawing autocomplete
                 renderer.reposition_cursor(editor)?;
             }
@@ -460,7 +460,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 let matches = editor.find_all(fr.find_text());
                                 fr.update_matches(matches.clone());
                                 // Update editor's find matches for highlighting
-                                editor.set_find_matches(matches, Some(0));
+                                // Only set current match to 0 if there are actually matches
+                                let current_match = if matches.is_empty() { None } else { Some(0) };
+                                editor.set_find_matches(matches, current_match);
                                 // Select first match if any
                                 if let Some((start, end)) = fr.current_match_position() {
                                     editor.select_range(start, end);
@@ -829,8 +831,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             commands::Command::None
                         } else if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
                             // When output pane is focused, Up moves cursor
-                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
-                            output_pane.move_cursor_up(with_selection);
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                // Ctrl+Up: move to previous paragraph
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_paragraph_up(with_selection);
+                            } else {
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_up(with_selection);
+                            }
                             needs_redraw = true;
                             commands::Command::None
                         } else if key.modifiers.contains(KeyModifiers::ALT) {
@@ -863,8 +871,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             commands::Command::None
                         } else if output_pane_visible && output_pane.is_focused() && !key.modifiers.contains(KeyModifiers::ALT) {
                             // When output pane is focused, Down moves cursor
-                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
-                            output_pane.move_cursor_down(with_selection);
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                // Ctrl+Down: move to next paragraph
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_paragraph_down(with_selection);
+                            } else {
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_down(with_selection);
+                            }
                             needs_redraw = true;
                             commands::Command::None
                         } else if key.modifiers.contains(KeyModifiers::ALT) {
@@ -889,8 +903,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     }
                     KeyCode::Left => {
                         if output_pane_visible && output_pane.is_focused() {
-                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
-                            output_pane.move_cursor_left(with_selection);
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                // Ctrl+Left: move to previous word
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_word_left(with_selection);
+                            } else {
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_left(with_selection);
+                            }
                             needs_redraw = true;
                             commands::Command::None
                         } else if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
@@ -905,8 +925,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     }
                     KeyCode::Right => {
                         if output_pane_visible && output_pane.is_focused() {
-                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
-                            output_pane.move_cursor_right(with_selection);
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                // Ctrl+Right: move to next word
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_word_right(with_selection);
+                            } else {
+                                let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                                output_pane.move_cursor_right(with_selection);
+                            }
                             needs_redraw = true;
                             commands::Command::None
                         } else if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {

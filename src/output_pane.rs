@@ -32,6 +32,7 @@ pub struct OutputPane {
     click_count: usize, // Count consecutive clicks
     last_click_position: Option<(usize, usize)>, // Last click position (line, col)
     output_start_row: u16, // Starting row of output pane on screen
+    preferred_column: Option<usize>, // Preferred column for vertical movement
 }
 
 impl OutputPane {
@@ -52,6 +53,7 @@ impl OutputPane {
             click_count: 0,
             last_click_position: None,
             output_start_row: 0,
+            preferred_column: None,
         }
     }
 
@@ -70,6 +72,7 @@ impl OutputPane {
             }
             // Clear any selection when gaining focus
             self.selection_start = None;
+            self.preferred_column = None;
         }
     }
 
@@ -91,6 +94,7 @@ impl OutputPane {
             }
             // Clear any selection when gaining focus
             self.selection_start = None;
+            self.preferred_column = None;
         }
     }
 
@@ -141,7 +145,18 @@ impl OutputPane {
         }
 
         if self.cursor_line > 0 {
+            // Set preferred column if not already set
+            if self.preferred_column.is_none() {
+                self.preferred_column = Some(self.cursor_col);
+            }
+
             self.cursor_line -= 1;
+
+            // Clamp cursor to new line length using preferred column
+            let target_col = self.preferred_column.unwrap();
+            let line_len = self.get_line_length(self.cursor_line);
+            self.cursor_col = target_col.min(line_len);
+
             self.auto_scroll = false;
             self.ensure_cursor_visible();
         }
@@ -157,7 +172,18 @@ impl OutputPane {
 
         let total_lines = self.count_total_lines();
         if self.cursor_line + 1 < total_lines {
+            // Set preferred column if not already set
+            if self.preferred_column.is_none() {
+                self.preferred_column = Some(self.cursor_col);
+            }
+
             self.cursor_line += 1;
+
+            // Clamp cursor to new line length using preferred column
+            let target_col = self.preferred_column.unwrap();
+            let line_len = self.get_line_length(self.cursor_line);
+            self.cursor_col = target_col.min(line_len);
+
             self.auto_scroll = false;
             self.ensure_cursor_visible();
         }
@@ -178,6 +204,7 @@ impl OutputPane {
             self.cursor_line -= 1;
             self.cursor_col = self.get_line_length(self.cursor_line);
         }
+        self.preferred_column = None; // Clear preferred column on horizontal movement
         self.ensure_cursor_visible();
     }
 
@@ -201,6 +228,7 @@ impl OutputPane {
                 self.cursor_col = 0;
             }
         }
+        self.preferred_column = None; // Clear preferred column on horizontal movement
         self.ensure_cursor_visible();
     }
 
@@ -213,6 +241,7 @@ impl OutputPane {
         }
 
         self.cursor_col = 0;
+        self.preferred_column = None; // Clear preferred column
         self.ensure_cursor_visible();
     }
 
@@ -225,6 +254,196 @@ impl OutputPane {
         }
 
         self.cursor_col = self.get_line_length(self.cursor_line);
+        self.preferred_column = None; // Clear preferred column
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to previous word boundary
+    pub fn move_cursor_word_left(&mut self, with_selection: bool) {
+        if with_selection && self.selection_start.is_none() {
+            self.selection_start = Some((self.cursor_line, self.cursor_col));
+        } else if !with_selection {
+            self.selection_start = None;
+        }
+
+        let lines = self.get_all_lines();
+        if self.cursor_line >= lines.len() {
+            return;
+        }
+
+        let line_text = &lines[self.cursor_line].0;
+
+        if self.cursor_col > 0 {
+            // Find the previous word boundary within the current line
+            let chars: Vec<char> = line_text.chars().collect();
+            let mut new_col = 0;
+            let mut in_word = false;
+
+            for (i, ch) in chars.iter().enumerate() {
+                if i >= self.cursor_col {
+                    break;
+                }
+
+                if ch.is_alphanumeric() || *ch == '_' {
+                    if !in_word {
+                        // Start of a new word
+                        new_col = i;
+                        in_word = true;
+                    }
+                } else {
+                    in_word = false;
+                }
+            }
+
+            self.cursor_col = new_col;
+        } else if self.cursor_line > 0 {
+            // Move to end of previous line
+            self.cursor_line -= 1;
+            self.cursor_col = self.get_line_length(self.cursor_line);
+        }
+
+        self.preferred_column = None;
+        self.auto_scroll = false;
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to next word boundary
+    pub fn move_cursor_word_right(&mut self, with_selection: bool) {
+        if with_selection && self.selection_start.is_none() {
+            self.selection_start = Some((self.cursor_line, self.cursor_col));
+        } else if !with_selection {
+            self.selection_start = None;
+        }
+
+        let lines = self.get_all_lines();
+        if self.cursor_line >= lines.len() {
+            return;
+        }
+
+        let line_text = &lines[self.cursor_line].0;
+        let chars: Vec<char> = line_text.chars().collect();
+        let line_len = chars.len();
+
+        if self.cursor_col < line_len {
+            // Find the next word boundary within the current line
+            // Iterate from the start to properly track word state
+            let mut in_word = false;
+            let mut found_next_word = false;
+
+            for i in 0..chars.len() {
+                let ch = chars[i];
+
+                // Check if we found the start of next word (after cursor position)
+                if i > self.cursor_col && !in_word && (ch.is_alphanumeric() || ch == '_') {
+                    // Found start of next word
+                    self.cursor_col = i;
+                    found_next_word = true;
+                    break;
+                }
+
+                // Update word state
+                in_word = ch.is_alphanumeric() || ch == '_';
+            }
+
+            if !found_next_word {
+                // No more words on this line, go to end of line
+                self.cursor_col = line_len;
+            }
+        } else {
+            // Move to start of next line
+            let total_lines = self.count_total_lines();
+            if self.cursor_line + 1 < total_lines {
+                self.cursor_line += 1;
+                self.cursor_col = 0;
+            }
+        }
+
+        self.preferred_column = None;
+        self.auto_scroll = false;
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to previous paragraph (empty line boundary)
+    pub fn move_cursor_paragraph_up(&mut self, with_selection: bool) {
+        if with_selection && self.selection_start.is_none() {
+            self.selection_start = Some((self.cursor_line, self.cursor_col));
+        } else if !with_selection {
+            self.selection_start = None;
+        }
+
+        let lines = self.get_all_lines();
+
+        // Search backwards for a non-empty line preceded by an empty line
+        let mut target_line = None;
+        for line_num in (0..self.cursor_line).rev() {
+            let line_text = &lines[line_num].0;
+            let is_empty = line_text.is_empty();
+
+            if !is_empty && line_num > 0 {
+                let prev_line = &lines[line_num - 1].0;
+                if prev_line.is_empty() {
+                    target_line = Some(line_num);
+                    break;
+                }
+            }
+        }
+
+        if let Some(line) = target_line {
+            self.cursor_line = line;
+            self.cursor_col = 0;
+        } else {
+            // No paragraph found, go to start
+            self.cursor_line = 0;
+            self.cursor_col = 0;
+        }
+
+        self.preferred_column = None;
+        self.auto_scroll = false;
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to next paragraph (empty line boundary)
+    pub fn move_cursor_paragraph_down(&mut self, with_selection: bool) {
+        if with_selection && self.selection_start.is_none() {
+            self.selection_start = Some((self.cursor_line, self.cursor_col));
+        } else if !with_selection {
+            self.selection_start = None;
+        }
+
+        let lines = self.get_all_lines();
+        let total_lines = lines.len();
+
+        // Search forward for a non-empty line preceded by an empty line
+        let mut found_empty = false;
+        let mut target_line = None;
+
+        for line_num in (self.cursor_line + 1)..total_lines {
+            let line_text = &lines[line_num].0;
+            let is_empty = line_text.is_empty();
+
+            if is_empty {
+                found_empty = true;
+            } else if found_empty {
+                // Found a non-empty line after an empty line
+                target_line = Some(line_num);
+                break;
+            }
+        }
+
+        if let Some(line) = target_line {
+            self.cursor_line = line;
+            self.cursor_col = 0;
+        } else {
+            // No paragraph found, go to end
+            let total_lines = self.count_total_lines();
+            if total_lines > 0 {
+                self.cursor_line = total_lines - 1;
+                self.cursor_col = self.get_line_length(self.cursor_line);
+            }
+        }
+
+        self.preferred_column = None;
+        self.auto_scroll = false;
         self.ensure_cursor_visible();
     }
 
@@ -771,6 +990,7 @@ impl OutputPane {
                     self.selection_start = None;
                     self.mouse_selecting = true;
                     self.auto_scroll = false;
+                    self.preferred_column = None;
                     self.ensure_cursor_visible();
                 }
             }

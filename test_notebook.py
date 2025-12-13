@@ -9,25 +9,26 @@ import duckdb as db
 import pandas as pd
 import matplotlib.pyplot as plt
 import math
+import numpy as np
 
 ##$$ 2 ---------------------------------------------------------------------------
-
+ 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 10000)
 
 ##$$ 3 ---------------------------------------------------------------------------
-
+ 
 customers_file = "/home/thyme/code/customers.csv"
 orders_file    = "/home/thyme/code/orders.csv"
 
 ##$$ 4 ---------------------------------------------------------------------------
-
+ 
 print(db.sql(f"""select * from '{customers_file}' limit 3 """).fetchdf())
 print("")
 print(db.sql(f"""select * from '{orders_file}'    limit 3 """).fetchdf())
 
 ##$$ 5 ---------------------------------------------------------------------------
-
+ 
 df = db.sql(f"""
     select
         *,
@@ -58,5 +59,5 @@ for idx, row in df.iterrows():
 
 ##$$ 8 ---------------------------------------------------------------------------
  
-for i in range(10000000):
-    print(i)
+for i in range(1000):
+    print(np.random.randn(1))
