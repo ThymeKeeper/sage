@@ -1,156 +1,149 @@
-# sage
+# Sage
 
-A Python REPL and pseudo Jupyter notebook in your terminal.
+A terminal-based Python notebook editor that brings Jupyter-style interactive coding to your command line.
 
-## Overview
+## What is Sage?
 
-sage is a terminal-based Python REPL and pseudo Jupyter notebook written in Rust. It combines a text editor with interactive Python execution, allowing you to write code in cells and execute them with live feedback - all in your terminal.
-
-<img width="1219" height="628" alt="thyme" src="https://github.com/user-attachments/assets/e0d7138b-c2c5-446b-bec7-f8bb89d335e2" />
-
-<img width="1219" height="628" alt="findreplace" src="https://github.com/user-attachments/assets/4388739b-1dea-4ec5-b7bb-3313ae0ab558" />
-
-<img width="1219" height="629" alt="saveas" src="https://github.com/user-attachments/assets/1df2f3d1-31c1-4497-b50b-cafa2fa3340c" />
+Sage lets you write and execute Python code in cells, just like Jupyter notebooks, but entirely in your terminal. Work with the speed and efficiency of a text editor while getting the interactivity of a notebook environment.
 
 ## Features
 
-### Python REPL & Notebook
-- **Cell-based execution**: Organize code into cells using `# %%` delimiters
-- **Kernel selection**: Connect to any Python interpreter or Jupyter kernel
-- **Interactive execution**: Execute cells with Shift+Enter and see results instantly
-- **Multiple kernel support**: Switch between different Python environments
-- **Persistent state**: Variables persist across cell executions within a session
+### Interactive Notebook Experience
 
-### Core Editing
-- Open and save files
-- Create new files with automatic parent directory creation
-- Full undo/redo support
-- Text selection with keyboard and mouse
-- Find and replace functionality
-- Unicode support
-- Syntax highlighting for Python, Rust, JavaScript, TypeScript, Bash, Markdown, and TOML
+- **Cell-based execution**: Organize code into executable cells using `##$$` delimiters
+- **Live output display**: View execution results in a dedicated output pane
+- **Multiple kernels**: Connect to different Python environments and switch between them
+- **Execution state tracking**: See which cells have been executed and their output history
 
-### Input & Navigation
-- Arrow keys for navigation
-- Home/End key support
-- Page Up/Page Down for quick scrolling
-- Mouse support for:
-  - Click to position cursor
-  - Drag to select text
-  - Scroll wheel for vertical scrolling
-  - Shift+scroll for horizontal scrolling
-  - Double-click to select word
-  - Triple-click to select line
+### Powerful Editing
 
-### Clipboard Operations
-- Copy (Ctrl+C)
-- Cut (Ctrl+X)
-- Paste (Ctrl+V)
-- Works with system clipboard
+- **Syntax highlighting**: Python code is highlighted for better readability
+- **Smart autocomplete**: Get code suggestions as you type
+- **Bracket matching**: Automatically highlights matching brackets and parentheses
+- **Find and replace**: Search through code with regex support
+- **Undo/redo**: Full history of all edits
+- **Multiple selection modes**: Click, double-click to select words, triple-click for lines
 
-### Text Normalization
-- Automatically converts CRLF to LF
-- Converts tabs to spaces (4 spaces)
-- Filters out zero-width and invisible Unicode characters
-- Handles various text encodings gracefully
+### Seamless Workflow
 
-### Smart Editing
-- Auto-indentation: new lines inherit indentation from the previous line
-- Tab with selection: indents all selected lines by 4 spaces
-- Shift+Tab: dedents current line or all selected lines by up to 4 spaces
+- **Mouse support**: Click to position cursor, drag to select, scroll with mouse wheel
+- **System clipboard**: Copy and paste between Sage and other applications
+- **Auto-save indicators**: Know when your work is saved
+- **Smart indentation**: Tab/Shift+Tab to indent/unindent selections
+- **Word-level navigation**: Jump between words with Ctrl+Arrow keys
 
-## Installation
+### Execution Modes
 
-Requires Rust 1.70 or later.
+- **Interactive mode**: Edit and execute cells in a live session
+- **Headless execution**: Run notebook files from the command line without opening the editor
+- **Error handling**: Execution stops on errors with clear traceback information
+- **Output persistence**: Cell outputs remain visible until cleared or re-executed
+
+## How to Use
+
+### Opening Files
 
 ```bash
-git clone https://github.com/yourusername/sage.git
-cd sage
-cargo build --release
+sage myfile.py    # Open an existing file or create a new one
+sage              # Start with an empty file
 ```
 
-The binary will be in `target/release/sage` (or `sage.exe` on Windows).
+### Running Scripts
 
-## Usage
+Execute a Python notebook file without opening the editor:
 
-### Basic usage
 ```bash
-# Start sage
-sage
-
-# Open a Python file
-sage script.py
+sage --execute myfile.py
+sage --execute myfile.py --python /path/to/python3  # Use specific Python
 ```
 
-### Keyboard Shortcuts
+Headless mode will execute each cell in order, print outputs, and stop if any cell encounters an error.
 
-#### REPL/Notebook Commands
-| Action | Shortcut |
-|--------|----------|
-| Select Python Kernel | Ctrl+K |
-| Execute Current Cell | Ctrl+Enter or Ctrl+E |
+## Key Bindings
 
-#### Editor Commands
-| Action | Shortcut |
-|--------|----------|
-| Save | Ctrl+S |
-| Save As | Ctrl+Shift+S |
-| Quit | Ctrl+Q |
-| Undo | Ctrl+Z |
-| Redo | Ctrl+Shift+Z |
-| Find/Replace | Ctrl+F |
-| Find Next | Ctrl+F (when find is open) |
-| Find Previous | Ctrl+Shift+F |
-| Replace | Ctrl+H |
-| Replace All | Ctrl+Shift+H |
-| Select All | Ctrl+A |
-| Copy | Ctrl+C |
-| Cut | Ctrl+X |
-| Paste | Ctrl+V |
-| Indent | Tab (with selection) |
-| Dedent | Shift+Tab |
+### File operations
+- `Ctrl+S`: Save file
+- `Ctrl+Q`: Quit
 
-### Using sage as a Python REPL
+### Editing
+- `Ctrl+Z`: Undo
+- `Ctrl+C`: Copy
+- `Ctrl+X`: Cut
+- `Ctrl+V`: Paste
+- `Ctrl+A`: Select all
+- `Ctrl+Backspace`: Delete word backward
+- `Tab`: Indent selection (or insert tab)
+- `Shift+Tab`: Unindent selection
 
-1. **Create cells** in your Python file using `# %%` as a delimiter:
-   ```python
-   # %% Cell 1
-   x = 10
-   y = 20
-   x + y
+### Navigation
+- Arrow keys: Move cursor
+- `Home`/`End`: Move to start/end of line
+- `Page Up`/`Page Down`: Scroll viewport
+- `Ctrl+Home`: Move to start of file
+- `Ctrl+End`: Move to end of file
+- `Ctrl+Left`/`Ctrl+Right`: Move by word
 
-   # %% Cell 2
-   result = x * y
-   print(result)
-   ```
+### Search
+- `Ctrl+F`: Find
+- `Ctrl+H`: Find and replace
+- `Ctrl+Shift+F`: Find next
+- `Ctrl+Shift+H`: Find previous
 
-2. **Select a Python kernel** by pressing `Ctrl+K`. sage will discover available Python interpreters on your system.
+### Notebook operations
+- `Ctrl+E`: Execute current cell
+- `Ctrl+K`: Select/change Python kernel
+- `Ctrl+L`: Clear cell outputs
+- `Ctrl+O`: Toggle focus between editor and output pane
 
-3. **Execute cells** by placing your cursor in a cell and pressing `Ctrl+Enter` (or `Ctrl+E` as alternative). The result will be shown in the status bar.
+### Mouse
+- Left click: Position cursor
+- Click and drag: Select text
+- Double click: Select word
+- Triple click: Select line
+- Scroll wheel: Scroll viewport
 
-4. **Variables persist** across cell executions, just like in Jupyter notebooks!
+## Working with Cells
 
-### Text Selection
+Cells are the building blocks of your notebook. Sage uses `##$$` as a cell delimiter:
 
-Hold Shift while using arrow keys, Home, or End to select text. Or just use your mouse.
+```python
+# Cell 1: Import libraries
+import numpy as np
+import matplotlib.pyplot as plt
 
-## Technical Details
+##$$
 
-Built with:
-- **ropey** - Efficient rope data structure for text manipulation
-- **crossterm** - Cross-platform terminal manipulation
-- **arboard** - System clipboard integration
-- **unicode-width** - Proper Unicode character width handling
-- **zmq** - ZeroMQ for Jupyter kernel protocol
-- **tokio** - Async runtime for kernel communication
-- **serde/serde_json** - JSON serialization for kernel messages
+# Cell 2: Generate data
+x = np.linspace(0, 10, 100)
+y = np.sin(x)
 
-sage uses a rope data structure for efficient text operations, maintains complete undo/redo history, and communicates with Python kernels using either direct subprocess communication or the Jupyter kernel protocol.
+##$$
 
-## Contributing
+# Cell 3: Plot results
+plt.plot(x, y)
+plt.show()
+```
 
-This is a personal project, but if you find bugs, feel free to judge silently.
+Each cell can be executed independently with `Ctrl+E`. Without delimiters, the entire file is treated as a single cell.
 
-## Author
+## Python Kernel Selection
 
-A developer who got tired of configuring text editors and decided to write their own. The irony is not lost.
+Sage automatically discovers Python interpreters on your system. Press `Ctrl+K` to:
+- View available Python environments
+- Switch between different Python versions
+- Connect to virtual environments
+
+You can also specify a Python interpreter via shebang in your file:
+```python
+#!/usr/bin/env python3
+```
+
+Or use the `--python` flag when running in headless mode.
+
+## Tips
+
+- **Double-click** any word to see all occurrences highlighted throughout your file
+- Use **Ctrl+O** to toggle focus between the editor and output pane for easy scrolling through results
+- **Ctrl+L** clears all cell outputs when you want a fresh start
+- Press **Esc** to cancel find/replace or other dialogs
+- Sage auto-launches in a terminal if you open it from a file manager
