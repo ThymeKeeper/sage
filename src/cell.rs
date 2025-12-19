@@ -56,6 +56,17 @@ pub fn parse_cells(buffer: &Rope) -> Vec<Cell> {
         return cells;
     }
 
+    // If there's content before the first delimiter, create a cell for it
+    if delimiter_positions[0] > 0 {
+        cells.push(Cell {
+            start: 0,
+            end: delimiter_positions[0],
+            cell_type: CellType::Code,
+            output: None,
+            execution_count: None,
+        });
+    }
+
     // Create cells between delimiters
     for (i, &delimiter_pos) in delimiter_positions.iter().enumerate() {
         // Get the end position (either next delimiter or end of buffer)
