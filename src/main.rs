@@ -146,25 +146,8 @@ fn execute_file(file_path: Option<String>, python_path: Option<String>) -> io::R
     let rope = ropey::Rope::from_str(&file_content);
     let cells = cell::parse_cells(&rope);
 
-    // If no cells with delimiters, just run the whole file with Python directly
-    if cells.len() == 1 && cells[0].start == 0 && cells[0].end == rope.len_bytes() {
-        // No cell delimiters found - execute as a regular Python script
-        let status = std::process::Command::new(&python_executable)
-            .arg(&file_path)
-            .status()
-            .map_err(|e| {
-                eprintln!("Error executing Python: {}", e);
-                e
-            })?;
-
-        // Exit with the same status code as the Python process
-        if !status.success() {
-            std::process::exit(status.code().unwrap_or(1));
-        }
-        return Ok(());
-    }
-
-    // File has cells - execute them one by one with kernel
+    // Always open in editor mode (headless execution only happens with --execute flag)
+    // Execute cells one by one with kernel
     let kernel_name = format!("Python ({})", python_executable);
     let mut kernel = direct_kernel::DirectKernel::new(
         python_executable.clone(),

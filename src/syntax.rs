@@ -390,61 +390,71 @@ impl SyntaxHighlighter {
     /// Returns spans for SQL keywords, functions, and numbers
     fn tokenize_sql_content(&self, content: &str, string_start: usize) -> Vec<HighlightSpan> {
         let mut spans = Vec::new();
-        let bytes = content.as_bytes();
-        let mut pos = 0;
+        let mut char_indices = content.char_indices().peekable();
 
-        while pos < bytes.len() {
-            let ch = bytes[pos] as char;
-
+        while let Some((byte_pos, ch)) = char_indices.next() {
             // Skip whitespace
             if ch.is_whitespace() {
-                pos += 1;
                 continue;
             }
 
             // Check for numbers
             if ch.is_numeric() {
-                let start = pos;
-                while pos < bytes.len() && ((bytes[pos] as char).is_numeric() || bytes[pos] == b'.') {
-                    pos += 1;
+                let start = byte_pos;
+                let mut end = byte_pos + ch.len_utf8();
+
+                // Consume all numeric characters and dots
+                while let Some(&(next_pos, next_ch)) = char_indices.peek() {
+                    if next_ch.is_numeric() || next_ch == '.' {
+                        end = next_pos + next_ch.len_utf8();
+                        char_indices.next();
+                    } else {
+                        break;
+                    }
                 }
+
                 spans.push(HighlightSpan {
                     start: string_start + start,
-                    end: string_start + pos,
+                    end: string_start + end,
                     state: SyntaxState::SqlNumber,
                 });
                 continue;
             }
 
             // Check for identifiers/keywords/functions
-            if (bytes[pos] as char).is_alphabetic() || bytes[pos] == b'_' {
-                let start = pos;
-                while pos < bytes.len() &&
-                      ((bytes[pos] as char).is_alphanumeric() || bytes[pos] == b'_') {
-                    pos += 1;
+            if ch.is_alphabetic() || ch == '_' {
+                let start = byte_pos;
+                let mut end = byte_pos + ch.len_utf8();
+
+                // Consume all alphanumeric characters and underscores
+                while let Some(&(next_pos, next_ch)) = char_indices.peek() {
+                    if next_ch.is_alphanumeric() || next_ch == '_' {
+                        end = next_pos + next_ch.len_utf8();
+                        char_indices.next();
+                    } else {
+                        break;
+                    }
                 }
 
-                let word = &content[start..pos];
+                let word = &content[start..end];
 
                 // Check if it's a SQL keyword or function
                 if self.is_sql_function(word) {
                     spans.push(HighlightSpan {
                         start: string_start + start,
-                        end: string_start + pos,
+                        end: string_start + end,
                         state: SyntaxState::SqlFunction,
                     });
                 } else if self.is_sql_keyword(word) {
                     spans.push(HighlightSpan {
                         start: string_start + start,
-                        end: string_start + pos,
+                        end: string_start + end,
                         state: SyntaxState::SqlKeyword,
                     });
                 }
-                continue;
             }
 
-            // Skip other characters (operators, punctuation, etc.)
-            pos += 1;
+            // Skip other characters (operators, punctuation, etc.) - iterator advances automatically
         }
 
         spans
