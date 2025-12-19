@@ -104,17 +104,28 @@ pub fn parse_cells(buffer: &Rope) -> Vec<Cell> {
 pub fn get_cell_at_position(cells: &[Cell], position: usize) -> Option<usize> {
     cells
         .iter()
-        .position(|cell| position >= cell.start && position < cell.end)
+        .position(|cell| position >= cell.start && position <= cell.end)
 }
 
 /// Get the content of a cell (excluding the delimiter line)
 pub fn get_cell_content(buffer: &Rope, cell: &Cell) -> String {
-    // Find the first non-delimiter line
     let start_line = buffer.byte_to_line(cell.start);
-    let content_start = if start_line + 1 < buffer.len_lines() {
+
+    // Check if the first line is actually a delimiter
+    let line_start = buffer.line_to_byte(start_line);
+    let line_end = if start_line + 1 < buffer.len_lines() {
         buffer.line_to_byte(start_line + 1)
     } else {
-        cell.end
+        buffer.len_bytes()
+    };
+    let first_line = buffer.slice(line_start..line_end).to_string();
+    let is_delimiter_line = first_line.trim_start().starts_with(CELL_DELIMITER);
+
+    // Only skip the first line if it's a delimiter
+    let content_start = if is_delimiter_line && start_line + 1 < buffer.len_lines() {
+        buffer.line_to_byte(start_line + 1)
+    } else {
+        cell.start
     };
 
     if content_start >= cell.end {

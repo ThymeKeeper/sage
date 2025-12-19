@@ -70,6 +70,125 @@ impl Editor {
         }
     }
 
+    /// Get completion context for method chaining and SQL
+    /// Returns (base_callable, prefix, is_sql_context) for cases like:
+    /// - "duckdb.sql(...).p" -> (Some("duckdb.sql"), "p", false)
+    /// - db.sql("SELECT * FROM u") -> (None, "u", true)  [inside SQL string]
+    pub fn get_completion_context(&self) -> (Option<String>, String, bool) {
+        let rope = self.buffer.rope();
+        let cursor_pos = self.cursor;
+
+        // Check if we're in a SQL string context
+        let is_sql_context = crate::sql_context::is_in_sql_context(rope, cursor_pos);
+
+        // First, get the simple word at cursor
+        let simple_word = self.get_word_at_cursor();
+
+        // Strip leading dot if present (get_word_at_cursor includes dots for paths like "pandas.read_csv")
+        let prefix = simple_word.trim_start_matches('.').to_string();
+
+        // Check if we're in a method chain (look back for `)` followed by `.` and then our word)
+        let mut pos = cursor_pos;
+
+        // Move back through just the alphanumeric part (prefix), not the dot
+        if !prefix.is_empty() {
+            pos = pos.saturating_sub(prefix.len());
+        }
+
+        // Check if there's a dot right before (where we are now)
+        if pos > 0 {
+            let char_before_idx = rope.byte_to_char(pos.saturating_sub(1));
+            if let Some(ch) = rope.get_char(char_before_idx) {
+                if ch == '.' {
+                    pos = pos.saturating_sub(1);
+
+                    // Now look for closing paren
+                    let mut paren_depth = 0;
+                    let mut found_callable = false;
+                    let mut callable_end = pos;
+
+                    // Move back through whitespace
+                    while pos > 0 {
+                        let idx = rope.byte_to_char(pos.saturating_sub(1));
+                        if let Some(ch) = rope.get_char(idx) {
+                            if ch.is_whitespace() {
+                                pos -= ch.len_utf8();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Check for closing paren
+                    if pos > 0 {
+                        let idx = rope.byte_to_char(pos.saturating_sub(1));
+                        if let Some(ch) = rope.get_char(idx) {
+                            if ch == ')' {
+                                paren_depth = 1;
+                                pos -= ch.len_utf8();
+                                callable_end = pos;
+                                found_callable = true;
+                            }
+                        }
+                    }
+
+                    // If we found a method chain, extract the base callable
+                    if found_callable {
+                        // Move back to find the matching opening paren
+                        while pos > 0 && paren_depth > 0 {
+                            let idx = rope.byte_to_char(pos.saturating_sub(1));
+                            if let Some(ch) = rope.get_char(idx) {
+                                if ch == ')' {
+                                    paren_depth += 1;
+                                } else if ch == '(' {
+                                    paren_depth -= 1;
+                                }
+                                pos -= ch.len_utf8();
+                            } else {
+                                break;
+                            }
+                        }
+
+                        // Now extract the callable name before the opening paren
+                        let mut callable_start = pos;
+                        while callable_start > 0 {
+                            let idx = rope.byte_to_char(callable_start.saturating_sub(1));
+                            if let Some(ch) = rope.get_char(idx) {
+                                if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+                                    callable_start -= ch.len_utf8();
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if callable_start < pos {
+                            let base_callable = rope.slice(callable_start..pos).to_string();
+                            // Debug logging
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
+                                use std::io::Write;
+                                let _ = writeln!(f, "DEBUG get_completion_context: FOUND METHOD CHAIN - base_callable='{}', prefix='{}', is_sql={}", base_callable, prefix, is_sql_context);
+                            }
+                            return (Some(base_callable), prefix.clone(), is_sql_context);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Not in a method chain, return None for base and the prefix (without leading dot)
+        // Debug logging
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "DEBUG get_completion_context: NO METHOD CHAIN - base_callable=None, prefix='{}', is_sql={}", prefix, is_sql_context);
+        }
+        (None, prefix, is_sql_context)
+    }
+
     /// Update cells by parsing the buffer
     pub fn update_cells(&mut self) {
         self.cells = parse_cells(self.buffer.rope());

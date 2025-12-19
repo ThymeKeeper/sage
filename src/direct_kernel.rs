@@ -71,6 +71,10 @@ while True:
 
         code = '\n'.join(code_lines)
 
+        # Debug: Mark code received
+        with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+            debug_f.write(f'>>> RECEIVED CODE ({len(code)} chars): {code[:50]}...\n')
+
         # Execute code with stdout capture
         # Use Jupyter-style execution: try eval, then try exec with last expression
         stdout_capture = io.StringIO()
@@ -80,10 +84,14 @@ while True:
             # First, try to eval the entire code (for simple expressions)
             with contextlib.redirect_stdout(stdout_capture):
                 _sage_result = eval(code, globals())
+            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                debug_f.write(f'>>> EVAL succeeded\n')
         except SyntaxError:
             # If eval fails, just exec the entire code block
             with contextlib.redirect_stdout(stdout_capture):
                 exec(code, globals())
+            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                debug_f.write(f'>>> EXEC succeeded\n')
 
         # Send captured stdout if any
         captured = stdout_capture.getvalue()
@@ -94,8 +102,26 @@ while True:
 
         # Collect namespace completions for autocomplete
         # IMPORTANT: Send completions BEFORE the success/result marker
+
+        # Debug marker - write directly to file
+        with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+            debug_f.write('=== INTROSPECTION START ===\n')
+
         try:
             completions = []
+            return_types = {}  # Maps callable names to their return types
+            type_methods = {}  # Maps type names to their methods
+            sql_tables = []    # SQL table names
+            sql_columns = []   # SQL column names (format: "table.column")
+            sql_functions = [] # SQL function names
+
+            # Debug: Check what's in globals
+            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                all_names = list(globals().keys())
+                debug_f.write(f'Globals count: {len(all_names)}\n')
+                debug_f.write(f'Has db: {"db" in globals()}\n')
+                debug_f.write(f'Has duckdb: {"duckdb" in globals()}\n')
+                debug_f.write(f'First 10 names: {all_names[:10]}\n')
 
             # Take a snapshot of globals to avoid "dictionary changed size during iteration"
             globals_snapshot = dict(globals())
@@ -122,11 +148,63 @@ while True:
                                 try:
                                     member_obj = getattr(obj, member)
                                     member_type = type(member_obj).__name__
+                                    full_name = f"{name}.{member}"
+
                                     # Add as "module.member"
                                     completions.append({
-                                        "name": f"{name}.{member}",
+                                        "name": full_name,
                                         "type": member_type
                                     })
+
+                                    # Try to get return type for functions/methods
+                                    if callable(member_obj):
+                                        try:
+                                            # Check for type hints
+                                            import typing
+                                            import inspect
+                                            sig = inspect.signature(member_obj)
+                                            if sig.return_annotation != inspect.Parameter.empty:
+                                                # Get the return type name
+                                                return_type = sig.return_annotation
+                                                if hasattr(return_type, '__name__'):
+                                                    return_type_name = return_type.__name__
+                                                else:
+                                                    return_type_name = str(return_type).split('.')[-1].rstrip("'>")
+                                                return_types[full_name] = return_type_name
+                                        except:
+                                            pass
+
+                                    # If it's a class/type, introspect its methods NOW (even if no instances exist)
+                                    if member_type in ['type', 'ABCMeta', 'pybind11_type']:
+                                        try:
+                                            # Get the actual type name
+                                            type_name = member_obj.__name__ if hasattr(member_obj, '__name__') else member
+
+                                            # Debug: Log type discovery
+                                            if name == 'db':  # Only for duckdb module
+                                                with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                                    debug_f.write(f'Found type in db: {member} (member_type={member_type}, type_name={type_name})\n')
+
+                                            if type_name not in type_methods:
+                                                class_methods = []
+                                                for method_name in dir(member_obj):
+                                                    if not method_name.startswith('_'):
+                                                        class_methods.append(method_name)
+                                                if class_methods:
+                                                    type_methods[type_name] = class_methods
+                                                    if name == 'db':
+                                                        with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                                            debug_f.write(f'  -> Added {len(class_methods)} methods for {type_name}\n')
+
+                                            # For callable classes, try to determine what they return
+                                            # Many C extension functions return instances of types in the same module
+                                            if callable(member_obj) and member_type in ['type', 'ABCMeta', 'pybind11_type']:
+                                                # If it's a callable type (constructor), it returns instances of itself
+                                                return_types[full_name] = type_name
+                                        except Exception as e:
+                                            if name == 'db':
+                                                with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                                    debug_f.write(f'Error introspecting {member}: {e}\n')
                                 except:
                                     pass
                     except:
@@ -134,14 +212,56 @@ while True:
                 elif obj_type in ['function', 'builtin_function_or_method', 'type', 'ABCMeta']:
                     # User-defined or built-in functions and classes
                     completions.append({"name": name, "type": obj_type})
+
+                    # Try to get return type for functions
+                    if callable(obj) and obj_type in ['function', 'builtin_function_or_method']:
+                        try:
+                            import inspect
+                            sig = inspect.signature(obj)
+                            if sig.return_annotation != inspect.Parameter.empty:
+                                return_type = sig.return_annotation
+                                if hasattr(return_type, '__name__'):
+                                    return_type_name = return_type.__name__
+                                else:
+                                    return_type_name = str(return_type).split('.')[-1].rstrip("'>")
+                                return_types[name] = return_type_name
+                        except:
+                            pass
                 else:
                     # Variables (includes DataFrames, Series, etc.)
                     completions.append({"name": name, "type": obj_type})
 
-                    # Add methods/attributes for common data types
-                    # Introspect: DataFrames, Series, lists, dicts, sets, and other objects
+                    # Introspect the type to get its methods
                     try:
-                        # Get attributes/methods of the object
+                        if obj_type not in type_methods:
+                            type_instance_methods = []
+                            members = dir(obj)
+                            for member in members:
+                                if not member.startswith('_'):
+                                    try:
+                                        member_obj = getattr(obj, member)
+                                        type_instance_methods.append(member)
+
+                                        # If the member is callable, try to get its return type
+                                        if callable(member_obj):
+                                            try:
+                                                import inspect
+                                                sig = inspect.signature(member_obj)
+                                                if sig.return_annotation != inspect.Parameter.empty:
+                                                    return_type = sig.return_annotation
+                                                    if hasattr(return_type, '__name__'):
+                                                        return_type_name = return_type.__name__
+                                                    else:
+                                                        return_type_name = str(return_type).split('.')[-1].rstrip("'>")
+                                                    return_types[f"{obj_type}.{member}"] = return_type_name
+                                            except:
+                                                pass
+                                    except:
+                                        pass
+                            if type_instance_methods:
+                                type_methods[obj_type] = type_instance_methods
+
+                        # Also add completions for object.member pattern
                         members = dir(obj)
                         for member in members:
                             if not member.startswith('_'):
@@ -158,14 +278,218 @@ while True:
                     except:
                         pass
 
+            # Debug: Write completion summary to file
+            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                debug_f.write(f'Completions collected: {len(completions)}\n')
+                if completions:
+                    sample = [c['name'] for c in completions[:5]]
+                    debug_f.write(f'Sample: {sample}\n')
+                    # Check for 'db' specifically
+                    db_items = [c['name'] for c in completions if c['name'].startswith('db')]
+                    debug_f.write(f'DB items found: {len(db_items)}\n')
+                    if db_items:
+                        debug_f.write(f'DB items: {db_items[:10]}\n')
+                debug_f.write(f'Type methods keys: {list(type_methods.keys())[:5]}\n')
+
+            # Harvest SQL metadata from DuckDB and Spark connections
+            for name in globals_snapshot:
+                if name.startswith('_') or name.startswith('SAGE_'):
+                    continue
+
+                try:
+                    obj = globals_snapshot[name]
+                    obj_type = type(obj).__name__
+
+                    # Check if this is the duckdb module itself
+                    if obj_type == 'module' and hasattr(obj, '__name__') and obj.__name__ == 'duckdb':
+                        try:
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'Found duckdb module: {name}\n')
+
+                            # Use the module's default connection via execute()
+                            try:
+                                tables_result = obj.execute("SHOW TABLES").fetchall()
+                                with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                    debug_f.write(f'SHOW TABLES returned: {tables_result}\n')
+                                for row in tables_result:
+                                    table_name = row[0]
+                                    if table_name not in sql_tables:
+                                        sql_tables.append(table_name)
+
+                                    # Get columns for this table
+                                    try:
+                                        columns_result = obj.execute(f"DESCRIBE {table_name}").fetchall()
+                                        for col_row in columns_result:
+                                            col_name = col_row[0]
+                                            # Add fully qualified name (table.column)
+                                            full_name = f"{table_name}.{col_name}"
+                                            if full_name not in sql_columns:
+                                                sql_columns.append(full_name)
+                                            # Also add unqualified name (just column)
+                                            if col_name not in sql_columns:
+                                                sql_columns.append(col_name)
+                                    except Exception as col_e:
+                                        with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                            debug_f.write(f'Error getting columns for {table_name}: {str(col_e)}\n')
+                            except Exception as table_e:
+                                with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                    debug_f.write(f'Error with SHOW TABLES: {str(table_e)}\n')
+
+                            # Get functions (only once)
+                            if not sql_functions:
+                                try:
+                                    functions_result = obj.execute("SELECT DISTINCT function_name FROM duckdb_functions() ORDER BY function_name").fetchall()
+                                    for func_row in functions_result:
+                                        sql_functions.append(func_row[0])
+                                except Exception as func_e:
+                                    with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                        debug_f.write(f'Error getting functions: {str(func_e)}\n')
+
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'DuckDB module SQL metadata: {len(sql_tables)} tables, {len(sql_columns)} columns, {len(sql_functions)} functions\n')
+                                if sql_tables:
+                                    debug_f.write(f'Tables: {sql_tables}\n')
+                        except Exception as e:
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'Error harvesting from duckdb module: {str(e)}\n')
+                                import traceback
+                                debug_f.write(f'Traceback: {traceback.format_exc()}\n')
+
+                    # Check for DuckDB connection object
+                    elif obj_type == 'DuckDBPyConnection':
+                        try:
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'Found DuckDB connection: {name}\n')
+
+                            # Get tables - use SHOW TABLES which is more reliable
+                            try:
+                                tables_result = obj.execute("SHOW TABLES").fetchall()
+                                with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                    debug_f.write(f'SHOW TABLES returned: {tables_result}\n')
+                                for row in tables_result:
+                                    table_name = row[0]
+                                    if table_name not in sql_tables:
+                                        sql_tables.append(table_name)
+
+                                    # Get columns for this table
+                                    try:
+                                        columns_result = obj.execute(f"DESCRIBE {table_name}").fetchall()
+                                        for col_row in columns_result:
+                                            col_name = col_row[0]  # First column is column name
+                                            # Add fully qualified name (table.column)
+                                            full_name = f"{table_name}.{col_name}"
+                                            if full_name not in sql_columns:
+                                                sql_columns.append(full_name)
+                                            # Also add unqualified name (just column)
+                                            if col_name not in sql_columns:
+                                                sql_columns.append(col_name)
+                                    except Exception as col_e:
+                                        with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                            debug_f.write(f'Error getting columns for {table_name}: {str(col_e)}\n')
+                            except Exception as table_e:
+                                with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                    debug_f.write(f'Error with SHOW TABLES: {str(table_e)}\n')
+
+                            # Get functions (only once, not per table)
+                            if not sql_functions:  # Only populate if empty
+                                try:
+                                    functions_result = obj.execute("SELECT DISTINCT function_name FROM duckdb_functions() ORDER BY function_name").fetchall()
+                                    for func_row in functions_result:
+                                        sql_functions.append(func_row[0])
+                                except Exception as func_e:
+                                    with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                        debug_f.write(f'Error getting functions: {str(func_e)}\n')
+
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'DuckDB SQL metadata: {len(sql_tables)} tables, {len(sql_columns)} columns, {len(sql_functions)} functions\n')
+                                if sql_tables:
+                                    debug_f.write(f'Tables: {sql_tables}\n')
+                        except Exception as e:
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'Error harvesting DuckDB metadata: {str(e)}\n')
+                                import traceback
+                                debug_f.write(f'Traceback: {traceback.format_exc()}\n')
+
+                    # Check for Spark session
+                    elif obj_type == 'SparkSession':
+                        try:
+                            # Get tables from Spark catalog
+                            tables = obj.catalog.listTables()
+                            for table in tables:
+                                table_name = table.name
+                                sql_tables.append(table_name)
+
+                                # Get columns for this table
+                                try:
+                                    columns = obj.catalog.listColumns(table_name)
+                                    for col in columns:
+                                        # Add fully qualified name (table.column)
+                                        full_name = f"{table_name}.{col.name}"
+                                        if full_name not in sql_columns:
+                                            sql_columns.append(full_name)
+                                        # Also add unqualified name (just column)
+                                        if col.name not in sql_columns:
+                                            sql_columns.append(col.name)
+                                except:
+                                    pass
+
+                            # Get functions
+                            try:
+                                functions = obj.catalog.listFunctions()
+                                for func in functions:
+                                    sql_functions.append(func.name)
+                            except:
+                                pass
+
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'Spark SQL metadata: {len(sql_tables)} tables, {len(sql_columns)} columns, {len(sql_functions)} functions\n')
+                        except Exception as e:
+                            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                                debug_f.write(f'Error harvesting Spark metadata: {str(e)}\n')
+                except:
+                    pass
+
+            with open('/tmp/sage_python_debug.txt', 'a') as debug_f:
+                debug_f.write('=== INTROSPECTION END ===\n\n')
+
             # Send completions
             print("SAGE_OUTPUT_START", flush=True)
             print(json.dumps({"type": "completions", "data": completions}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+
+            # Send type relationships
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "type_relationships", "data": {
+                "return_types": return_types,
+                "type_methods": type_methods
+            }}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+
+            # Send SQL metadata
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "sql_metadata", "data": {
+                "tables": sql_tables,
+                "columns": sql_columns,
+                "functions": sql_functions
+            }}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
         except Exception as e:
             # If completion gathering fails, don't crash - just send empty completions
             print("SAGE_OUTPUT_START", flush=True)
             print(json.dumps({"type": "completions", "data": []}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "type_relationships", "data": {
+                "return_types": {},
+                "type_methods": {}
+            }}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "sql_metadata", "data": {
+                "tables": [],
+                "columns": [],
+                "functions": []
+            }}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
 
         # Send result (only if not None, matching Jupyter behavior)
@@ -292,6 +616,8 @@ impl Kernel for DirectKernel {
         // Read outputs - there can be multiple output blocks (stdout, result, etc)
         let mut outputs = Vec::new();
         let mut completions = Vec::new();
+        let mut type_relationships = crate::kernel::TypeRelationships::default();
+        let mut sql_metadata = crate::kernel::SqlMetadata::default();
         let mut success = false;
         let mut finished = false;
         let mut line = String::new();
@@ -360,6 +686,24 @@ impl Kernel for DirectKernel {
                     }
                     // Don't set finished - continue reading for success/result markers
                 }
+                Some("type_relationships") => {
+                    // Parse type relationship data for intelligent autocomplete
+                    if let Some(data) = output_data.get("data") {
+                        if let Ok(type_rel) = serde_json::from_value::<crate::kernel::TypeRelationships>(data.clone()) {
+                            type_relationships = type_rel;
+                        }
+                    }
+                    // Don't set finished - continue reading for success/result markers
+                }
+                Some("sql_metadata") => {
+                    // Parse SQL metadata for SQL autocomplete
+                    if let Some(data) = output_data.get("data") {
+                        if let Ok(sql_meta) = serde_json::from_value::<crate::kernel::SqlMetadata>(data.clone()) {
+                            sql_metadata = sql_meta;
+                        }
+                    }
+                    // Don't set finished - continue reading for success/result markers
+                }
                 _ => {
                     finished = true;
                 }
@@ -375,6 +719,8 @@ impl Kernel for DirectKernel {
             execution_count: Some(self.execution_count),
             success,
             completions,
+            type_relationships,
+            sql_metadata,
         })
     }
 
