@@ -353,6 +353,18 @@ impl Renderer {
                                                 // Muted purple for macros/decorators
                                                 formatted_line.push_str("\x1b[38;2;180;150;180m"); // #B496B4
                                             }
+                                            SyntaxState::SqlKeyword => {
+                                                // Cyan-green for SQL keywords (hue shift toward blue)
+                                                formatted_line.push_str("\x1b[38;2;160;195;185m"); // #A0C3B9
+                                            }
+                                            SyntaxState::SqlFunction => {
+                                                // Pure saturated green for SQL functions
+                                                formatted_line.push_str("\x1b[38;2;140;195;140m"); // #8CC38C
+                                            }
+                                            SyntaxState::SqlNumber => {
+                                                // Yellow-green for SQL numbers (hue shift toward yellow)
+                                                formatted_line.push_str("\x1b[38;2;200;210;150m"); // #C8D296
+                                            }
                                             SyntaxState::Normal => {
                                                 // Normal text - default foreground color
                                                 // No need to set color as it's already the default
@@ -432,6 +444,18 @@ impl Renderer {
                                             SyntaxState::MacroOrDecorator => {
                                                 // Muted purple for macros/decorators
                                                 formatted_line.push_str("\x1b[38;2;180;150;180m"); // #B496B4
+                                            }
+                                            SyntaxState::SqlKeyword => {
+                                                // Cyan-green for SQL keywords (hue shift toward blue)
+                                                formatted_line.push_str("\x1b[38;2;160;195;185m"); // #A0C3B9
+                                            }
+                                            SyntaxState::SqlFunction => {
+                                                // Pure saturated green for SQL functions
+                                                formatted_line.push_str("\x1b[38;2;140;195;140m"); // #8CC38C
+                                            }
+                                            SyntaxState::SqlNumber => {
+                                                // Yellow-green for SQL numbers (hue shift toward yellow)
+                                                formatted_line.push_str("\x1b[38;2;200;210;150m"); // #C8D296
                                             }
                                             SyntaxState::Normal => {
                                                 // Normal text - default foreground color
