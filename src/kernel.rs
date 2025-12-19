@@ -25,6 +25,53 @@ pub struct CompletionItem {
     pub item_type: String,
 }
 
+/// Type relationship data for intelligent autocomplete
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRelationships {
+    /// Maps callable names to their return types (e.g., "duckdb.sql" -> "DuckDBPyConnection")
+    #[serde(default)]
+    pub return_types: std::collections::HashMap<String, String>,
+
+    /// Maps type names to their methods (e.g., "DataFrame" -> ["head", "tail", ...])
+    #[serde(default)]
+    pub type_methods: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl Default for TypeRelationships {
+    fn default() -> Self {
+        TypeRelationships {
+            return_types: std::collections::HashMap::new(),
+            type_methods: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// SQL metadata for SQL autocomplete
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlMetadata {
+    /// Table names available in the SQL database
+    #[serde(default)]
+    pub tables: Vec<String>,
+
+    /// Column names with their table names (format: "table.column")
+    #[serde(default)]
+    pub columns: Vec<String>,
+
+    /// SQL function names
+    #[serde(default)]
+    pub functions: Vec<String>,
+}
+
+impl Default for SqlMetadata {
+    fn default() -> Self {
+        SqlMetadata {
+            tables: Vec::new(),
+            columns: Vec::new(),
+            functions: Vec::new(),
+        }
+    }
+}
+
 /// Execution result with combined output
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
@@ -32,6 +79,8 @@ pub struct ExecutionResult {
     pub execution_count: Option<usize>,
     pub success: bool,
     pub completions: Vec<CompletionItem>,
+    pub type_relationships: TypeRelationships,
+    pub sql_metadata: SqlMetadata,
 }
 
 /// Information about an available Python kernel

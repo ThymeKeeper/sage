@@ -13,6 +13,7 @@ mod kernel_selector;
 mod output_pane;
 mod autocomplete;
 mod event_loop;
+mod sql_context;
 
 use kernel::Kernel;
 

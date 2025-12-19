@@ -23,7 +23,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut skip_event_read = false; // Skip event read to force immediate redraw
 
     // State for background execution with live timer
-    let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>)>> = None;
+    let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>, kernel::TypeRelationships, kernel::SqlMetadata)>> = None;
     let mut execution_start_time: Option<std::time::Instant> = None;
     let mut executing_kernel_info: Option<kernel::KernelInfo> = None;
 
@@ -37,7 +37,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
         // Check if background execution is complete
         if let Some(ref rx) = execution_rx {
             match rx.try_recv() {
-                Ok((kernel, results, completions)) => {
+                Ok((kernel, results, completions, type_relationships, sql_metadata)) => {
                     // Execution complete! Put kernel back and process results
                     editor.set_kernel(kernel);
                     execution_rx = None;
@@ -62,6 +62,10 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             .collect();
                         autocomplete.add_dynamic_completions(completion_names);
                     }
+
+                    // Update autocomplete with type relationships and SQL metadata
+                    autocomplete.set_type_relationships(type_relationships);
+                    autocomplete.set_sql_metadata(sql_metadata);
 
                     // Update status message with final time
                     editor.status_message = Some((format!("Executed ({:.3}s)", elapsed), false));
@@ -1181,16 +1185,21 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             // Skip autocomplete update this cycle (after Tab completion)
                             suppress_autocomplete_once = false;
                         } else if should_update_autocomplete {
-                            let prefix = editor.get_word_at_cursor();
-                            autocomplete.update(&prefix);
+                            let (base_callable, prefix, is_sql_context) = editor.get_completion_context();
+                            // Debug logging
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
+                                use std::io::Write;
+                                let _ = writeln!(f, "DEBUG event_loop: should_update_autocomplete, base_callable={:?}, prefix='{}', is_sql={}", base_callable, prefix, is_sql_context);
+                            }
+                            autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
                             renderer.force_redraw(); // Clear artifacts when menu changes
                         } else if should_check_backspace_delete {
-                            let prefix = editor.get_word_at_cursor();
-                            if prefix.is_empty() {
+                            let (base_callable, prefix, is_sql_context) = editor.get_completion_context();
+                            if prefix.is_empty() && base_callable.is_none() && !is_sql_context {
                                 autocomplete.hide();
                                 renderer.force_redraw();
                             } else {
-                                autocomplete.update(&prefix);
+                                autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
                                 renderer.force_redraw(); // Clear artifacts when menu changes
                             }
                         } else if should_hide_autocomplete {
@@ -1214,7 +1223,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
 fn spawn_background_execution(
     editor: &mut editor::Editor,
-) -> Option<(std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>)>, kernel::KernelInfo)> {
+) -> Option<(std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>, kernel::TypeRelationships, kernel::SqlMetadata)>, kernel::KernelInfo)> {
     // Extract kernel from editor (temporarily)
     let mut kernel = editor.take_kernel()?;
 
@@ -1263,6 +1272,8 @@ fn spawn_background_execution(
     std::thread::spawn(move || {
         let mut results = Vec::new();
         let mut all_completions = Vec::new();
+        let mut type_relationships = crate::kernel::TypeRelationships::default();
+        let mut sql_metadata = crate::kernel::SqlMetadata::default();
 
         for (_cell_idx, cell_number, code) in cells {
             let start_time = std::time::Instant::now();
@@ -1276,6 +1287,10 @@ fn spawn_background_execution(
 
                     // Collect completions from this execution
                     all_completions.extend(result.completions);
+
+                    // Update type relationships and SQL metadata (keep the latest)
+                    type_relationships = result.type_relationships;
+                    sql_metadata = result.sql_metadata;
 
                     results.push((execution_count, cell_number, output_text, is_error, elapsed));
 
@@ -1293,8 +1308,8 @@ fn spawn_background_execution(
             }
         }
 
-        // Send back kernel, results, and completions
-        let _ = tx.send((kernel, results, all_completions));
+        // Send back kernel, results, completions, type relationships, and SQL metadata
+        let _ = tx.send((kernel, results, all_completions, type_relationships, sql_metadata));
     });
 
     Some((rx, kernel_info))

@@ -116,7 +116,7 @@ impl SyntaxHighlighter {
             viewport_end: 0,
             viewport_mode: false,
             viewport_buffer: 500,
-            language: Language::PlainText,
+            language: Language::Python,
         }
     }
 
