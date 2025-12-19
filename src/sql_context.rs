@@ -23,6 +23,7 @@ pub fn is_in_sql_context(rope: &Rope, cursor_pos: usize) -> bool {
     let mut pos = cursor_pos;
     let mut in_string = false;
     let mut string_start = cursor_pos;
+    let mut is_triple_quote = false;
 
     while pos > 0 {
         pos -= 1;
@@ -46,10 +47,30 @@ pub fn is_in_sql_context(rope: &Rope, cursor_pos: usize) -> bool {
 
                 // If even number of escapes, this quote is not escaped
                 if escape_count % 2 == 0 {
-                    in_string = !in_string;
-                    if in_string {
-                        string_start = pos;
-                        break;
+                    // Check for triple quotes
+                    if pos >= 2 {
+                        let idx1 = rope.byte_to_char(pos.saturating_sub(1));
+                        let idx2 = rope.byte_to_char(pos.saturating_sub(2));
+                        if let (Some(ch1), Some(ch2)) = (rope.get_char(idx1), rope.get_char(idx2)) {
+                            if ch1 == ch && ch2 == ch {
+                                // Found triple quote
+                                is_triple_quote = true;
+                                in_string = !in_string;
+                                if in_string {
+                                    string_start = pos.saturating_sub(2);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Regular single/double quote
+                    if !is_triple_quote {
+                        in_string = !in_string;
+                        if in_string {
+                            string_start = pos;
+                            break;
+                        }
                     }
                 }
             }
@@ -74,7 +95,8 @@ pub fn is_in_sql_context(rope: &Rope, cursor_pos: usize) -> bool {
 
     // Now look backwards from check_start to find if there's a SQL function call
     // We need to look for patterns like: .sql( or .execute( etc.
-    let search_start = check_start.saturating_sub(200); // Look back up to 200 bytes
+    // Increased from 200 to 1000 bytes to handle longer multiline strings
+    let search_start = check_start.saturating_sub(1000);
     let search_text = rope.slice(search_start..check_start).to_string();
 
     // Check if any SQL pattern appears near the string start

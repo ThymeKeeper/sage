@@ -15,6 +15,9 @@ pub enum SyntaxState {
     Operator,           // Operators (+, -, *, etc.)
     Punctuation,        // Punctuation (brackets, parens, etc.)
     MacroOrDecorator,   // Rust macros or Python decorators
+    SqlKeyword,         // SQL keywords within strings (SELECT, FROM, etc.)
+    SqlFunction,        // SQL functions within strings (COUNT, SUM, etc.)
+    SqlNumber,          // SQL numeric literals within strings
 }
 
 /// Language type for syntax highlighting
@@ -334,9 +337,172 @@ impl SyntaxHighlighter {
     fn is_ident_start(&self, ch: char) -> bool {
         ch.is_alphabetic() || ch == '_' || (self.language == Language::Python && ch == '@')
     }
-    
+
+    /// Check if a SQL word is a function (not a structural keyword)
+    fn is_sql_function(&self, word: &str) -> bool {
+        matches!(word.to_uppercase().as_str(),
+            // Aggregate functions
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "FIRST" | "LAST" |
+            // String functions (REPLACE removed - it's a keyword in CREATE OR REPLACE context)
+            "UPPER" | "LOWER" | "LENGTH" | "CONCAT" | "SUBSTRING" | "TRIM" |
+            "LTRIM" | "RTRIM" | "LPAD" | "RPAD" |
+            // Math functions
+            "ROUND" | "FLOOR" | "CEIL" | "ABS" | "MOD" | "POWER" | "SQRT" | "EXP" | "LOG" |
+            // Date/time functions
+            "NOW" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" |
+            "DATEADD" | "DATEDIFF" | "DATEPART" | "YEAR" | "MONTH" | "DAY" |
+            "HOUR" | "MINUTE" | "SECOND" | "EXTRACT" |
+            // Conditional functions
+            "IFNULL" | "NULLIF" | "COALESCE" | "CASE" |
+            // Conversion functions
+            "CAST" | "CONVERT" |
+            // Window functions
+            "RANK" | "DENSE_RANK" | "ROW_NUMBER" | "LEAD" | "LAG" | "NTILE" |
+            "CUME_DIST" | "PERCENT_RANK" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
+        )
+    }
+
+    /// Check if a SQL word is a keyword (for highlighting within strings)
+    fn is_sql_keyword(&self, word: &str) -> bool {
+        matches!(word.to_uppercase().as_str(),
+            "SELECT" | "FROM" | "WHERE" | "INSERT" | "UPDATE" | "DELETE" | "CREATE" |
+            "DROP" | "ALTER" | "REPLACE" | "TABLE" | "INDEX" | "VIEW" | "JOIN" | "LEFT" | "RIGHT" |
+            "INNER" | "OUTER" | "ON" | "AS" | "ORDER" | "BY" | "GROUP" | "HAVING" |
+            "UNION" | "AND" | "OR" | "NOT" | "IN" | "EXISTS" | "BETWEEN" | "LIKE" |
+            "IS" | "NULL" | "PRIMARY" | "KEY" | "FOREIGN" | "REFERENCES" | "CONSTRAINT" |
+            "DISTINCT" | "ALL" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "WHEN" |
+            "THEN" | "ELSE" | "END" | "BEGIN" | "COMMIT" | "ROLLBACK" | "TRANSACTION" |
+            "INTO" | "VALUES" | "DEFAULT" | "SET" | "OVER" | "WITH" | "PARTITION" |
+            "ROWS" | "RANGE" | "UNBOUNDED" | "PRECEDING" | "FOLLOWING" | "CURRENT" |
+            "ROW" | "WINDOW" | "RECURSIVE" | "RETURNING" | "CROSS" | "NATURAL" |
+            "USING" | "FULL" | "GRANT" | "REVOKE" | "TO" | "CASCADE" | "RESTRICT" |
+            "CHECK" | "UNIQUE" | "AUTO_INCREMENT" | "COLLATE" | "IF" |
+            "FOR" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "DECLARE" | "CURSOR" | "OPEN" |
+            "FETCH" | "CLOSE" | "DEALLOCATE" | "EXEC" | "EXECUTE" | "RETURNS" | "RETURN" |
+            "WHILE" | "LOOP" | "REPEAT" | "UNTIL" | "CONTINUE" | "BREAK" | "GOTO" | "LABEL" |
+            "TRY" | "CATCH" | "THROW" | "RAISERROR" | "PRINT" | "TRUNCATE" | "MERGE" |
+            "MATERIALIZED" | "TEMPORARY" | "TEMP" | "VOLATILE" | "IMMUTABLE" | "STABLE" |
+            "ANY" | "SOME" | "INTERSECT" | "EXCEPT" | "MINUS"
+        )
+    }
+
+    /// Tokenize SQL content within a string
+    /// Returns spans for SQL keywords, functions, and numbers
+    fn tokenize_sql_content(&self, content: &str, string_start: usize) -> Vec<HighlightSpan> {
+        let mut spans = Vec::new();
+        let bytes = content.as_bytes();
+        let mut pos = 0;
+
+        while pos < bytes.len() {
+            let ch = bytes[pos] as char;
+
+            // Skip whitespace
+            if ch.is_whitespace() {
+                pos += 1;
+                continue;
+            }
+
+            // Check for numbers
+            if ch.is_numeric() {
+                let start = pos;
+                while pos < bytes.len() && ((bytes[pos] as char).is_numeric() || bytes[pos] == b'.') {
+                    pos += 1;
+                }
+                spans.push(HighlightSpan {
+                    start: string_start + start,
+                    end: string_start + pos,
+                    state: SyntaxState::SqlNumber,
+                });
+                continue;
+            }
+
+            // Check for identifiers/keywords/functions
+            if (bytes[pos] as char).is_alphabetic() || bytes[pos] == b'_' {
+                let start = pos;
+                while pos < bytes.len() &&
+                      ((bytes[pos] as char).is_alphanumeric() || bytes[pos] == b'_') {
+                    pos += 1;
+                }
+
+                let word = &content[start..pos];
+
+                // Check if it's a SQL keyword or function
+                if self.is_sql_function(word) {
+                    spans.push(HighlightSpan {
+                        start: string_start + start,
+                        end: string_start + pos,
+                        state: SyntaxState::SqlFunction,
+                    });
+                } else if self.is_sql_keyword(word) {
+                    spans.push(HighlightSpan {
+                        start: string_start + start,
+                        end: string_start + pos,
+                        state: SyntaxState::SqlKeyword,
+                    });
+                }
+                continue;
+            }
+
+            // Skip other characters (operators, punctuation, etc.)
+            pos += 1;
+        }
+
+        spans
+    }
+
+    /// Check if a line contains SQL context patterns
+    fn line_has_sql_context(&self, line_content: &str) -> bool {
+        const SQL_PATTERNS: &[&str] = &[
+            ".sql(",
+            ".execute(",
+            ".query(",
+            ".read_sql(",
+            ".read_sql_query(",
+            ".read_sql_table(",
+            "spark.sql(",
+        ];
+
+        for pattern in SQL_PATTERNS {
+            if line_content.contains(pattern) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if we're in an SQL context, looking back at recent lines for multiline strings
+    fn check_sql_context<F>(&self, line_index: usize, line_content: &str, entry_state: SyntaxState, get_line: &F) -> bool
+    where
+        F: Fn(usize) -> Option<String>
+    {
+        // First check current line
+        if self.line_has_sql_context(line_content) {
+            return true;
+        }
+
+        // If we're in a string continuation (entry_state is a string state),
+        // look back at recent lines to see if the string started with SQL context
+        if matches!(entry_state, SyntaxState::StringTriple | SyntaxState::StringTripleSingle |
+                                 SyntaxState::StringDouble | SyntaxState::StringSingle) {
+            // Look back up to 100 lines to find SQL context pattern (increased for longer multiline strings)
+            let start = line_index.saturating_sub(100);
+            for i in (start..line_index).rev() {
+                if let Some(prev_line) = get_line(i) {
+                    if self.line_has_sql_context(&prev_line) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     /// Process a single line and update its state
-    pub fn process_line(&mut self, line_index: usize, line_content: &str) {
+    pub fn process_line<F>(&mut self, line_index: usize, line_content: &str, get_line: &F)
+    where
+        F: Fn(usize) -> Option<String>
+    {
         // Ensure we have enough line states
         while self.line_states.len() <= line_index {
             self.line_states.push(LineState::new());
@@ -355,7 +521,7 @@ impl SyntaxHighlighter {
 
         // Use the enhanced tokenizer if we're processing a programming language
         let (new_spans, final_state) = if self.language != Language::PlainText {
-            self.tokenize_line_enhanced(line_content, entry_state, bytes)
+            self.tokenize_line_enhanced(line_content, entry_state, bytes, line_index, get_line)
         } else {
             self.tokenize_line_simple(line_content, entry_state, bytes)
         };
@@ -775,7 +941,10 @@ impl SyntaxHighlighter {
     }
 
     /// Enhanced tokenizer for programming languages
-    fn tokenize_line_enhanced(&self, line_content: &str, entry_state: SyntaxState, bytes: &[u8]) -> (Vec<HighlightSpan>, SyntaxState) {
+    fn tokenize_line_enhanced<F>(&self, line_content: &str, entry_state: SyntaxState, bytes: &[u8], line_index: usize, get_line: &F) -> (Vec<HighlightSpan>, SyntaxState)
+    where
+        F: Fn(usize) -> Option<String>
+    {
         // Special handling for Markdown
         if self.language == Language::Markdown {
             return self.tokenize_markdown_line(line_content, entry_state, bytes);
@@ -895,11 +1064,66 @@ impl SyntaxHighlighter {
                         current_pos += 2;
                     } else if bytes[current_pos] == b'"' {
                         current_pos += 1;
-                        new_spans.push(HighlightSpan {
-                            start: span_start,
-                            end: current_pos,
-                            state: SyntaxState::StringDouble,
-                        });
+
+                        // Check if this string should have SQL highlighting
+                        let in_sql_context = self.language == Language::Python &&
+                                             self.check_sql_context(line_index, line_content, entry_state, get_line);
+
+                        if in_sql_context && span_start + 1 < current_pos - 1 {
+                            // Extract string content (without quotes)
+                            let string_content_start = span_start + 1;
+                            let string_content_end = current_pos - 1;
+                            let string_content = &line_content[string_content_start..string_content_end];
+
+                            // Add opening quote span
+                            new_spans.push(HighlightSpan {
+                                start: span_start,
+                                end: span_start + 1,
+                                state: SyntaxState::StringDouble,
+                            });
+
+                            // Get SQL spans for content
+                            let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+
+                            // Fill gaps with string spans
+                            let mut last_end = string_content_start;
+                            for sql_span in &sql_spans {
+                                // Add string span before SQL span if there's a gap
+                                if sql_span.start > last_end {
+                                    new_spans.push(HighlightSpan {
+                                        start: last_end,
+                                        end: sql_span.start,
+                                        state: SyntaxState::StringDouble,
+                                    });
+                                }
+                                new_spans.push(sql_span.clone());
+                                last_end = sql_span.end;
+                            }
+
+                            // Add remaining string content after last SQL span
+                            if last_end < string_content_end {
+                                new_spans.push(HighlightSpan {
+                                    start: last_end,
+                                    end: string_content_end,
+                                    state: SyntaxState::StringDouble,
+                                });
+                            }
+
+                            // Add closing quote span
+                            new_spans.push(HighlightSpan {
+                                start: string_content_end,
+                                end: current_pos,
+                                state: SyntaxState::StringDouble,
+                            });
+                        } else {
+                            // Regular string without SQL highlighting
+                            new_spans.push(HighlightSpan {
+                                start: span_start,
+                                end: current_pos,
+                                state: SyntaxState::StringDouble,
+                            });
+                        }
+
                         span_start = current_pos;
                         current_state = SyntaxState::Normal;
                     } else {
@@ -912,11 +1136,66 @@ impl SyntaxHighlighter {
                         current_pos += 2;
                     } else if bytes[current_pos] == b'\'' {
                         current_pos += 1;
-                        new_spans.push(HighlightSpan {
-                            start: span_start,
-                            end: current_pos,
-                            state: SyntaxState::StringSingle,
-                        });
+
+                        // Check if this string should have SQL highlighting
+                        let in_sql_context = self.language == Language::Python &&
+                                             self.check_sql_context(line_index, line_content, entry_state, get_line);
+
+                        if in_sql_context && span_start + 1 < current_pos - 1 {
+                            // Extract string content (without quotes)
+                            let string_content_start = span_start + 1;
+                            let string_content_end = current_pos - 1;
+                            let string_content = &line_content[string_content_start..string_content_end];
+
+                            // Add opening quote span
+                            new_spans.push(HighlightSpan {
+                                start: span_start,
+                                end: span_start + 1,
+                                state: SyntaxState::StringSingle,
+                            });
+
+                            // Get SQL spans for content
+                            let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+
+                            // Fill gaps with string spans
+                            let mut last_end = string_content_start;
+                            for sql_span in &sql_spans {
+                                // Add string span before SQL span if there's a gap
+                                if sql_span.start > last_end {
+                                    new_spans.push(HighlightSpan {
+                                        start: last_end,
+                                        end: sql_span.start,
+                                        state: SyntaxState::StringSingle,
+                                    });
+                                }
+                                new_spans.push(sql_span.clone());
+                                last_end = sql_span.end;
+                            }
+
+                            // Add remaining string content after last SQL span
+                            if last_end < string_content_end {
+                                new_spans.push(HighlightSpan {
+                                    start: last_end,
+                                    end: string_content_end,
+                                    state: SyntaxState::StringSingle,
+                                });
+                            }
+
+                            // Add closing quote span
+                            new_spans.push(HighlightSpan {
+                                start: string_content_end,
+                                end: current_pos,
+                                state: SyntaxState::StringSingle,
+                            });
+                        } else {
+                            // Regular string without SQL highlighting
+                            new_spans.push(HighlightSpan {
+                                start: span_start,
+                                end: current_pos,
+                                state: SyntaxState::StringSingle,
+                            });
+                        }
+
                         span_start = current_pos;
                         current_state = SyntaxState::Normal;
                     } else {
@@ -925,17 +1204,130 @@ impl SyntaxHighlighter {
                 }
 
                 SyntaxState::StringTriple => {
+                    // For continuation lines (span_start == 0 means we entered this state from previous line),
+                    // tokenize the entire line as SQL if in SQL context
+                    if span_start == 0 && current_pos == 0 {
+                        let in_sql_context = self.language == Language::Python &&
+                                             self.check_sql_context(line_index, line_content, entry_state, get_line);
+
+                        if in_sql_context && !line_content.is_empty() {
+                            // Check if this line has the closing """ by searching in bytes
+                            let mut has_closing = false;
+                            for i in 0..bytes.len().saturating_sub(2) {
+                                if bytes[i] == b'"' && bytes[i+1] == b'"' && bytes[i+2] == b'"' {
+                                    has_closing = true;
+                                    break;
+                                }
+                            }
+
+                            if !has_closing {
+                                // This is a full continuation line - tokenize entire line as SQL
+                                let sql_spans = self.tokenize_sql_content(line_content, 0);
+
+                                // Fill gaps with string spans
+                                let mut last_end = 0;
+                                for sql_span in &sql_spans {
+                                    if sql_span.start > last_end {
+                                        new_spans.push(HighlightSpan {
+                                            start: last_end,
+                                            end: sql_span.start,
+                                            state: SyntaxState::StringTriple,
+                                        });
+                                    }
+                                    new_spans.push(sql_span.clone());
+                                    last_end = sql_span.end;
+                                }
+
+                                // Add remaining content
+                                if last_end < bytes.len() {
+                                    new_spans.push(HighlightSpan {
+                                        start: last_end,
+                                        end: bytes.len(),
+                                        state: SyntaxState::StringTriple,
+                                    });
+                                }
+
+                                // Skip to end of line
+                                current_pos = bytes.len();
+                                continue;
+                            }
+                        }
+                    }
+
                     // Look for closing """
                     if current_pos + 2 < bytes.len() &&
                        bytes[current_pos] == b'"' &&
                        bytes[current_pos + 1] == b'"' &&
                        bytes[current_pos + 2] == b'"' {
                         current_pos += 3;
-                        new_spans.push(HighlightSpan {
-                            start: span_start,
-                            end: current_pos,
-                            state: SyntaxState::StringTriple,
-                        });
+
+                        // Check if this string should have SQL highlighting
+                        let in_sql_context = self.language == Language::Python &&
+                                             self.check_sql_context(line_index, line_content, entry_state, get_line);
+
+                        // Check if this is a continuation line (span_start == 0)
+                        let is_continuation = span_start == 0;
+
+                        if in_sql_context {
+                            // For continuation lines, content starts at 0, not span_start + 3
+                            let string_content_start = if is_continuation { 0 } else { span_start + 3 };
+                            let string_content_end = current_pos - 3;
+
+                            if string_content_start < string_content_end {
+                                let string_content = &line_content[string_content_start..string_content_end];
+
+                                // Add opening quote span (only if not continuation line)
+                                if !is_continuation {
+                                    new_spans.push(HighlightSpan {
+                                        start: span_start,
+                                        end: span_start + 3,
+                                        state: SyntaxState::StringTriple,
+                                    });
+                                }
+
+                                // Get SQL spans for content
+                                let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+
+                            // Fill gaps with string spans
+                            let mut last_end = string_content_start;
+                            for sql_span in &sql_spans {
+                                // Add string span before SQL span if there's a gap
+                                if sql_span.start > last_end {
+                                    new_spans.push(HighlightSpan {
+                                        start: last_end,
+                                        end: sql_span.start,
+                                        state: SyntaxState::StringTriple,
+                                    });
+                                }
+                                new_spans.push(sql_span.clone());
+                                last_end = sql_span.end;
+                            }
+
+                            // Add remaining string content after last SQL span
+                            if last_end < string_content_end {
+                                new_spans.push(HighlightSpan {
+                                    start: last_end,
+                                    end: string_content_end,
+                                    state: SyntaxState::StringTriple,
+                                });
+                            }
+
+                            // Add closing quote span
+                            new_spans.push(HighlightSpan {
+                                start: string_content_end,
+                                end: current_pos,
+                                state: SyntaxState::StringTriple,
+                            });
+                            }
+                        } else {
+                            // Regular string without SQL highlighting
+                            new_spans.push(HighlightSpan {
+                                start: span_start,
+                                end: current_pos,
+                                state: SyntaxState::StringTriple,
+                            });
+                        }
+
                         span_start = current_pos;
                         current_state = SyntaxState::Normal;
                         continue;
@@ -944,17 +1336,130 @@ impl SyntaxHighlighter {
                 }
 
                 SyntaxState::StringTripleSingle => {
+                    // For continuation lines (span_start == 0 means we entered this state from previous line),
+                    // tokenize the entire line as SQL if in SQL context
+                    if span_start == 0 && current_pos == 0 {
+                        let in_sql_context = self.language == Language::Python &&
+                                             self.check_sql_context(line_index, line_content, entry_state, get_line);
+
+                        if in_sql_context && !line_content.is_empty() {
+                            // Check if this line has the closing ''' by searching in bytes
+                            let mut has_closing = false;
+                            for i in 0..bytes.len().saturating_sub(2) {
+                                if bytes[i] == b'\'' && bytes[i+1] == b'\'' && bytes[i+2] == b'\'' {
+                                    has_closing = true;
+                                    break;
+                                }
+                            }
+
+                            if !has_closing {
+                                // This is a full continuation line - tokenize entire line as SQL
+                                let sql_spans = self.tokenize_sql_content(line_content, 0);
+
+                                // Fill gaps with string spans
+                                let mut last_end = 0;
+                                for sql_span in &sql_spans {
+                                    if sql_span.start > last_end {
+                                        new_spans.push(HighlightSpan {
+                                            start: last_end,
+                                            end: sql_span.start,
+                                            state: SyntaxState::StringTripleSingle,
+                                        });
+                                    }
+                                    new_spans.push(sql_span.clone());
+                                    last_end = sql_span.end;
+                                }
+
+                                // Add remaining content
+                                if last_end < bytes.len() {
+                                    new_spans.push(HighlightSpan {
+                                        start: last_end,
+                                        end: bytes.len(),
+                                        state: SyntaxState::StringTripleSingle,
+                                    });
+                                }
+
+                                // Skip to end of line
+                                current_pos = bytes.len();
+                                continue;
+                            }
+                        }
+                    }
+
                     // Look for closing '''
                     if current_pos + 2 < bytes.len() &&
                        bytes[current_pos] == b'\'' &&
                        bytes[current_pos + 1] == b'\'' &&
                        bytes[current_pos + 2] == b'\'' {
                         current_pos += 3;
-                        new_spans.push(HighlightSpan {
-                            start: span_start,
-                            end: current_pos,
-                            state: SyntaxState::StringTripleSingle,
-                        });
+
+                        // Check if this string should have SQL highlighting
+                        let in_sql_context = self.language == Language::Python &&
+                                             self.check_sql_context(line_index, line_content, entry_state, get_line);
+
+                        // Check if this is a continuation line (span_start == 0)
+                        let is_continuation = span_start == 0;
+
+                        if in_sql_context {
+                            // For continuation lines, content starts at 0, not span_start + 3
+                            let string_content_start = if is_continuation { 0 } else { span_start + 3 };
+                            let string_content_end = current_pos - 3;
+
+                            if string_content_start < string_content_end {
+                                let string_content = &line_content[string_content_start..string_content_end];
+
+                                // Add opening quote span (only if not continuation line)
+                                if !is_continuation {
+                                    new_spans.push(HighlightSpan {
+                                        start: span_start,
+                                        end: span_start + 3,
+                                        state: SyntaxState::StringTripleSingle,
+                                    });
+                                }
+
+                                // Get SQL spans for content
+                                let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+
+                            // Fill gaps with string spans
+                            let mut last_end = string_content_start;
+                            for sql_span in &sql_spans {
+                                // Add string span before SQL span if there's a gap
+                                if sql_span.start > last_end {
+                                    new_spans.push(HighlightSpan {
+                                        start: last_end,
+                                        end: sql_span.start,
+                                        state: SyntaxState::StringTripleSingle,
+                                    });
+                                }
+                                new_spans.push(sql_span.clone());
+                                last_end = sql_span.end;
+                            }
+
+                            // Add remaining string content after last SQL span
+                            if last_end < string_content_end {
+                                new_spans.push(HighlightSpan {
+                                    start: last_end,
+                                    end: string_content_end,
+                                    state: SyntaxState::StringTripleSingle,
+                                });
+                            }
+
+                            // Add closing quote span
+                            new_spans.push(HighlightSpan {
+                                start: string_content_end,
+                                end: current_pos,
+                                state: SyntaxState::StringTripleSingle,
+                            });
+                            }
+                        } else {
+                            // Regular string without SQL highlighting
+                            new_spans.push(HighlightSpan {
+                                start: span_start,
+                                end: current_pos,
+                                state: SyntaxState::StringTripleSingle,
+                            });
+                        }
+
                         span_start = current_pos;
                         current_state = SyntaxState::Normal;
                         continue;
@@ -1023,7 +1528,7 @@ impl SyntaxHighlighter {
             }
             
             if let Some(line_content) = get_line(line_index) {
-                self.process_line(line_index, &line_content);
+                self.process_line(line_index, &line_content, &get_line);
                 processed += 1;
                 
                 // Limit processing per frame in viewport mode to maintain responsiveness
