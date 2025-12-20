@@ -315,59 +315,63 @@ impl Renderer {
                                         // Dim version of selection background for matching text
                                         formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
                                     } else {
-                                        // Apply syntax highlighting colors - muted and professional
+                                        // Apply syntax highlighting colors - autumn/earthy for Python, spring/green for SQL
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                // Muted green for strings
-                                                formatted_line.push_str("\x1b[38;2;152;180;152m"); // #98B498
+                                                // Warm tan-brown for Python strings
+                                                formatted_line.push_str("\x1b[38;2;170;145;120m"); // #AA9178
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Dimmer grey for comments
-                                                formatted_line.push_str("\x1b[38;2;110;110;110m"); // #6E6E6E
+                                                // Neutral grey for comments
+                                                formatted_line.push_str("\x1b[38;2;120;120;120m"); // #787878
                                             }
                                             SyntaxState::Keyword => {
-                                                // Muted blue for keywords
-                                                formatted_line.push_str("\x1b[38;2;135;160;180m"); // #87A0B4
+                                                // Warm brown for Python keywords
+                                                formatted_line.push_str("\x1b[38;2;180;140;110m"); // #B48C6E
                                             }
                                             SyntaxState::Type => {
-                                                // Muted teal for types
-                                                formatted_line.push_str("\x1b[38;2;132;170;170m"); // #84AAAA
+                                                // Rich earth brown for types
+                                                formatted_line.push_str("\x1b[38;2;160;125;95m"); // #A07D5F
                                             }
                                             SyntaxState::Function => {
-                                                // Muted yellow for functions
-                                                formatted_line.push_str("\x1b[38;2;200;190;150m"); // #C8BE96
+                                                // Muted golden-brown for functions
+                                                formatted_line.push_str("\x1b[38;2;190;160;120m"); // #BEA078
                                             }
                                             SyntaxState::Number => {
-                                                // Muted orange for numbers
-                                                formatted_line.push_str("\x1b[38;2;200;170;140m"); // #C8AA8C
+                                                // Clay brown for numbers
+                                                formatted_line.push_str("\x1b[38;2;175;135;105m"); // #AF8769
                                             }
                                             SyntaxState::Operator => {
-                                                // Lighter grey for operators
-                                                formatted_line.push_str("\x1b[38;2;160;160;160m"); // #A0A0A0
+                                                // Medium tan for operators
+                                                formatted_line.push_str("\x1b[38;2;155;140;120m"); // #9B8C78
                                             }
                                             SyntaxState::Punctuation => {
-                                                // Default color for punctuation
-                                                // No need to set color
+                                                // Light brown for punctuation
+                                                formatted_line.push_str("\x1b[38;2;165;150;130m"); // #A59682
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                // Muted purple for macros/decorators
-                                                formatted_line.push_str("\x1b[38;2;180;150;180m"); // #B496B4
+                                                // Dusty brown-red for decorators
+                                                formatted_line.push_str("\x1b[38;2;170;120;105m"); // #AA7869
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                // Cyan-green for SQL keywords (hue shift toward blue)
-                                                formatted_line.push_str("\x1b[38;2;160;195;185m"); // #A0C3B9
+                                                // Light sage green for SQL keywords
+                                                formatted_line.push_str("\x1b[38;2;140;180;150m"); // #8CB496
                                             }
                                             SyntaxState::SqlFunction => {
-                                                // Pure saturated green for SQL functions
-                                                formatted_line.push_str("\x1b[38;2;140;195;140m"); // #8CC38C
+                                                // Fresh spring green for SQL functions
+                                                formatted_line.push_str("\x1b[38;2;130;200;140m"); // #82C88C
                                             }
                                             SyntaxState::SqlNumber => {
-                                                // Yellow-green for SQL numbers (hue shift toward yellow)
-                                                formatted_line.push_str("\x1b[38;2;200;210;150m"); // #C8D296
+                                                // Mint green for SQL numbers
+                                                formatted_line.push_str("\x1b[38;2;150;210;170m"); // #96D2AA
+                                            }
+                                            SyntaxState::SqlText => {
+                                                // Pale spring green for SQL text/identifiers
+                                                formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
                                             }
                                             SyntaxState::Normal => {
-                                                // Normal text - default foreground color
-                                                // No need to set color as it's already the default
+                                                // Light tan for normal text
+                                                formatted_line.push_str("\x1b[38;2;200;185;165m"); // #C8B9A5
                                             }
                                         }
                                     }
@@ -383,7 +387,7 @@ impl Renderer {
                                         // Reset background
                                         formatted_line.push_str("\x1b[49m");
                                         formatted_line.push_str(line_bg_color); // Restore line background
-                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
+                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation && syntax_state != SyntaxState::SqlText {
                                         // Reset color after syntax-highlighted character
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
@@ -407,59 +411,63 @@ impl Renderer {
                                         // Dim version of selection background for matching text
                                         formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
                                     } else {
-                                        // Apply syntax highlighting colors - muted and professional
+                                        // Apply syntax highlighting colors - autumn/earthy for Python, spring/green for SQL
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                // Muted green for strings
-                                                formatted_line.push_str("\x1b[38;2;152;180;152m"); // #98B498
+                                                // Warm tan-brown for Python strings
+                                                formatted_line.push_str("\x1b[38;2;170;145;120m"); // #AA9178
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Dimmer grey for comments
-                                                formatted_line.push_str("\x1b[38;2;110;110;110m"); // #6E6E6E
+                                                // Neutral grey for comments
+                                                formatted_line.push_str("\x1b[38;2;120;120;120m"); // #787878
                                             }
                                             SyntaxState::Keyword => {
-                                                // Muted blue for keywords
-                                                formatted_line.push_str("\x1b[38;2;135;160;180m"); // #87A0B4
+                                                // Warm brown for Python keywords
+                                                formatted_line.push_str("\x1b[38;2;180;140;110m"); // #B48C6E
                                             }
                                             SyntaxState::Type => {
-                                                // Muted teal for types
-                                                formatted_line.push_str("\x1b[38;2;132;170;170m"); // #84AAAA
+                                                // Rich earth brown for types
+                                                formatted_line.push_str("\x1b[38;2;160;125;95m"); // #A07D5F
                                             }
                                             SyntaxState::Function => {
-                                                // Muted yellow for functions
-                                                formatted_line.push_str("\x1b[38;2;200;190;150m"); // #C8BE96
+                                                // Muted golden-brown for functions
+                                                formatted_line.push_str("\x1b[38;2;190;160;120m"); // #BEA078
                                             }
                                             SyntaxState::Number => {
-                                                // Muted orange for numbers
-                                                formatted_line.push_str("\x1b[38;2;200;170;140m"); // #C8AA8C
+                                                // Clay brown for numbers
+                                                formatted_line.push_str("\x1b[38;2;175;135;105m"); // #AF8769
                                             }
                                             SyntaxState::Operator => {
-                                                // Lighter grey for operators
-                                                formatted_line.push_str("\x1b[38;2;160;160;160m"); // #A0A0A0
+                                                // Medium tan for operators
+                                                formatted_line.push_str("\x1b[38;2;155;140;120m"); // #9B8C78
                                             }
                                             SyntaxState::Punctuation => {
-                                                // Default color for punctuation
-                                                // No need to set color
+                                                // Light brown for punctuation
+                                                formatted_line.push_str("\x1b[38;2;165;150;130m"); // #A59682
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                // Muted purple for macros/decorators
-                                                formatted_line.push_str("\x1b[38;2;180;150;180m"); // #B496B4
+                                                // Dusty brown-red for decorators
+                                                formatted_line.push_str("\x1b[38;2;170;120;105m"); // #AA7869
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                // Cyan-green for SQL keywords (hue shift toward blue)
-                                                formatted_line.push_str("\x1b[38;2;160;195;185m"); // #A0C3B9
+                                                // Light sage green for SQL keywords
+                                                formatted_line.push_str("\x1b[38;2;140;180;150m"); // #8CB496
                                             }
                                             SyntaxState::SqlFunction => {
-                                                // Pure saturated green for SQL functions
-                                                formatted_line.push_str("\x1b[38;2;140;195;140m"); // #8CC38C
+                                                // Fresh spring green for SQL functions
+                                                formatted_line.push_str("\x1b[38;2;130;200;140m"); // #82C88C
                                             }
                                             SyntaxState::SqlNumber => {
-                                                // Yellow-green for SQL numbers (hue shift toward yellow)
-                                                formatted_line.push_str("\x1b[38;2;200;210;150m"); // #C8D296
+                                                // Mint green for SQL numbers
+                                                formatted_line.push_str("\x1b[38;2;150;210;170m"); // #96D2AA
+                                            }
+                                            SyntaxState::SqlText => {
+                                                // Pale spring green for SQL text/identifiers
+                                                formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
                                             }
                                             SyntaxState::Normal => {
-                                                // Normal text - default foreground color
-                                                // No need to set color as it's already the default
+                                                // Light tan for normal text
+                                                formatted_line.push_str("\x1b[38;2;200;185;165m"); // #C8B9A5
                                             }
                                         }
                                     }
@@ -475,7 +483,7 @@ impl Renderer {
                                         // Reset background
                                         formatted_line.push_str("\x1b[49m");
                                         formatted_line.push_str(line_bg_color); // Restore line background
-                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
+                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation && syntax_state != SyntaxState::SqlText {
                                         // Reset color after syntax-highlighted character
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
