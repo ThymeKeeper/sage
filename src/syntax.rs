@@ -18,6 +18,7 @@ pub enum SyntaxState {
     SqlKeyword,         // SQL keywords within strings (SELECT, FROM, etc.)
     SqlFunction,        // SQL functions within strings (COUNT, SUM, etc.)
     SqlNumber,          // SQL numeric literals within strings
+    SqlText,            // SQL string content (non-keyword text, spaces, punctuation)
 }
 
 /// Language type for syntax highlighting
@@ -1098,24 +1099,24 @@ impl SyntaxHighlighter {
                             // Fill gaps with string spans
                             let mut last_end = string_content_start;
                             for sql_span in &sql_spans {
-                                // Add string span before SQL span if there's a gap
+                                // Add SQL text span before SQL span if there's a gap
                                 if sql_span.start > last_end {
                                     new_spans.push(HighlightSpan {
                                         start: last_end,
                                         end: sql_span.start,
-                                        state: SyntaxState::StringDouble,
+                                        state: SyntaxState::SqlText,
                                     });
                                 }
                                 new_spans.push(sql_span.clone());
                                 last_end = sql_span.end;
                             }
 
-                            // Add remaining string content after last SQL span
+                            // Add remaining SQL text after last SQL span
                             if last_end < string_content_end {
                                 new_spans.push(HighlightSpan {
                                     start: last_end,
                                     end: string_content_end,
-                                    state: SyntaxState::StringDouble,
+                                    state: SyntaxState::SqlText,
                                 });
                             }
 
@@ -1170,24 +1171,24 @@ impl SyntaxHighlighter {
                             // Fill gaps with string spans
                             let mut last_end = string_content_start;
                             for sql_span in &sql_spans {
-                                // Add string span before SQL span if there's a gap
+                                // Add SQL text span before SQL span if there's a gap
                                 if sql_span.start > last_end {
                                     new_spans.push(HighlightSpan {
                                         start: last_end,
                                         end: sql_span.start,
-                                        state: SyntaxState::StringSingle,
+                                        state: SyntaxState::SqlText,
                                     });
                                 }
                                 new_spans.push(sql_span.clone());
                                 last_end = sql_span.end;
                             }
 
-                            // Add remaining string content after last SQL span
+                            // Add remaining SQL text after last SQL span
                             if last_end < string_content_end {
                                 new_spans.push(HighlightSpan {
                                     start: last_end,
                                     end: string_content_end,
-                                    state: SyntaxState::StringSingle,
+                                    state: SyntaxState::SqlText,
                                 });
                             }
 
@@ -1234,26 +1235,26 @@ impl SyntaxHighlighter {
                                 // This is a full continuation line - tokenize entire line as SQL
                                 let sql_spans = self.tokenize_sql_content(line_content, 0);
 
-                                // Fill gaps with string spans
+                                // Fill gaps with SQL text spans
                                 let mut last_end = 0;
                                 for sql_span in &sql_spans {
                                     if sql_span.start > last_end {
                                         new_spans.push(HighlightSpan {
                                             start: last_end,
                                             end: sql_span.start,
-                                            state: SyntaxState::StringTriple,
+                                            state: SyntaxState::SqlText,
                                         });
                                     }
                                     new_spans.push(sql_span.clone());
                                     last_end = sql_span.end;
                                 }
 
-                                // Add remaining content
+                                // Add remaining SQL text
                                 if last_end < bytes.len() {
                                     new_spans.push(HighlightSpan {
                                         start: last_end,
                                         end: bytes.len(),
-                                        state: SyntaxState::StringTriple,
+                                        state: SyntaxState::SqlText,
                                     });
                                 }
 
@@ -1298,27 +1299,27 @@ impl SyntaxHighlighter {
                                 // Get SQL spans for content
                                 let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
 
-                            // Fill gaps with string spans
+                            // Fill gaps with SQL text spans
                             let mut last_end = string_content_start;
                             for sql_span in &sql_spans {
-                                // Add string span before SQL span if there's a gap
+                                // Add SQL text span before SQL span if there's a gap
                                 if sql_span.start > last_end {
                                     new_spans.push(HighlightSpan {
                                         start: last_end,
                                         end: sql_span.start,
-                                        state: SyntaxState::StringTriple,
+                                        state: SyntaxState::SqlText,
                                     });
                                 }
                                 new_spans.push(sql_span.clone());
                                 last_end = sql_span.end;
                             }
 
-                            // Add remaining string content after last SQL span
+                            // Add remaining SQL text after last SQL span
                             if last_end < string_content_end {
                                 new_spans.push(HighlightSpan {
                                     start: last_end,
                                     end: string_content_end,
-                                    state: SyntaxState::StringTriple,
+                                    state: SyntaxState::SqlText,
                                 });
                             }
 
@@ -1366,26 +1367,26 @@ impl SyntaxHighlighter {
                                 // This is a full continuation line - tokenize entire line as SQL
                                 let sql_spans = self.tokenize_sql_content(line_content, 0);
 
-                                // Fill gaps with string spans
+                                // Fill gaps with SQL text spans
                                 let mut last_end = 0;
                                 for sql_span in &sql_spans {
                                     if sql_span.start > last_end {
                                         new_spans.push(HighlightSpan {
                                             start: last_end,
                                             end: sql_span.start,
-                                            state: SyntaxState::StringTripleSingle,
+                                            state: SyntaxState::SqlText,
                                         });
                                     }
                                     new_spans.push(sql_span.clone());
                                     last_end = sql_span.end;
                                 }
 
-                                // Add remaining content
+                                // Add remaining SQL text
                                 if last_end < bytes.len() {
                                     new_spans.push(HighlightSpan {
                                         start: last_end,
                                         end: bytes.len(),
-                                        state: SyntaxState::StringTripleSingle,
+                                        state: SyntaxState::SqlText,
                                     });
                                 }
 
@@ -1430,27 +1431,27 @@ impl SyntaxHighlighter {
                                 // Get SQL spans for content
                                 let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
 
-                            // Fill gaps with string spans
+                            // Fill gaps with SQL text spans
                             let mut last_end = string_content_start;
                             for sql_span in &sql_spans {
-                                // Add string span before SQL span if there's a gap
+                                // Add SQL text span before SQL span if there's a gap
                                 if sql_span.start > last_end {
                                     new_spans.push(HighlightSpan {
                                         start: last_end,
                                         end: sql_span.start,
-                                        state: SyntaxState::StringTripleSingle,
+                                        state: SyntaxState::SqlText,
                                     });
                                 }
                                 new_spans.push(sql_span.clone());
                                 last_end = sql_span.end;
                             }
 
-                            // Add remaining string content after last SQL span
+                            // Add remaining SQL text after last SQL span
                             if last_end < string_content_end {
                                 new_spans.push(HighlightSpan {
                                     start: last_end,
                                     end: string_content_end,
-                                    state: SyntaxState::StringTripleSingle,
+                                    state: SyntaxState::SqlText,
                                 });
                             }
 
