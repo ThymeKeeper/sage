@@ -315,43 +315,43 @@ impl Renderer {
                                         // Dim version of selection background for matching text
                                         formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
                                     } else {
-                                        // Apply syntax highlighting colors - autumn/earthy for Python, spring/green for SQL
+                                        // Apply syntax highlighting colors - desaturated greys with strong brightness and hue distinction
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                // Warm tan-brown for Python strings
-                                                formatted_line.push_str("\x1b[38;2;170;145;120m"); // #AA9178
+                                                // Medium grey with pronounced warm hint for strings
+                                                formatted_line.push_str("\x1b[38;2;135;128;115m"); // #878073
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Neutral grey for comments
-                                                formatted_line.push_str("\x1b[38;2;120;120;120m"); // #787878
+                                                // Very dark grey for comments
+                                                formatted_line.push_str("\x1b[38;2;65;65;65m"); // #414141
                                             }
                                             SyntaxState::Keyword => {
-                                                // Warm brown for Python keywords
-                                                formatted_line.push_str("\x1b[38;2;180;140;110m"); // #B48C6E
+                                                // Bright grey with strong warm hint for keywords
+                                                formatted_line.push_str("\x1b[38;2;160;150;135m"); // #A09687
                                             }
                                             SyntaxState::Type => {
-                                                // Rich earth brown for types
-                                                formatted_line.push_str("\x1b[38;2;160;125;95m"); // #A07D5F
+                                                // Medium-light neutral grey for types
+                                                formatted_line.push_str("\x1b[38;2;130;130;126m"); // #82827E
                                             }
                                             SyntaxState::Function => {
-                                                // Muted golden-brown for functions
-                                                formatted_line.push_str("\x1b[38;2;190;160;120m"); // #BEA078
+                                                // Brightest grey with strong warm hint for functions
+                                                formatted_line.push_str("\x1b[38;2;175;167;150m"); // #AFA796
                                             }
                                             SyntaxState::Number => {
-                                                // Clay brown for numbers
-                                                formatted_line.push_str("\x1b[38;2;175;135;105m"); // #AF8769
+                                                // Medium-bright grey with warm hint for numbers
+                                                formatted_line.push_str("\x1b[38;2;150;142;130m"); // #968E82
                                             }
                                             SyntaxState::Operator => {
-                                                // Medium tan for operators
-                                                formatted_line.push_str("\x1b[38;2;155;140;120m"); // #9B8C78
+                                                // Medium-dark neutral grey for operators
+                                                formatted_line.push_str("\x1b[38;2;120;120;117m"); // #787875
                                             }
                                             SyntaxState::Punctuation => {
-                                                // Light brown for punctuation
-                                                formatted_line.push_str("\x1b[38;2;165;150;130m"); // #A59682
+                                                // Dark neutral grey for punctuation
+                                                formatted_line.push_str("\x1b[38;2;100;100;98m"); // #646462
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                // Dusty brown-red for decorators
-                                                formatted_line.push_str("\x1b[38;2;170;120;105m"); // #AA7869
+                                                // Medium-bright grey with warm-red hint for decorators
+                                                formatted_line.push_str("\x1b[38;2;145;135;125m"); // #91877D
                                             }
                                             SyntaxState::SqlKeyword => {
                                                 // Light sage green for SQL keywords
@@ -370,8 +370,8 @@ impl Renderer {
                                                 formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
                                             }
                                             SyntaxState::Normal => {
-                                                // Light tan for normal text
-                                                formatted_line.push_str("\x1b[38;2;200;185;165m"); // #C8B9A5
+                                                // Bright neutral grey for normal text
+                                                formatted_line.push_str("\x1b[38;2;165;162;157m"); // #A5A29D
                                             }
                                         }
                                     }
@@ -411,43 +411,43 @@ impl Renderer {
                                         // Dim version of selection background for matching text
                                         formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
                                     } else {
-                                        // Apply syntax highlighting colors - autumn/earthy for Python, spring/green for SQL
+                                        // Apply syntax highlighting colors - desaturated greys with strong brightness and hue distinction
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                // Warm tan-brown for Python strings
-                                                formatted_line.push_str("\x1b[38;2;170;145;120m"); // #AA9178
+                                                // Medium grey with pronounced warm hint for strings
+                                                formatted_line.push_str("\x1b[38;2;135;128;115m"); // #878073
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Neutral grey for comments
-                                                formatted_line.push_str("\x1b[38;2;120;120;120m"); // #787878
+                                                // Very dark grey for comments
+                                                formatted_line.push_str("\x1b[38;2;65;65;65m"); // #414141
                                             }
                                             SyntaxState::Keyword => {
-                                                // Warm brown for Python keywords
-                                                formatted_line.push_str("\x1b[38;2;180;140;110m"); // #B48C6E
+                                                // Bright grey with strong warm hint for keywords
+                                                formatted_line.push_str("\x1b[38;2;160;150;135m"); // #A09687
                                             }
                                             SyntaxState::Type => {
-                                                // Rich earth brown for types
-                                                formatted_line.push_str("\x1b[38;2;160;125;95m"); // #A07D5F
+                                                // Medium-light neutral grey for types
+                                                formatted_line.push_str("\x1b[38;2;130;130;126m"); // #82827E
                                             }
                                             SyntaxState::Function => {
-                                                // Muted golden-brown for functions
-                                                formatted_line.push_str("\x1b[38;2;190;160;120m"); // #BEA078
+                                                // Brightest grey with strong warm hint for functions
+                                                formatted_line.push_str("\x1b[38;2;175;167;150m"); // #AFA796
                                             }
                                             SyntaxState::Number => {
-                                                // Clay brown for numbers
-                                                formatted_line.push_str("\x1b[38;2;175;135;105m"); // #AF8769
+                                                // Medium-bright grey with warm hint for numbers
+                                                formatted_line.push_str("\x1b[38;2;150;142;130m"); // #968E82
                                             }
                                             SyntaxState::Operator => {
-                                                // Medium tan for operators
-                                                formatted_line.push_str("\x1b[38;2;155;140;120m"); // #9B8C78
+                                                // Medium-dark neutral grey for operators
+                                                formatted_line.push_str("\x1b[38;2;120;120;117m"); // #787875
                                             }
                                             SyntaxState::Punctuation => {
-                                                // Light brown for punctuation
-                                                formatted_line.push_str("\x1b[38;2;165;150;130m"); // #A59682
+                                                // Dark neutral grey for punctuation
+                                                formatted_line.push_str("\x1b[38;2;100;100;98m"); // #646462
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                // Dusty brown-red for decorators
-                                                formatted_line.push_str("\x1b[38;2;170;120;105m"); // #AA7869
+                                                // Medium-bright grey with warm-red hint for decorators
+                                                formatted_line.push_str("\x1b[38;2;145;135;125m"); // #91877D
                                             }
                                             SyntaxState::SqlKeyword => {
                                                 // Light sage green for SQL keywords
@@ -466,8 +466,8 @@ impl Renderer {
                                                 formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
                                             }
                                             SyntaxState::Normal => {
-                                                // Light tan for normal text
-                                                formatted_line.push_str("\x1b[38;2;200;185;165m"); // #C8B9A5
+                                                // Bright neutral grey for normal text
+                                                formatted_line.push_str("\x1b[38;2;165;162;157m"); // #A5A29D
                                             }
                                         }
                                     }
