@@ -128,7 +128,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 output_pane.draw(&mut io::stdout(), output_start_row, output_pane_height, width)?;
                 // Only reposition cursor to editor if output pane doesn't have focus
                 if !output_pane.is_focused() {
-                    renderer.reposition_cursor(editor)?;
+                    renderer.reposition_cursor(editor, bottom_window_height)?;
                 }
                 debug_log(&format!("output_pane draw completed"));
             }
@@ -139,7 +139,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 let (width, height) = crossterm::terminal::size()?;
                 autocomplete.draw(&mut io::stdout(), screen_row as u16, screen_col as u16, height, width)?;
                 // Reposition cursor after drawing autocomplete
-                renderer.reposition_cursor(editor)?;
+                renderer.reposition_cursor(editor, bottom_window_height)?;
             }
 
             needs_redraw = false; // Reset flag after drawing

@@ -705,25 +705,32 @@ impl Renderer {
         if bottom_window_height == 0 {
             let (cursor_line, cursor_col) = editor.cursor_position();
             let logical_cursor_line = cursor_line + 2; // Add 2 for virtual lines before buffer
-            
-            if logical_cursor_line >= viewport_offset.0 && 
+
+            if logical_cursor_line >= viewport_offset.0 &&
                logical_cursor_line < viewport_offset.0 + content_height &&
                cursor_col >= viewport_offset.1 &&
                cursor_col < viewport_offset.1 + width as usize {
-                
+
                 let screen_row = logical_cursor_line - viewport_offset.0;
                 let screen_col = cursor_col - viewport_offset.1;
-                
+
                 #[cfg(target_os = "windows")]
-                write!(self.stdout, "\x1b[{};{}H\x1b[?25h", 
+                write!(self.stdout, "\x1b[{};{}H\x1b[?25h",
                     screen_row + 1, screen_col + 1)?;
-                
+
                 #[cfg(not(target_os = "windows"))]
                 execute!(
                     self.stdout,
                     MoveTo(screen_col as u16, screen_row as u16),
                     Show
                 )?;
+            } else {
+                // Cursor is outside viewport - hide it
+                #[cfg(target_os = "windows")]
+                write!(self.stdout, "\x1b[?25l")?;
+
+                #[cfg(not(target_os = "windows"))]
+                execute!(self.stdout, Hide)?;
             }
         }
         // If find/replace is open, cursor will be positioned by find_replace.draw()
@@ -745,7 +752,7 @@ impl Renderer {
     }
 
     /// Reposition and show cursor at editor position (call after drawing output pane)
-    pub fn reposition_cursor(&mut self, editor: &Editor) -> io::Result<()> {
+    pub fn reposition_cursor(&mut self, editor: &Editor, bottom_window_height: usize) -> io::Result<()> {
         let (width, height) = terminal::size()?;
         let (cursor_line, cursor_col) = editor.cursor_position();
         let (viewport_row, viewport_col) = editor.viewport_offset();
@@ -765,13 +772,22 @@ impl Renderer {
             self.last_cursor_style = desired_style;
         }
 
-        // Calculate screen position (add 2 for virtual lines before buffer)
-        let logical_cursor_line = cursor_line + 2;
-        let screen_row = logical_cursor_line.saturating_sub(viewport_row);
-        let screen_col = cursor_col.saturating_sub(viewport_col);
+        // Calculate content height (excluding status bar and bottom window)
+        let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize;
 
-        // Only show cursor if it's within the visible area
-        if screen_row < height as usize && screen_col < width as usize {
+        // Calculate logical cursor position (add 2 for virtual lines before buffer)
+        let logical_cursor_line = cursor_line + 2;
+
+        // Check if cursor is within viewport bounds BEFORE calculating screen position
+        // This prevents saturating_sub from hiding out-of-bounds positions as 0
+        if logical_cursor_line >= viewport_row &&
+           logical_cursor_line < viewport_row + content_height &&
+           cursor_col >= viewport_col &&
+           cursor_col < viewport_col + width as usize {
+
+            let screen_row = logical_cursor_line - viewport_row;
+            let screen_col = cursor_col - viewport_col;
+
             #[cfg(target_os = "windows")]
             write!(self.stdout, "\x1b[{};{}H\x1b[?25h",
                 screen_row + 1, screen_col + 1)?;
@@ -782,6 +798,13 @@ impl Renderer {
                 MoveTo(screen_col as u16, screen_row as u16),
                 Show
             )?;
+        } else {
+            // Cursor is outside viewport - hide it
+            #[cfg(target_os = "windows")]
+            write!(self.stdout, "\x1b[?25l")?;
+
+            #[cfg(not(target_os = "windows"))]
+            execute!(self.stdout, Hide)?;
         }
 
         self.stdout.flush()?;
