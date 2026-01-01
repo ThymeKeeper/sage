@@ -143,6 +143,11 @@ impl SyntaxHighlighter {
         }
     }
 
+    /// Get the current language
+    pub fn get_language(&self) -> &Language {
+        &self.language
+    }
+
     /// Set viewport for large file mode
     pub fn set_viewport(&mut self, start: usize, end: usize, total_lines: usize) {
         // Check if we should be in viewport mode

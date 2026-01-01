@@ -1,4 +1,4 @@
-use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, commands, direct_kernel};
+use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, language_selector, commands, direct_kernel, syntax};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
     execute,
@@ -17,7 +17,8 @@ fn debug_log(msg: &str) {
 pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
     let mut output_pane = output_pane::OutputPane::new();
-    let mut output_pane_visible = true; // Visible by default
+    // Output pane should only be visible for Python/REPL mode
+    let mut output_pane_visible = editor.is_repl_mode();
     let mut output_pane_height = 8; // Default height in lines
     let mut needs_redraw = true; // Track if we need to redraw
     let mut skip_event_read = false; // Skip event read to force immediate redraw
@@ -682,8 +683,12 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                     // Execute Cell (Ctrl+E as alternative)
                     KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Check if already executing
-                        if execution_rx.is_some() {
+                        // Only allow execution in Python/REPL mode
+                        if !editor.is_repl_mode() {
+                            editor.status_message = Some(("Cell execution only available in Python mode. Press Ctrl+Y to switch language.".to_string(), true));
+                            needs_redraw = true;
+                        } else if execution_rx.is_some() {
+                            // Check if already executing
                             editor.status_message = Some(("Already executing (Ctrl+Backspace to cancel - WARNING: resets kernel)".to_string(), true));
                             needs_redraw = true;
                         } else {
@@ -705,9 +710,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                     // Clear Output Pane (Ctrl+L)
                     KeyCode::Char('l') | KeyCode::Char('L') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        output_pane.clear();
-                        editor.status_message = Some(("Output cleared".to_string(), false));
-                        needs_redraw = true;
+                        if editor.is_repl_mode() && output_pane_visible {
+                            output_pane.clear();
+                            editor.status_message = Some(("Output cleared".to_string(), false));
+                            needs_redraw = true;
+                        }
                         commands::Command::None
                     }
 
@@ -723,6 +730,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                     // Kernel Selection (Ctrl+K)
                     KeyCode::Char('k') | KeyCode::Char('K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Only allow kernel selection in Python mode
+                        if *editor.get_language() != syntax::Language::Python {
+                            editor.status_message = Some(("Kernel selection only available in Python mode. Press Ctrl+Y to switch language.".to_string(), true));
+                            commands::Command::None
+                        } else {
                         // Show loading message
                         editor.status_message = Some(("Discovering Python kernels...".to_string(), false));
                         renderer.draw(editor)?;
@@ -821,6 +833,100 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         debug_log(&format!("Screen cleared 2"));
                         renderer.force_redraw();
                         debug_log(&format!("Force redraw done, setting needs_redraw"));
+                        needs_redraw = true;
+
+                        commands::Command::None
+                        }
+                    }
+
+                    // Language Selection (Ctrl+Y)
+                    KeyCode::Char('y') | KeyCode::Char('Y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Get current language
+                        let current_language = editor.get_language();
+
+                        // Create selector
+                        let mut selector = language_selector::LanguageSelector::new(current_language);
+
+                        execute!(io::stdout(), crossterm::cursor::Hide)?;
+
+                        let result = selector.run(&mut io::stdout());
+
+                        // Clear and redraw
+                        execute!(io::stdout(),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                        )?;
+
+                        // Reset terminal state
+                        execute!(io::stdout(), crossterm::cursor::Hide)?;
+
+                        renderer.force_redraw();
+                        needs_redraw = true;
+
+                        if let Ok(Some(language)) = result {
+                            // Set the new language
+                            editor.set_language(language);
+
+                            // Check if we need to enable/disable REPL mode
+                            if language == syntax::Language::Python {
+                                // Enable REPL mode for Python
+                                if !editor.is_repl_mode() {
+                                    // If no kernel connected, prompt to select one
+                                    if !editor.is_kernel_connected() {
+                                        editor.status_message = Some(("Python mode enabled. Press Ctrl+K to select a kernel.".to_string(), false));
+                                    } else {
+                                        editor.enable_repl_mode();
+                                        editor.status_message = Some(("Switched to Python mode with REPL enabled".to_string(), false));
+                                    }
+                                }
+                                // Show output pane for Python
+                                output_pane_visible = true;
+                            } else {
+                                // Disable REPL mode for other languages
+                                if editor.is_repl_mode() {
+                                    editor.disable_repl_mode();
+                                    editor.status_message = Some((format!("Switched to {} mode (REPL disabled)",
+                                        match language {
+                                            syntax::Language::PlainText => "Plain Text",
+                                            syntax::Language::Sql => "SQL",
+                                            syntax::Language::Rust => "Rust",
+                                            syntax::Language::R => "R",
+                                            syntax::Language::Yaml => "YAML",
+                                            syntax::Language::Markdown => "Markdown",
+                                            syntax::Language::Json => "JSON",
+                                            syntax::Language::Shell => "Shell",
+                                            syntax::Language::Toml => "TOML",
+                                            _ => "Unknown",
+                                        }
+                                    ), false));
+                                } else {
+                                    editor.status_message = Some((format!("Switched to {} mode",
+                                        match language {
+                                            syntax::Language::PlainText => "Plain Text",
+                                            syntax::Language::Sql => "SQL",
+                                            syntax::Language::Rust => "Rust",
+                                            syntax::Language::R => "R",
+                                            syntax::Language::Yaml => "YAML",
+                                            syntax::Language::Markdown => "Markdown",
+                                            syntax::Language::Json => "JSON",
+                                            syntax::Language::Shell => "Shell",
+                                            syntax::Language::Toml => "TOML",
+                                            _ => "Unknown",
+                                        }
+                                    ), false));
+                                }
+                                // Hide output pane for non-Python languages
+                                output_pane_visible = false;
+                            }
+                        } else {
+                            // User cancelled
+                            editor.status_message = None;
+                        }
+
+                        // Force full redraw
+                        execute!(io::stdout(),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                        )?;
+                        renderer.force_redraw();
                         needs_redraw = true;
 
                         commands::Command::None
@@ -1181,10 +1287,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         editor.update_viewport_for_cursor_with_bottom(bottom_height);
 
                         // Apply autocomplete updates based on command type
+                        // Only enable autocomplete in REPL mode (Python)
                         if suppress_autocomplete_once {
                             // Skip autocomplete update this cycle (after Tab completion)
                             suppress_autocomplete_once = false;
-                        } else if should_update_autocomplete {
+                        } else if should_update_autocomplete && editor.is_repl_mode() {
                             let (base_callable, prefix, is_sql_context) = editor.get_completion_context();
                             // Debug logging
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
@@ -1193,7 +1300,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             }
                             autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
                             renderer.force_redraw(); // Clear artifacts when menu changes
-                        } else if should_check_backspace_delete {
+                        } else if should_check_backspace_delete && editor.is_repl_mode() {
                             let (base_callable, prefix, is_sql_context) = editor.get_completion_context();
                             if prefix.is_empty() && base_callable.is_none() && !is_sql_context {
                                 autocomplete.hide();
@@ -1202,7 +1309,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
                                 renderer.force_redraw(); // Clear artifacts when menu changes
                             }
-                        } else if should_hide_autocomplete {
+                        } else if should_hide_autocomplete || !editor.is_repl_mode() {
                             autocomplete.hide();
                             renderer.force_redraw();
                         }

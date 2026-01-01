@@ -11,6 +11,11 @@ impl Editor {
         self.update_cells();
     }
 
+    /// Disable REPL mode
+    pub fn disable_repl_mode(&mut self) {
+        self.repl_mode = false;
+    }
+
     /// Check if in REPL mode
     pub fn is_repl_mode(&self) -> bool {
         self.repl_mode

@@ -1507,5 +1507,14 @@ impl Editor {
         }
     }
 
+    /// Set the syntax highlighting language
+    pub fn set_language(&mut self, language: crate::syntax::Language) {
+        self.syntax.set_language(language);
+    }
+
+    /// Get the current syntax highlighting language
+    pub fn get_language(&self) -> &crate::syntax::Language {
+        self.syntax.get_language()
+    }
 
 }

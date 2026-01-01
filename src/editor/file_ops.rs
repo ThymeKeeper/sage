@@ -106,7 +106,12 @@ impl Editor {
         // Large files will initialize viewport on first render
 
         // Check for shebang and auto-select kernel if appropriate
-        self.detect_and_set_kernel_from_shebang();
+        // Only enable REPL mode for Python files
+        if let Some(ext) = Path::new(path).extension() {
+            if ext == "py" || ext == "pyw" {
+                self.detect_and_set_kernel_from_shebang();
+            }
+        }
 
         Ok(())
     }

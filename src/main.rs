@@ -10,6 +10,7 @@ mod kernel;
 mod direct_kernel;
 mod cell;
 mod kernel_selector;
+mod language_selector;
 mod output_pane;
 mod autocomplete;
 mod event_loop;
@@ -356,9 +357,6 @@ fn main() -> io::Result<()> {
     let mut editor = editor::Editor::new();
     let mut renderer = renderer::Renderer::new()?;
 
-    // Set initial help message
-    editor.status_message = Some(("Press Ctrl+K to select kernel, Ctrl+E to execute cell".to_string(), false));
-
     // Load file if provided
     if let Some(path) = file_to_execute {
         match editor.load_file(&path) {
@@ -371,8 +369,18 @@ fn main() -> io::Result<()> {
                 eprintln!("Failed to load file: {}", e);
             }
         }
+    } else {
+        // No file provided - default to plain text mode
+        editor.set_language(syntax::Language::PlainText);
     }
-    
+
+    // Set initial help message based on mode
+    if editor.is_repl_mode() {
+        editor.status_message = Some(("Press Ctrl+Y to select language, Ctrl+K to select kernel, Ctrl+E to execute".to_string(), false));
+    } else {
+        editor.status_message = Some(("Press Ctrl+Y to select language".to_string(), false));
+    }
+
     // Initialize viewport to follow cursor
     editor.update_viewport_for_cursor();
     

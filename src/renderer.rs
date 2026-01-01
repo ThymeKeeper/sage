@@ -581,6 +581,22 @@ impl Renderer {
             format!(" {}{}{} ", file_name, modified_indicator, read_only_indicator)
         };
 
+        // Add language indicator
+        let language = editor.get_language();
+        let language_name = match language {
+            crate::syntax::Language::PlainText => "Plain",
+            crate::syntax::Language::Python => "Python",
+            crate::syntax::Language::Sql => "SQL",
+            crate::syntax::Language::Rust => "Rust",
+            crate::syntax::Language::R => "R",
+            crate::syntax::Language::Yaml => "YAML",
+            crate::syntax::Language::Markdown => "Markdown",
+            crate::syntax::Language::Json => "JSON",
+            crate::syntax::Language::Shell => "Shell",
+            crate::syntax::Language::Toml => "TOML",
+        };
+        let language_info = format!(" [{}] ", language_name);
+
         crate::debug_log("draw_with_bottom_window: calling is_repl_mode");
         // Add kernel info if in REPL mode
         let mut kernel_info = if editor.is_repl_mode() {
@@ -607,7 +623,7 @@ impl Renderer {
 
         crate::debug_log("draw_with_bottom_window: building full status_line");
         // Calculate available space and truncate kernel_info if needed
-        let min_width = left_status.len() + right_status.len();
+        let min_width = left_status.len() + language_info.len() + right_status.len();
         let max_kernel_width = if min_width < width as usize {
             (width as usize).saturating_sub(min_width)
         } else {
@@ -627,9 +643,10 @@ impl Renderer {
 
         let mut status_line = String::with_capacity(width as usize);
         status_line.push_str(&left_status);
+        status_line.push_str(&language_info);
         status_line.push_str(&kernel_info);
         // Calculate padding - ensure we never exceed width
-        let used_width = left_status.chars().count() + kernel_info.chars().count() + right_status.chars().count();
+        let used_width = left_status.chars().count() + language_info.chars().count() + kernel_info.chars().count() + right_status.chars().count();
         let padding = if used_width < width as usize {
             width as usize - used_width
         } else {
