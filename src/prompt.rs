@@ -52,7 +52,7 @@ impl Prompt {
                 stdout,
                 MoveTo(self.prompt_x + 2, (self.prompt_y as usize + y) as u16),
                 SetBackgroundColor(Color::Black),
-                Print(" ".repeat(self.prompt_width))
+                Print(" ".repeat(self.prompt_width - 2))  // Reduce width to prevent overflow
             )?;
         }
         

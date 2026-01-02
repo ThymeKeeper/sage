@@ -135,13 +135,13 @@ impl ExitPrompt {
         let prompt_x = (width as usize - prompt_width) / 2;
         let prompt_y = (height as usize - prompt_height) / 2;
         
-        // Draw shadow effect
+        // Draw shadow effect (offset right by 2, down by 1)
         for y in 1..prompt_height {
             execute!(
                 stdout,
                 MoveTo((prompt_x + 2) as u16, (prompt_y + y) as u16),
                 SetBackgroundColor(Color::Black),
-                Print(" ".repeat(prompt_width))
+                Print(" ".repeat(prompt_width - 2))  // Reduce width to prevent overflow
             )?;
         }
         

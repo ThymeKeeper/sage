@@ -301,7 +301,7 @@ impl Renderer {
                                 {
                                     if is_selected {
                                         // Use same cadet blue as cursor (#5F9EA0) with black text
-                                        formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
+                                        formatted_line.push_str("\x1b[48;2;55;110;112m\x1b[38;2;0;0;0m"); // RGB background + black foreground (dimmer than caret)
                                     } else if is_current_find_match {
                                         // Bright orange background for current find match
                                         formatted_line.push_str("\x1b[48;2;200;150;100m\x1b[38;2;0;0;0m"); // Bright orange + black text
@@ -322,8 +322,8 @@ impl Renderer {
                                                 formatted_line.push_str("\x1b[38;2;135;128;115m"); // #878073
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Very dark grey for comments
-                                                formatted_line.push_str("\x1b[38;2;65;65;65m"); // #414141
+                                                // Medium grey for comments
+                                                formatted_line.push_str("\x1b[38;2;101;101;101m"); // #656565
                                             }
                                             SyntaxState::Keyword => {
                                                 // Bright grey with strong warm hint for keywords
@@ -397,7 +397,7 @@ impl Renderer {
                                 {
                                     if is_selected {
                                         // Use same cadet blue as cursor (#5F9EA0) with black text
-                                        formatted_line.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m"); // RGB background + black foreground
+                                        formatted_line.push_str("\x1b[48;2;55;110;112m\x1b[38;2;0;0;0m"); // RGB background + black foreground (dimmer than caret)
                                     } else if is_current_find_match {
                                         // Bright orange background for current find match
                                         formatted_line.push_str("\x1b[48;2;200;150;100m\x1b[38;2;0;0;0m"); // Bright orange + black text
@@ -418,8 +418,8 @@ impl Renderer {
                                                 formatted_line.push_str("\x1b[38;2;135;128;115m"); // #878073
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Very dark grey for comments
-                                                formatted_line.push_str("\x1b[38;2;65;65;65m"); // #414141
+                                                // Medium grey for comments
+                                                formatted_line.push_str("\x1b[38;2;101;101;101m"); // #656565
                                             }
                                             SyntaxState::Keyword => {
                                                 // Bright grey with strong warm hint for keywords
@@ -497,7 +497,28 @@ impl Renderer {
                         line_byte_offset += ch.len_utf8();
                         display_col += char_width;
                     }
-                    
+
+                    // If line is empty and selected, show a visual indicator
+                    if screen_col == 0 {
+                        // Check if this empty line is within the selection
+                        if let Some((sel_start, sel_end)) = selection {
+                            let line_end_byte = if file_row < buffer.len_lines() - 1 {
+                                buffer.line_to_byte(file_row + 1)
+                            } else {
+                                buffer.len_bytes()
+                            };
+
+                            // Line is selected if selection overlaps with this line's byte range
+                            if sel_start < line_end_byte && sel_end > line_byte_start {
+                                // Draw a vertical bar with selection color to indicate empty line is selected
+                                formatted_line.push_str("\x1b[38;2;55;110;112m"); // Selection color for foreground
+                                formatted_line.push('│'); // Vertical bar
+                                formatted_line.push_str("\x1b[39m"); // Reset foreground
+                                screen_col += 1;
+                            }
+                        }
+                    }
+
                     // Pad the rest of the line with spaces (background already set)
                     while screen_col < width as usize {
                         formatted_line.push(' ');

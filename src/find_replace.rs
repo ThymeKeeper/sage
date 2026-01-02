@@ -437,7 +437,7 @@ impl FindReplace {
                 let abs_byte_pos = offset_byte + byte_idx;
                 if abs_byte_pos >= sel_start && abs_byte_pos < sel_end {
                     // Selected character - use inverted colors
-                    result.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m");
+                    result.push_str("\x1b[48;2;55;110;112m\x1b[38;2;0;0;0m");
                     result.push(ch);
                     result.push_str("\x1b[0m");
                     // Restore the field background color
