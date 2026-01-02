@@ -17,6 +17,7 @@ desktop.ini
 # IDE files
 .idea/
 .vscode/
+.claude/
 *.iml
 .project
 .classpath
