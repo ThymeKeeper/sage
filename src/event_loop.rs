@@ -1,4 +1,4 @@
-use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, language_selector, commands, direct_kernel, syntax};
+use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, language_selector, commands, direct_kernel, syntax, help_screen};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
     execute,
@@ -22,6 +22,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut output_pane_height = 8; // Default height in lines
     let mut needs_redraw = true; // Track if we need to redraw
     let mut skip_event_read = false; // Skip event read to force immediate redraw
+    let mut help_screen_visible = false; // Track if help screen is visible
 
     // State for background execution with live timer
     let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>, kernel::TypeRelationships, kernel::SqlMetadata)>> = None;
@@ -103,48 +104,58 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
         // Only draw if needed
         if needs_redraw {
             debug_log(&format!("needs_redraw is true, starting draw"));
-            // Calculate bottom window height
-            let bottom_window_height = if find_replace.is_some() {
-                3 // Find/replace pane
-            } else if output_pane_visible {
-                output_pane_height
+
+            // If help screen is visible, draw it and skip everything else
+            if help_screen_visible {
+                debug_log(&format!("Drawing help screen"));
+                let help = help_screen::HelpScreen::new();
+                help.draw(&mut io::stdout())?;
+                needs_redraw = false;
+                debug_log(&format!("Help screen draw completed"));
             } else {
-                0
-            };
+                // Calculate bottom window height
+                let bottom_window_height = if find_replace.is_some() {
+                    3 // Find/replace pane
+                } else if output_pane_visible {
+                    output_pane_height
+                } else {
+                    0
+                };
 
-            debug_log(&format!("About to call draw_with_bottom_window"));
-            // Draw the editor with bottom window if needed
-            renderer.draw_with_bottom_window(editor, bottom_window_height)?;
-            debug_log(&format!("draw_with_bottom_window completed"));
+                debug_log(&format!("About to call draw_with_bottom_window"));
+                // Draw the editor with bottom window if needed
+                renderer.draw_with_bottom_window(editor, bottom_window_height)?;
+                debug_log(&format!("draw_with_bottom_window completed"));
 
-            // Draw the appropriate pane
-            if let Some(ref fr) = find_replace {
-                debug_log(&format!("Drawing find_replace"));
-                fr.draw(&mut io::stdout())?;
-            } else if output_pane_visible {
-                debug_log(&format!("Drawing output_pane"));
-                let (width, height) = crossterm::terminal::size()?;
-                // Output pane starts after the status bar
-                let output_start_row = height.saturating_sub(output_pane_height as u16);
-                output_pane.draw(&mut io::stdout(), output_start_row, output_pane_height, width)?;
-                // Only reposition cursor to editor if output pane doesn't have focus
-                if !output_pane.is_focused() {
+                // Draw the appropriate pane
+                if let Some(ref fr) = find_replace {
+                    debug_log(&format!("Drawing find_replace"));
+                    fr.draw(&mut io::stdout())?;
+                } else if output_pane_visible {
+                    debug_log(&format!("Drawing output_pane"));
+                    let (width, height) = crossterm::terminal::size()?;
+                    // Output pane starts after the status bar
+                    let output_start_row = height.saturating_sub(output_pane_height as u16);
+                    output_pane.draw(&mut io::stdout(), output_start_row, output_pane_height, width)?;
+                    // Only reposition cursor to editor if output pane doesn't have focus
+                    if !output_pane.is_focused() {
+                        renderer.reposition_cursor(editor, bottom_window_height)?;
+                    }
+                    debug_log(&format!("output_pane draw completed"));
+                }
+
+                // Draw autocomplete dropdown if visible
+                if autocomplete.is_visible() {
+                    let (screen_col, screen_row) = editor.cursor_screen_position();
+                    let (width, height) = crossterm::terminal::size()?;
+                    autocomplete.draw(&mut io::stdout(), screen_row as u16, screen_col as u16, height, width)?;
+                    // Reposition cursor after drawing autocomplete
                     renderer.reposition_cursor(editor, bottom_window_height)?;
                 }
-                debug_log(&format!("output_pane draw completed"));
-            }
 
-            // Draw autocomplete dropdown if visible
-            if autocomplete.is_visible() {
-                let (screen_col, screen_row) = editor.cursor_screen_position();
-                let (width, height) = crossterm::terminal::size()?;
-                autocomplete.draw(&mut io::stdout(), screen_row as u16, screen_col as u16, height, width)?;
-                // Reposition cursor after drawing autocomplete
-                renderer.reposition_cursor(editor, bottom_window_height)?;
+                needs_redraw = false; // Reset flag after drawing
+                debug_log(&format!("Draw complete, needs_redraw set to false"));
             }
-
-            needs_redraw = false; // Reset flag after drawing
-            debug_log(&format!("Draw complete, needs_redraw set to false"));
         }
 
         // Skip event read if we need immediate redraw (after cell execution)
@@ -388,6 +399,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                         editor.select_range(start, end);
                                         // Update current match index for highlighting
                                         editor.set_find_matches(fr.get_all_matches().to_vec(), fr.get_current_match_index());
+                                        // Update viewport to show the match (find/replace pane is 3 lines)
+                                        editor.update_viewport_for_cursor_with_bottom(3);
+                                        renderer.force_redraw();
                                     }
                                 }
                             }
@@ -397,6 +411,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                         editor.select_range(start, end);
                                         // Update current match index for highlighting
                                         editor.set_find_matches(fr.get_all_matches().to_vec(), fr.get_current_match_index());
+                                        // Update viewport to show the match (find/replace pane is 3 lines)
+                                        editor.update_viewport_for_cursor_with_bottom(3);
+                                        renderer.force_redraw();
                                     }
                                 }
                             }
@@ -471,6 +488,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 // Select first match if any
                                 if let Some((start, end)) = fr.current_match_position() {
                                     editor.select_range(start, end);
+                                    // Update viewport to show the first match (find/replace pane is 3 lines)
+                                    editor.update_viewport_for_cursor_with_bottom(3);
+                                    renderer.force_redraw();
                                 } else {
                                     editor.selection_start = None;
                                 }
@@ -481,6 +501,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                         editor.select_range(start, end);
                                         // Update current match index for highlighting
                                         editor.set_find_matches(fr.get_all_matches().to_vec(), fr.get_current_match_index());
+                                        // Update viewport to show the match (find/replace pane is 3 lines)
+                                        editor.update_viewport_for_cursor_with_bottom(3);
+                                        renderer.force_redraw();
                                     }
                                 }
                             }
@@ -494,8 +517,44 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 // Note: suppress_autocomplete_once flag (if set by Tab completion) will be
                 // checked and cleared in the autocomplete update logic below
 
+                // F1 - Toggle help screen
+                if key.code == KeyCode::F(1) {
+                    help_screen_visible = !help_screen_visible;
+                    if help_screen_visible {
+                        // When showing help, force a complete redraw
+                        execute!(io::stdout(),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                        )?;
+                    } else {
+                        // When hiding help, force a complete redraw of the editor
+                        execute!(io::stdout(),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                            crossterm::cursor::Hide
+                        )?;
+                        renderer.force_redraw();
+                    }
+                    needs_redraw = true;
+                    continue; // Skip normal command processing
+                }
+
+                // If help screen is visible and it's not F1, only process Esc to close it
+                if help_screen_visible {
+                    if key.code == KeyCode::Esc {
+                        help_screen_visible = false;
+                        // Force a complete redraw of the editor
+                        execute!(io::stdout(),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                            crossterm::cursor::Hide
+                        )?;
+                        renderer.force_redraw();
+                        needs_redraw = true;
+                    }
+                    // Ignore all other keys while help screen is visible
+                    continue;
+                }
+
                 let cmd = match key.code {
-                    // Esc - Hide autocomplete, or toggle output pane focus
+                    // Esc - Hide autocomplete or toggle output pane focus
                     KeyCode::Esc => {
                         if autocomplete.is_visible() {
                             autocomplete.hide();

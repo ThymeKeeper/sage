@@ -324,26 +324,30 @@ impl FindReplace {
         
         // Position cursor in active field
         // Use the same counter length and field width that we calculated for drawing
-        
+
         // Calculate the actual cursor display position within the visible field
-        let (active_text, active_cursor) = if self.active_field == Field::Find {
+        let (active_text, active_cursor_byte) = if self.active_field == Field::Find {
             (&self.find_text, self.cursor_pos)
         } else {
             (&self.replace_text, self.cursor_pos)
         };
-        
-        // Calculate scrolling offset for the field
-        let scroll_offset = if active_text.len() <= field_width {
+
+        // Convert byte index to character count for display
+        let active_cursor_char = active_text[..active_cursor_byte].chars().count();
+        let total_chars = active_text.chars().count();
+
+        // Calculate scrolling offset for the field (in characters)
+        let scroll_offset = if total_chars <= field_width {
             0
-        } else if active_cursor > field_width - 1 {
-            active_cursor - (field_width - 1)
+        } else if active_cursor_char > field_width - 1 {
+            active_cursor_char - (field_width - 1)
         } else {
             0
         };
-        
+
         // The cursor's visual position within the field
-        let cursor_display_pos = active_cursor.saturating_sub(scroll_offset);
-        
+        let cursor_display_pos = active_cursor_char.saturating_sub(scroll_offset);
+
         let cursor_x = if self.active_field == Field::Find {
             2 + 6 + cursor_display_pos // "│ " + "Find: "
         } else {
@@ -363,37 +367,75 @@ impl FindReplace {
     }
     
     /// Get visible portion of text for scrolling
-    fn get_visible_text(&self, text: &str, width: usize, cursor: usize) -> String {
-        if text.len() <= width {
+    fn get_visible_text(&self, text: &str, width: usize, cursor_byte: usize) -> String {
+        let total_chars = text.chars().count();
+        if total_chars <= width {
             text.to_string()
-        } else if cursor > width - 1 {
-            let start = cursor - (width - 1);
-            let end = (start + width).min(text.len());
-            text[start..end].to_string()
         } else {
-            text[..width].to_string()
+            // Convert byte cursor to character position
+            let cursor_char = text[..cursor_byte].chars().count();
+
+            if cursor_char > width - 1 {
+                // Need to scroll - show ending at cursor position
+                let start_char = cursor_char - (width - 1);
+                let end_char = (start_char + width).min(total_chars);
+
+                // Convert character positions back to byte indices
+                let chars_vec: Vec<(usize, char)> = text.char_indices().collect();
+                let start_byte = if start_char < chars_vec.len() {
+                    chars_vec[start_char].0
+                } else {
+                    text.len()
+                };
+                let end_byte = if end_char < chars_vec.len() {
+                    chars_vec[end_char].0
+                } else {
+                    text.len()
+                };
+
+                text[start_byte..end_byte].to_string()
+            } else {
+                // Show from beginning
+                let chars_vec: Vec<(usize, char)> = text.char_indices().collect();
+                let end_byte = if width < chars_vec.len() {
+                    chars_vec[width].0
+                } else {
+                    text.len()
+                };
+                text[..end_byte].to_string()
+            }
         }
     }
     
     /// Get visible portion of text with selection highlighting
-    fn get_visible_text_with_selection(&self, text: &str, width: usize, cursor: usize, selection: Option<(usize, usize)>) -> String {
-        let visible = self.get_visible_text(text, width, cursor);
-        
-        // Calculate offset for visible portion
-        let offset = if text.len() <= width {
+    fn get_visible_text_with_selection(&self, text: &str, width: usize, cursor_byte: usize, selection: Option<(usize, usize)>) -> String {
+        let visible = self.get_visible_text(text, width, cursor_byte);
+
+        // Calculate byte offset for visible portion
+        let total_chars = text.chars().count();
+        let cursor_char = text[..cursor_byte].chars().count();
+
+        let offset_byte = if total_chars <= width {
             0
-        } else if cursor > width - 1 {
-            cursor - (width - 1)
+        } else if cursor_char > width - 1 {
+            // Find byte position of start_char
+            let start_char = cursor_char - (width - 1);
+            let chars_vec: Vec<(usize, char)> = text.char_indices().collect();
+            if start_char < chars_vec.len() {
+                chars_vec[start_char].0
+            } else {
+                text.len()
+            }
         } else {
             0
         };
-        
+
         // Apply selection highlighting if needed
         if let Some((sel_start, sel_end)) = selection {
             let mut result = String::new();
-            for (i, ch) in visible.chars().enumerate() {
-                let abs_pos = offset + i;
-                if abs_pos >= sel_start && abs_pos < sel_end {
+            for (byte_idx, ch) in visible.char_indices() {
+                let abs_byte_pos = offset_byte + byte_idx;
+                if abs_byte_pos >= sel_start && abs_byte_pos < sel_end {
                     // Selected character - use inverted colors
                     result.push_str("\x1b[48;2;95;158;160m\x1b[38;2;0;0;0m");
                     result.push(ch);
@@ -569,16 +611,17 @@ impl FindReplace {
             KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
                 // Delete any selected text first
                 let was_selection = self.delete_selection();
-                
+
                 let text = if self.active_field == Field::Find {
                     &mut self.find_text
                 } else {
                     &mut self.replace_text
                 };
-                
+
                 text.insert(self.cursor_pos, c);
-                self.cursor_pos += 1;
-                
+                // Move cursor forward by the byte length of the inserted character
+                self.cursor_pos += c.len_utf8();
+
                 if self.active_field == Field::Find || was_selection {
                     InputResult::FindTextChanged
                 } else {
@@ -601,11 +644,19 @@ impl FindReplace {
                     } else {
                         &mut self.replace_text
                     };
-                    
+
                     if self.cursor_pos > 0 {
-                        self.cursor_pos -= 1;
-                        text.remove(self.cursor_pos);
-                        
+                        // Find the start of the character before cursor using char_indices
+                        let char_start = text.char_indices()
+                            .rev()
+                            .find(|(idx, _)| *idx < self.cursor_pos)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0);
+
+                        // Remove the character range
+                        text.drain(char_start..self.cursor_pos);
+                        self.cursor_pos = char_start;
+
                         if self.active_field == Field::Find {
                             InputResult::FindTextChanged
                         } else {
@@ -632,10 +683,20 @@ impl FindReplace {
                     } else {
                         &mut self.replace_text
                     };
-                    
+
                     if self.cursor_pos < text.len() {
-                        text.remove(self.cursor_pos);
-                        
+                        // Find the end of the character at/after cursor using char_indices
+                        let char_end = text.char_indices()
+                            .find(|(idx, _)| *idx >= self.cursor_pos)
+                            .and_then(|(start_idx, ch)| {
+                                // Return the byte index after this character
+                                Some(start_idx + ch.len_utf8())
+                            })
+                            .unwrap_or(text.len());
+
+                        // Remove the character range
+                        text.drain(self.cursor_pos..char_end);
+
                         if self.active_field == Field::Find {
                             InputResult::FindTextChanged
                         } else {
@@ -648,6 +709,12 @@ impl FindReplace {
             }
             
             KeyCode::Left => {
+                let text = if self.active_field == Field::Find {
+                    &self.find_text
+                } else {
+                    &self.replace_text
+                };
+
                 if modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+Left = select left
                     if self.selection_start.is_none() {
@@ -657,9 +724,15 @@ impl FindReplace {
                     // Regular Left = clear selection and move
                     self.selection_start = None;
                 }
-                
+
                 if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
+                    // Move to the start of the previous character
+                    let new_pos = text.char_indices()
+                        .rev()
+                        .find(|(idx, _)| *idx < self.cursor_pos)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0);
+                    self.cursor_pos = new_pos;
                 }
                 InputResult::Continue
             }
@@ -670,7 +743,7 @@ impl FindReplace {
                 } else {
                     &self.replace_text
                 };
-                
+
                 if modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+Right = select right
                     if self.selection_start.is_none() {
@@ -680,9 +753,17 @@ impl FindReplace {
                     // Regular Right = clear selection and move
                     self.selection_start = None;
                 }
-                
+
                 if self.cursor_pos < text.len() {
-                    self.cursor_pos += 1;
+                    // Move to the start of the next character
+                    let new_pos = text.char_indices()
+                        .find(|(idx, _)| *idx >= self.cursor_pos)
+                        .and_then(|(start_idx, ch)| {
+                            // Return the byte index after this character
+                            Some(start_idx + ch.len_utf8())
+                        })
+                        .unwrap_or(text.len());
+                    self.cursor_pos = new_pos;
                 }
                 InputResult::Continue
             }

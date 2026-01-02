@@ -604,18 +604,6 @@ impl SyntaxHighlighter {
                             current_state = SyntaxState::LineComment;
                             current_pos += 2;
                             continue;
-                        } else if bytes[current_pos] == b'/' && bytes[current_pos + 1] == b'*' {
-                            if current_pos > span_start {
-                                new_spans.push(HighlightSpan {
-                                    start: span_start,
-                                    end: current_pos,
-                                    state: SyntaxState::Normal,
-                                });
-                            }
-                            span_start = current_pos;
-                            current_state = SyntaxState::BlockComment;
-                            current_pos += 2;
-                            continue;
                         }
                     }
 
@@ -655,22 +643,6 @@ impl SyntaxHighlighter {
 
                 SyntaxState::LineComment => {
                     current_pos = bytes.len();
-                }
-
-                SyntaxState::BlockComment => {
-                    if current_pos + 1 < bytes.len() &&
-                       bytes[current_pos] == b'*' && bytes[current_pos + 1] == b'/' {
-                        current_pos += 2;
-                        new_spans.push(HighlightSpan {
-                            start: span_start,
-                            end: current_pos,
-                            state: SyntaxState::BlockComment,
-                        });
-                        span_start = current_pos;
-                        current_state = SyntaxState::Normal;
-                    } else {
-                        current_pos += 1;
-                    }
                 }
 
                 _ => {

@@ -15,6 +15,7 @@ mod output_pane;
 mod autocomplete;
 mod event_loop;
 mod sql_context;
+mod help_screen;
 
 use kernel::Kernel;
 
