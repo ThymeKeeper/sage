@@ -6,11 +6,23 @@ use crossterm::{
 };
 use std::io::{self, Write};
 
-pub struct HelpScreen;
+pub struct HelpScreen {
+    scroll_offset: usize,
+}
 
 impl HelpScreen {
     pub fn new() -> Self {
-        HelpScreen
+        HelpScreen {
+            scroll_offset: 0,
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset += 1;
     }
 
     pub fn draw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -35,7 +47,7 @@ impl HelpScreen {
             ]),
             ("EDITING", vec![
                 ("Ctrl+Z", "Undo"),
-                ("Ctrl+Y / Ctrl+Shift+Z", "Redo"),
+                ("Ctrl+Shift+Z", "Redo"),
                 ("Ctrl+X", "Cut line/selection"),
                 ("Ctrl+C", "Copy line/selection"),
                 ("Ctrl+V", "Paste"),
@@ -59,10 +71,10 @@ impl HelpScreen {
                 ("Ctrl+Shift+Arrow Keys", "Select by word/paragraph"),
                 ("Ctrl+A", "Select all"),
                 ("Mouse Click+Drag", "Select text"),
-                ("Esc", "Clear selection"),
             ]),
             ("PYTHON REPL MODE", vec![
                 ("Ctrl+E / Ctrl+Enter", "Execute cell/code"),
+                ("Ctrl+Backspace", "Cancel execution (resets kernel)"),
                 ("Ctrl+K", "Select Python kernel"),
                 ("Ctrl+L", "Clear output pane"),
                 ("Ctrl+O", "Toggle output pane visibility"),
@@ -74,13 +86,12 @@ impl HelpScreen {
             ]),
             ("OTHER", vec![
                 ("F1", "Toggle this help screen"),
-                ("Ctrl+Backspace", "Cancel execution (resets kernel)"),
             ]),
         ];
 
         // Calculate layout
         let title = "SAGE - Keyboard Shortcuts";
-        let footer = "Press F1 or Esc to close";
+        let footer = "Use Up/Down arrows to scroll | Press F1 or Esc to close";
 
         let mut current_row = 2u16;
 
@@ -97,40 +108,58 @@ impl HelpScreen {
 
         current_row += 2;
 
+        // Track lines to skip based on scroll offset
+        let mut lines_to_skip = self.scroll_offset;
+
         // Draw each section
         for (section_name, hotkeys) in &sections {
-            if current_row + hotkeys.len() as u16 + 2 >= height - 2 {
-                // Not enough space, skip remaining sections
-                break;
-            }
-
-            // Draw section header
-            execute!(
-                writer,
-                cursor::MoveTo(4, current_row),
-                SetBackgroundColor(bg_color),
-                SetForegroundColor(Color::Yellow),
-                Print(section_name),
-                SetForegroundColor(Color::Reset)
-            )?;
-            current_row += 1;
-
-            // Draw hotkeys in this section
-            for (key, description) in hotkeys {
+            // Skip section header if needed
+            if lines_to_skip > 0 {
+                lines_to_skip -= 1;
+            } else {
+                if current_row >= height - 2 {
+                    break; // No more space
+                }
+                // Draw section header
                 execute!(
                     writer,
-                    cursor::MoveTo(6, current_row),
+                    cursor::MoveTo(4, current_row),
                     SetBackgroundColor(bg_color),
-                    SetForegroundColor(Color::Green),
-                    Print(format!("{:30}", key)),
-                    SetForegroundColor(Color::White),
-                    Print(description),
+                    SetForegroundColor(Color::Yellow),
+                    Print(section_name),
                     SetForegroundColor(Color::Reset)
                 )?;
                 current_row += 1;
             }
 
-            current_row += 1; // Extra space between sections
+            // Draw hotkeys in this section
+            for (key, description) in hotkeys {
+                if lines_to_skip > 0 {
+                    lines_to_skip -= 1;
+                } else {
+                    if current_row >= height - 2 {
+                        break; // No more space
+                    }
+                    execute!(
+                        writer,
+                        cursor::MoveTo(6, current_row),
+                        SetBackgroundColor(bg_color),
+                        SetForegroundColor(Color::Green),
+                        Print(format!("{:30}", key)),
+                        SetForegroundColor(Color::White),
+                        Print(description),
+                        SetForegroundColor(Color::Reset)
+                    )?;
+                    current_row += 1;
+                }
+            }
+
+            // Extra space between sections
+            if lines_to_skip > 0 {
+                lines_to_skip -= 1;
+            } else {
+                current_row += 1;
+            }
         }
 
         // Draw footer

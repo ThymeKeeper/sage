@@ -22,7 +22,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut output_pane_height = 8; // Default height in lines
     let mut needs_redraw = true; // Track if we need to redraw
     let mut skip_event_read = false; // Skip event read to force immediate redraw
-    let mut help_screen_visible = false; // Track if help screen is visible
+    let mut help_screen: Option<help_screen::HelpScreen> = None; // Help screen state
 
     // State for background execution with live timer
     let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>, kernel::TypeRelationships, kernel::SqlMetadata)>> = None;
@@ -106,9 +106,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
             debug_log(&format!("needs_redraw is true, starting draw"));
 
             // If help screen is visible, draw it and skip everything else
-            if help_screen_visible {
+            if let Some(ref help) = help_screen {
                 debug_log(&format!("Drawing help screen"));
-                let help = help_screen::HelpScreen::new();
                 help.draw(&mut io::stdout())?;
                 needs_redraw = false;
                 debug_log(&format!("Help screen draw completed"));
@@ -519,38 +518,53 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                 // F1 - Toggle help screen
                 if key.code == KeyCode::F(1) {
-                    help_screen_visible = !help_screen_visible;
-                    if help_screen_visible {
-                        // When showing help, force a complete redraw
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                        )?;
-                    } else {
-                        // When hiding help, force a complete redraw of the editor
+                    if help_screen.is_some() {
+                        // Hide help screen
+                        help_screen = None;
                         execute!(io::stdout(),
                             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                             crossterm::cursor::Hide
                         )?;
                         renderer.force_redraw();
+                    } else {
+                        // Show help screen
+                        help_screen = Some(help_screen::HelpScreen::new());
+                        execute!(io::stdout(),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                        )?;
                     }
                     needs_redraw = true;
                     continue; // Skip normal command processing
                 }
 
-                // If help screen is visible and it's not F1, only process Esc to close it
-                if help_screen_visible {
-                    if key.code == KeyCode::Esc {
-                        help_screen_visible = false;
-                        // Force a complete redraw of the editor
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                            crossterm::cursor::Hide
-                        )?;
-                        renderer.force_redraw();
-                        needs_redraw = true;
+                // If help screen is visible, handle its input
+                if let Some(ref mut help) = help_screen {
+                    match key.code {
+                        KeyCode::Esc => {
+                            // Close help screen
+                            help_screen = None;
+                            execute!(io::stdout(),
+                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                                crossterm::cursor::Hide
+                            )?;
+                            renderer.force_redraw();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Up => {
+                            // Scroll up
+                            help.scroll_up();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down => {
+                            // Scroll down
+                            help.scroll_down();
+                            needs_redraw = true;
+                        }
+                        _ => {
+                            // Ignore all other keys
+                        }
                     }
-                    // Ignore all other keys while help screen is visible
-                    continue;
+                    continue; // Skip normal command processing
                 }
 
                 let cmd = match key.code {
