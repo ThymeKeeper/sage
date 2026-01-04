@@ -675,32 +675,32 @@ impl SyntaxHighlighter {
         }
 
         let segment = &line_content[start..end];
-        let segment_bytes = segment.as_bytes();
-        let mut pos = 0;
+        let mut chars = segment.char_indices().peekable();
 
-        while pos < segment_bytes.len() {
-            let ch = segment_bytes[pos] as char;
+        while let Some((pos, ch)) = chars.next() {
             let abs_pos = start + pos;
 
             // Skip whitespace
             if ch.is_whitespace() {
-                pos += 1;
                 continue;
             }
 
             // Check for numbers
             if ch.is_numeric() {
                 let token_start = pos;
-                while pos < segment_bytes.len() {
-                    let c = segment_bytes[pos] as char;
-                    if !c.is_numeric() && c != '.' && c != '_' {
+                let mut token_end = pos + ch.len_utf8();
+
+                while let Some(&(next_pos, next_ch)) = chars.peek() {
+                    if !next_ch.is_numeric() && next_ch != '.' && next_ch != '_' {
                         break;
                     }
-                    pos += 1;
+                    token_end = next_pos + next_ch.len_utf8();
+                    chars.next();
                 }
+
                 spans.push(HighlightSpan {
                     start: start + token_start,
-                    end: start + pos,
+                    end: start + token_end,
                     state: SyntaxState::Number,
                 });
                 continue;
@@ -709,15 +709,17 @@ impl SyntaxHighlighter {
             // Check for identifiers/keywords
             if ch.is_alphabetic() || ch == '_' || ch == '@' {
                 let token_start = pos;
-                while pos < segment_bytes.len() {
-                    let c = segment_bytes[pos] as char;
-                    if !c.is_alphanumeric() && c != '_' {
+                let mut token_end = pos + ch.len_utf8();
+
+                while let Some(&(next_pos, next_ch)) = chars.peek() {
+                    if !next_ch.is_alphanumeric() && next_ch != '_' {
                         break;
                     }
-                    pos += 1;
+                    token_end = next_pos + next_ch.len_utf8();
+                    chars.next();
                 }
 
-                let word = &segment[token_start..pos];
+                let word = &segment[token_start..token_end];
 
                 // Determine token type
                 let token_state = if self.is_keyword(word) {
@@ -726,11 +728,19 @@ impl SyntaxHighlighter {
                     SyntaxState::Type
                 } else {
                     // Check if it's a function call (followed by '(')
-                    let mut check_pos = pos;
-                    while check_pos < segment_bytes.len() && (segment_bytes[check_pos] as char).is_whitespace() {
-                        check_pos += 1;
+                    let mut is_function = false;
+                    let remaining_chars = chars.clone();
+                    for (_, next_ch) in remaining_chars {
+                        if next_ch.is_whitespace() {
+                            continue;
+                        }
+                        if next_ch == '(' {
+                            is_function = true;
+                        }
+                        break;
                     }
-                    if check_pos < segment_bytes.len() && segment_bytes[check_pos] == b'(' {
+
+                    if is_function {
                         SyntaxState::Function
                     } else {
                         SyntaxState::Normal
@@ -739,7 +749,7 @@ impl SyntaxHighlighter {
 
                 spans.push(HighlightSpan {
                     start: start + token_start,
-                    end: start + pos,
+                    end: start + token_end,
                     state: token_state,
                 });
                 continue;
@@ -749,10 +759,9 @@ impl SyntaxHighlighter {
             if "+-*/%=<>!&|^~".contains(ch) {
                 spans.push(HighlightSpan {
                     start: abs_pos,
-                    end: abs_pos + 1,
+                    end: abs_pos + ch.len_utf8(),
                     state: SyntaxState::Operator,
                 });
-                pos += 1;
                 continue;
             }
 
@@ -760,15 +769,13 @@ impl SyntaxHighlighter {
             if "()[]{},.;:".contains(ch) {
                 spans.push(HighlightSpan {
                     start: abs_pos,
-                    end: abs_pos + 1,
+                    end: abs_pos + ch.len_utf8(),
                     state: SyntaxState::Punctuation,
                 });
-                pos += 1;
                 continue;
             }
 
             // Other characters - skip
-            pos += 1;
         }
     }
 
