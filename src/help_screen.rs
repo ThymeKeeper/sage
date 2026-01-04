@@ -30,7 +30,7 @@ impl HelpScreen {
         let sections = vec![
             ("FILE OPERATIONS", vec![
                 ("Ctrl+S", "Save file"),
-                ("Ctrl+O", "Open file"),
+                ("Ctrl+Shift+S", "Save as"),
                 ("Ctrl+Q", "Quit"),
             ]),
             ("EDITING", vec![
@@ -39,20 +39,14 @@ impl HelpScreen {
                 ("Ctrl+X", "Cut line/selection"),
                 ("Ctrl+C", "Copy line/selection"),
                 ("Ctrl+V", "Paste"),
-                ("Ctrl+D", "Duplicate line"),
-                ("Ctrl+/", "Toggle line comment"),
-                ("Tab", "Indent / Autocomplete"),
-                ("Shift+Tab", "Unindent"),
-                ("Ctrl+]", "Indent selection"),
-                ("Ctrl+[", "Unindent selection"),
+                ("Tab", "Indent selection / Autocomplete"),
+                ("Shift+Tab", "Unindent selection"),
             ]),
             ("NAVIGATION", vec![
                 ("Arrow Keys", "Move cursor"),
+                ("Ctrl+Arrow Keys", "Move by word/paragraph"),
                 ("Home / End", "Start / End of line"),
-                ("Ctrl+Home / Ctrl+End", "Start / End of file"),
                 ("Page Up / Page Down", "Scroll page"),
-                ("Ctrl+G", "Go to line"),
-                ("Ctrl+P", "Matching bracket"),
             ]),
             ("SEARCH & REPLACE", vec![
                 ("Ctrl+F", "Find / Find next"),
@@ -62,22 +56,25 @@ impl HelpScreen {
             ]),
             ("SELECTION", vec![
                 ("Shift+Arrow Keys", "Select text"),
+                ("Ctrl+Shift+Arrow Keys", "Select by word/paragraph"),
                 ("Ctrl+A", "Select all"),
                 ("Mouse Click+Drag", "Select text"),
                 ("Esc", "Clear selection"),
             ]),
             ("PYTHON REPL MODE", vec![
-                ("Ctrl+E", "Execute cell/code"),
+                ("Ctrl+E / Ctrl+Enter", "Execute cell/code"),
                 ("Ctrl+K", "Select Python kernel"),
-                ("Ctrl+N", "Clear output pane"),
+                ("Ctrl+L", "Clear output pane"),
+                ("Ctrl+O", "Toggle output pane visibility"),
                 ("Esc", "Toggle output pane focus"),
+                ("Alt+Up / Alt+Down", "Resize output pane"),
             ]),
             ("LANGUAGE", vec![
                 ("Ctrl+Y", "Select language"),
             ]),
             ("OTHER", vec![
                 ("F1", "Toggle this help screen"),
-                ("Ctrl+L", "Refresh screen"),
+                ("Ctrl+Backspace", "Cancel execution (resets kernel)"),
             ]),
         ];
 
