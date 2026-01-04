@@ -7,6 +7,83 @@ use crossterm::{
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+/// Calculate the display width of a string, ignoring ANSI escape sequences.
+/// ANSI escape sequences like \x1b[31m (for colors) take up bytes but no display columns.
+fn display_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if ch == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if ch == 'm' {
+                in_escape = false;
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+/// Strip all ANSI escape sequences from a string, returning only the visible text.
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if ch == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if ch == 'm' {
+                in_escape = false;
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Extract a visible substring from a string containing ANSI escape sequences.
+/// Returns a substring that displays `visible_width` characters starting from display position `start`.
+/// ANSI escape sequences are preserved in the output as they don't consume display space.
+fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
+    let mut result = String::new();
+    let mut display_pos = 0;
+    let mut in_escape = false;
+    let mut escape_seq = String::new();
+
+    for ch in s.chars() {
+        if ch == '\x1b' {
+            in_escape = true;
+            escape_seq.clear();
+            escape_seq.push(ch);
+        } else if in_escape {
+            escape_seq.push(ch);
+            if ch == 'm' {
+                in_escape = false;
+                // Always include escape sequences that are within or before our visible range
+                if display_pos < start + visible_width {
+                    result.push_str(&escape_seq);
+                }
+            }
+        } else {
+            // This is a visible character
+            if display_pos >= start && display_pos < start + visible_width {
+                result.push(ch);
+            }
+            display_pos += 1;
+            // Stop if we've collected enough visible characters
+            if display_pos >= start + visible_width {
+                // Continue to collect any trailing escape sequences
+                // (but we'll break on the next visible char)
+            }
+        }
+    }
+
+    result
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputEntry {
     pub execution_count: usize,
@@ -133,6 +210,15 @@ impl OutputPane {
             self.scroll_offset += 1;
         } else {
             self.auto_scroll = true;
+        }
+    }
+
+    /// Scroll horizontally by delta columns (positive = right, negative = left)
+    pub fn scroll_horizontal(&mut self, delta: i32) {
+        if delta > 0 {
+            self.horizontal_offset = self.horizontal_offset.saturating_add(delta as usize);
+        } else {
+            self.horizontal_offset = self.horizontal_offset.saturating_sub((-delta) as usize);
         }
     }
 
@@ -447,6 +533,16 @@ impl OutputPane {
         self.ensure_cursor_visible();
     }
 
+    /// Get the indent size for a specific line
+    fn get_line_indent(&self, line_idx: usize) -> usize {
+        let lines = self.get_all_lines();
+        if line_idx < lines.len() {
+            if lines[line_idx].1 { 2 } else { 4 } // is_header -> 2, else 4
+        } else {
+            4 // Default to content indent
+        }
+    }
+
     /// Ensure cursor is visible in viewport
     fn ensure_cursor_visible(&mut self) {
         // Vertical scrolling
@@ -458,31 +554,33 @@ impl OutputPane {
         }
 
         // Horizontal scrolling
-        // Account for indent (2 for headers, 4 for content) + 2 margin (must match rendering!)
-        let indent = 4; // Use content indent as reference
-        let visible_width = self.viewport_width.saturating_sub(indent + 2);
+        // cursor_col is in raw line coordinates (without indent)
+        // We need to account for indent when calculating screen position
+        let indent = self.get_line_indent(self.cursor_line);
+        let cursor_screen_col = indent + self.cursor_col; // Position including indent
+        let visible_width = self.viewport_width;
 
         if visible_width > 0 {
             // Scroll left if cursor is before viewport
-            if self.cursor_col < self.horizontal_offset {
-                self.horizontal_offset = self.cursor_col;
+            if cursor_screen_col < self.horizontal_offset {
+                self.horizontal_offset = cursor_screen_col;
             }
             // Scroll right if cursor is past viewport
-            else if self.cursor_col >= self.horizontal_offset + visible_width {
-                // Position offset to show maximum content
-                // When cursor is at line_len, we want to show from (line_len - visible_width) to (line_len - 1)
-                if self.cursor_col >= visible_width {
-                    self.horizontal_offset = self.cursor_col.saturating_sub(visible_width);
-                } else {
-                    self.horizontal_offset = 0;
-                }
+            else if cursor_screen_col >= self.horizontal_offset + visible_width {
+                self.horizontal_offset = cursor_screen_col.saturating_sub(visible_width - 1);
             }
+        }
+
+        // Reset horizontal scroll when on an empty line
+        if self.get_line_length(self.cursor_line) == 0 {
+            self.horizontal_offset = 0;
         }
     }
 
     /// Ensure cursor is visible with scrolloff zones for drag selection
     fn ensure_cursor_visible_with_scrolloff(&mut self) {
-        let scrolloff = 2; // Number of lines/cols to keep as margin
+        let scrolloff = 2; // Number of lines to keep as margin (vertical)
+        let horizontal_scrolloff = 8; // Number of cols to keep as margin (horizontal)
         let total_lines = self.count_total_lines();
 
         // Vertical scrolling with scrolloff
@@ -506,30 +604,33 @@ impl OutputPane {
         }
 
         // Horizontal scrolling with scrolloff
-        let indent = 4;
-        let visible_width = self.viewport_width.saturating_sub(indent + 2);
+        // cursor_col is in raw line coordinates, add indent for screen position
+        let indent = self.get_line_indent(self.cursor_line);
+        let cursor_screen_col = indent + self.cursor_col;
+        let visible_width = self.viewport_width;
 
         if visible_width > 0 {
             // Scroll left if cursor is in the left scrolloff zone
-            if self.cursor_col < self.horizontal_offset + scrolloff {
-                self.horizontal_offset = self.cursor_col.saturating_sub(scrolloff);
+            if cursor_screen_col < self.horizontal_offset + horizontal_scrolloff {
+                self.horizontal_offset = cursor_screen_col.saturating_sub(horizontal_scrolloff);
             }
             // Scroll right if cursor is in the right scrolloff zone
-            else if self.cursor_col >= self.horizontal_offset + visible_width.saturating_sub(scrolloff) {
-                if self.cursor_col >= visible_width.saturating_sub(scrolloff) {
-                    self.horizontal_offset = self.cursor_col + scrolloff - visible_width;
-                } else {
-                    self.horizontal_offset = 0;
-                }
+            else if cursor_screen_col >= self.horizontal_offset + visible_width.saturating_sub(horizontal_scrolloff) {
+                self.horizontal_offset = cursor_screen_col + horizontal_scrolloff - visible_width + 1;
             }
+        }
+
+        // Reset horizontal scroll when on an empty line
+        if self.get_line_length(self.cursor_line) == 0 {
+            self.horizontal_offset = 0;
         }
     }
 
-    /// Get the length of a specific line (in characters, not bytes)
+    /// Get the length of a specific line (in display columns, accounting for ANSI escapes)
     fn get_line_length(&self, line_idx: usize) -> usize {
         let lines = self.get_all_lines();
         if line_idx < lines.len() {
-            lines[line_idx].0.chars().count()  // Use char count, not byte length
+            display_width(&lines[line_idx].0)  // Use display width, not char count
         } else {
             0
         }
@@ -726,16 +827,24 @@ impl OutputPane {
                 break;
             }
 
-            let indent = if *is_header { 2 } else { 4 };
+            // Determine indent and create the full line with indent prepended
+            // This makes indentation part of the scrollable content
+            let indent_str = if *is_header { "  " } else { "    " };
+            let indent_len = indent_str.len();
 
-            // Apply horizontal scrolling - get visible portion of line
-            // Use char-based indexing to avoid UTF-8 boundary panics
-            let visible_width = (width as usize).saturating_sub(indent + 2);
+            // Create the full line with indent prepended (for scrolling purposes)
+            // The full_line is: indent + line_text
+            // We'll slice this for display, so indent scrolls with content
+            let full_line = format!("{}{}", indent_str, line_text);
+            let full_line_display_width = display_width(&full_line);
+
+            // Apply horizontal scrolling - get visible portion of the full line
+            let visible_width = width as usize;
             let h_offset = self.horizontal_offset;
-            let char_count = line_text.chars().count();
-            let visible_line_owned: String = if h_offset < char_count {
-                let end = (h_offset + visible_width).min(char_count);
-                line_text.chars().skip(h_offset).take(end - h_offset).collect()
+
+            // Use ANSI-aware slicing to extract the visible portion
+            let visible_line_owned: String = if h_offset < full_line_display_width {
+                slice_with_ansi(&full_line, h_offset, visible_width)
             } else {
                 String::new()
             };
@@ -745,87 +854,102 @@ impl OutputPane {
             let is_cursor_line = self.focused && absolute_line_idx == self.cursor_line;
             if is_cursor_line {
                 cursor_screen_row = Some(current_row);
-                // Cursor column in screen space = indent + (cursor_col - horizontal_offset)
-                let screen_col = if self.cursor_col >= h_offset {
-                    indent as u16 + (self.cursor_col - h_offset) as u16
+                // Cursor column in screen space:
+                // cursor_col is in raw line coordinates (without indent)
+                // screen position = indent_len + cursor_col - horizontal_offset
+                let cursor_full_col = indent_len + self.cursor_col;
+                let screen_col = if cursor_full_col >= h_offset {
+                    (cursor_full_col - h_offset) as u16
                 } else {
-                    indent as u16
+                    0
                 };
                 cursor_screen_col = Some(screen_col.min(width - 1));
             }
 
             // Draw line with selection highlighting
+            // Selection coordinates are in raw line coordinates (without indent)
+            // We need to translate them to full_line coordinates (with indent)
             if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection_range {
                 if absolute_line_idx >= sel_start_line && absolute_line_idx <= sel_end_line {
-                    // This line has selection - adjust for horizontal offset
-                    let (sel_from, sel_to) = if absolute_line_idx == sel_start_line && absolute_line_idx == sel_end_line {
+                    // This line has selection
+                    // Convert raw selection coordinates to full_line coordinates
+                    let raw_line_len = display_width(line_text);
+                    let (raw_sel_from, raw_sel_to) = if absolute_line_idx == sel_start_line && absolute_line_idx == sel_end_line {
                         (sel_start_col, sel_end_col)
                     } else if absolute_line_idx == sel_start_line {
-                        (sel_start_col, line_text.len())
+                        (sel_start_col, raw_line_len)
                     } else if absolute_line_idx == sel_end_line {
                         (0, sel_end_col)
                     } else {
-                        (0, line_text.len())
+                        (0, raw_line_len)
                     };
 
-                    // Translate selection to visible range
-                    let vis_sel_from = if sel_from > h_offset {
-                        sel_from - h_offset
-                    } else if sel_from == h_offset {
-                        0
-                    } else {
-                        // Selection starts before visible area
-                        0
-                    };
-                    let vis_sel_to = if sel_to > h_offset {
-                        (sel_to - h_offset).min(visible_line.len())
+                    // Convert to full_line coordinates (add indent_len)
+                    let full_sel_from = indent_len + raw_sel_from;
+                    let full_sel_to = indent_len + raw_sel_to;
+
+                    // Translate selection to visible range (accounting for horizontal scroll)
+                    let vis_sel_from = if full_sel_from > h_offset {
+                        full_sel_from - h_offset
                     } else {
                         0
                     };
+                    let visible_line_display_len = display_width(visible_line);
+                    let vis_sel_to = if full_sel_to > h_offset {
+                        (full_sel_to - h_offset).min(visible_line_display_len)
+                    } else {
+                        0
+                    };
 
-                    execute!(writer, cursor::MoveTo(indent as u16, current_row))?;
+                    execute!(writer, cursor::MoveTo(0, current_row))?;
 
-                    // Use char-based slicing to avoid UTF-8 boundary issues
-                    let vis_line_chars: Vec<char> = visible_line.chars().collect();
-                    let vis_line_len = vis_line_chars.len();
-                    let vis_sel_from = vis_sel_from.min(vis_line_len);
-                    let vis_sel_to = vis_sel_to.min(vis_line_len);
+                    // Use ANSI-aware slicing to properly handle colored text
+                    let vis_line_display_len = visible_line_display_len;
+                    let vis_sel_from = vis_sel_from.min(vis_line_display_len);
+                    let vis_sel_to = vis_sel_to.min(vis_line_display_len);
 
-                    // Draw before selection
+                    // Draw before selection (using display-position-aware slicing)
                     if vis_sel_from > 0 {
-                        let before: String = vis_line_chars[..vis_sel_from].iter().collect();
+                        let before = slice_with_ansi(visible_line, 0, vis_sel_from);
+                        // Strip ANSI codes for selection rendering - we apply our own colors
+                        let before_plain = strip_ansi(&before);
                         if *is_header {
-                            execute!(writer, SetForegroundColor(Color::Green), Print(before), ResetColor)?;
+                            execute!(writer, SetForegroundColor(Color::Green), Print(before_plain), ResetColor)?;
                         } else if *is_error {
-                            execute!(writer, SetForegroundColor(Color::Red), Print(before), ResetColor)?;
+                            execute!(writer, SetForegroundColor(Color::Red), Print(before_plain), ResetColor)?;
                         } else {
-                            execute!(writer, Print(before))?;
+                            execute!(writer, Print(before_plain))?;
                         }
                     }
 
-                    // Draw selection (inverted colors)
+                    // Draw selection (teal background matching editor selection color)
                     if vis_sel_to > vis_sel_from {
-                        let selected: String = vis_line_chars[vis_sel_from..vis_sel_to].iter().collect();
-                        execute!(writer, crossterm::style::SetBackgroundColor(crossterm::style::Color::White),
-                                 crossterm::style::SetForegroundColor(crossterm::style::Color::Black),
-                                 Print(selected),
+                        let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
+                        // Strip ANSI codes - selection has its own styling
+                        let selected_plain = strip_ansi(&selected);
+                        // Use RGB(55, 110, 112) background and RGB(0, 0, 0) foreground to match editor selection color
+                        execute!(writer, crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb { r: 55, g: 110, b: 112 }),
+                                 crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb { r: 0, g: 0, b: 0 }),
+                                 Print(selected_plain),
                                  crossterm::style::ResetColor)?;
                     }
 
                     // Draw after selection
-                    if vis_sel_to < vis_line_len {
-                        let after: String = vis_line_chars[vis_sel_to..].iter().collect();
+                    if vis_sel_to < vis_line_display_len {
+                        let after = slice_with_ansi(visible_line, vis_sel_to, vis_line_display_len - vis_sel_to);
+                        // Strip ANSI codes for selection rendering - we apply our own colors
+                        let after_plain = strip_ansi(&after);
                         if *is_header {
-                            execute!(writer, SetForegroundColor(Color::Green), Print(after), ResetColor)?;
+                            execute!(writer, SetForegroundColor(Color::Green), Print(after_plain), ResetColor)?;
                         } else if *is_error {
-                            execute!(writer, SetForegroundColor(Color::Red), Print(after), ResetColor)?;
+                            execute!(writer, SetForegroundColor(Color::Red), Print(after_plain), ResetColor)?;
                         } else {
-                            execute!(writer, Print(after))?;
+                            execute!(writer, Print(after_plain))?;
                         }
                     }
                 } else {
                     // No selection on this line
-                    execute!(writer, cursor::MoveTo(indent as u16, current_row))?;
+                    execute!(writer, cursor::MoveTo(0, current_row))?;
                     if *is_header {
                         execute!(writer, SetForegroundColor(Color::Green), Print(visible_line), ResetColor)?;
                     } else if *is_error {
@@ -836,7 +960,7 @@ impl OutputPane {
                 }
             } else {
                 // No selection anywhere
-                execute!(writer, cursor::MoveTo(indent as u16, current_row))?;
+                execute!(writer, cursor::MoveTo(0, current_row))?;
                 if *is_header {
                     execute!(writer, SetForegroundColor(Color::Green), Print(visible_line), ResetColor)?;
                 } else if *is_error {
@@ -922,16 +1046,18 @@ impl OutputPane {
         let (line_text, is_header, _) = &lines[line_idx];
         let indent = if *is_header { 2 } else { 4 };
 
-        // Calculate column position considering horizontal scroll and indent
-        let col = if screen_col < indent {
-            0
+        // Calculate column position in raw line coordinates (without indent)
+        // screen_col + horizontal_offset gives us the position in the "indented line"
+        // We need to subtract indent to get the raw line position
+        let full_col = screen_col + self.horizontal_offset;
+        let col = if full_col < indent {
+            0 // Click is in the indent area, map to column 0
         } else {
-            let visible_col = screen_col - indent;
-            visible_col + self.horizontal_offset
+            full_col - indent // Convert to raw line coordinates
         };
 
-        // Clamp to line length
-        let line_len = line_text.chars().count();
+        // Clamp to line length (in display columns)
+        let line_len = display_width(line_text);
         let col = col.min(line_len);
 
         Some((line_idx, col))
@@ -1044,7 +1170,7 @@ impl OutputPane {
                 self.cursor_line = (line_offset + self.viewport_height - 1).min(total_lines.saturating_sub(1));
                 let lines = self.get_all_lines();
                 if self.cursor_line < lines.len() {
-                    self.cursor_col = lines[self.cursor_line].0.chars().count();
+                    self.cursor_col = display_width(&lines[self.cursor_line].0);
                 }
                 self.auto_scroll = false;
             }
@@ -1116,7 +1242,7 @@ impl OutputPane {
         }
 
         let line_text = &lines[line].0;
-        let line_len = line_text.chars().count();
+        let line_len = display_width(line_text);
 
         // Select from start to end of line
         self.selection_start = Some((line, 0));
@@ -1124,5 +1250,81 @@ impl OutputPane {
         self.cursor_col = line_len;
         self.auto_scroll = false;
         self.ensure_cursor_visible();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_width_plain_text() {
+        assert_eq!(display_width("hello"), 5);
+        assert_eq!(display_width(""), 0);
+        assert_eq!(display_width("hello world"), 11);
+    }
+
+    #[test]
+    fn test_display_width_with_ansi() {
+        // Red text: \x1b[31m ... \x1b[0m
+        assert_eq!(display_width("\x1b[31mhello\x1b[0m"), 5);
+        // Multiple escape sequences
+        assert_eq!(display_width("\x1b[31mred\x1b[0m \x1b[32mgreen\x1b[0m"), 9);
+        // Only escape sequences
+        assert_eq!(display_width("\x1b[31m\x1b[0m"), 0);
+    }
+
+    #[test]
+    fn test_slice_with_ansi_plain_text() {
+        assert_eq!(slice_with_ansi("hello world", 0, 5), "hello");
+        assert_eq!(slice_with_ansi("hello world", 6, 5), "world");
+        assert_eq!(slice_with_ansi("hello world", 0, 100), "hello world");
+        assert_eq!(slice_with_ansi("hello world", 20, 5), "");
+    }
+
+    #[test]
+    fn test_slice_with_ansi_preserves_escapes() {
+        // Slice from start should include the color code
+        let s = "\x1b[31mhello\x1b[0m world";
+        let result = slice_with_ansi(s, 0, 5);
+        assert!(result.contains("\x1b[31m")); // Color code preserved
+        assert!(result.contains("hello"));
+
+        // Slice in the middle should work correctly
+        let result = slice_with_ansi(s, 0, 11);
+        assert_eq!(display_width(&result), 11);
+    }
+
+    #[test]
+    fn test_slice_with_ansi_offset() {
+        // Start after the colored portion
+        let s = "\x1b[31mred\x1b[0m green";
+        let result = slice_with_ansi(s, 4, 5);
+        // Should get "green" (starting at display position 4, which is 'g')
+        assert!(result.contains("green"));
+    }
+
+    #[test]
+    fn test_strip_ansi() {
+        assert_eq!(strip_ansi("hello"), "hello");
+        assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m"), "hello");
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m \x1b[32mgreen\x1b[0m"), "red green");
+        assert_eq!(strip_ansi("\x1b[31m\x1b[0m"), "");
+    }
+
+    #[test]
+    fn test_selection_with_ansi() {
+        // Simulate selecting text that contains ANSI codes
+        let text = "\x1b[31mCatalogException\x1b[0m: Error message";
+
+        // Selecting first 16 chars ("CatalogException")
+        let selected = slice_with_ansi(text, 0, 16);
+        let selected_plain = strip_ansi(&selected);
+        assert_eq!(selected_plain, "CatalogException");
+
+        // Selecting from position 18 onwards (": Error message" minus the colon space)
+        let after = slice_with_ansi(text, 18, 100);
+        let after_plain = strip_ansi(&after);
+        assert_eq!(after_plain, "Error message");
     }
 }

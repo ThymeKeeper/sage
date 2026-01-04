@@ -191,7 +191,23 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
             Event::Mouse(mouse_event) => {
                 // Check if shift is held for horizontal scrolling
                 let shift_held = mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
-                
+
+                // Handle mouse scrolling for help screen
+                if let Some(ref mut help) = help_screen {
+                    match mouse_event.kind {
+                        MouseEventKind::ScrollDown => {
+                            help.scroll_down();
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::ScrollUp => {
+                            help.scroll_up();
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                    continue; // Skip other mouse event handling when help screen is open
+                }
+
                 // Only handle mouse events if find/replace is NOT open
                 if find_replace.is_none() {
                     // Handle mouse events for text selection
@@ -272,8 +288,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
 
                             if output_pane_visible && mouse_event.row >= output_start_row {
-                                // Scroll output pane
-                                output_pane.scroll_down();
+                                // Over output pane
+                                if shift_held {
+                                    // Shift+scroll = horizontal scroll right
+                                    output_pane.scroll_horizontal(5);
+                                } else {
+                                    // Normal scroll = vertical scroll down
+                                    output_pane.scroll_down();
+                                }
                             } else if shift_held {
                                 // Shift+scroll = horizontal scroll right
                                 editor.scroll_viewport_horizontal(5);
@@ -289,8 +311,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
 
                             if output_pane_visible && mouse_event.row >= output_start_row {
-                                // Scroll output pane
-                                output_pane.scroll_up();
+                                // Over output pane
+                                if shift_held {
+                                    // Shift+scroll = horizontal scroll left
+                                    output_pane.scroll_horizontal(-5);
+                                } else {
+                                    // Normal scroll = vertical scroll up
+                                    output_pane.scroll_up();
+                                }
                             } else if shift_held {
                                 // Shift+scroll = horizontal scroll left
                                 editor.scroll_viewport_horizontal(-5);
@@ -301,13 +329,31 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             needs_redraw = true; // Need to redraw for scroll
                         }
                         MouseEventKind::ScrollLeft => {
-                            // Scroll viewport left without moving cursor
-                            editor.scroll_viewport_horizontal(-5);
+                            // Check if mouse is over output pane
+                            let (_, height) = crossterm::terminal::size()?;
+                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+
+                            if output_pane_visible && mouse_event.row >= output_start_row {
+                                // Scroll output pane left
+                                output_pane.scroll_horizontal(-5);
+                            } else {
+                                // Scroll editor viewport left
+                                editor.scroll_viewport_horizontal(-5);
+                            }
                             needs_redraw = true; // Need to redraw for scroll
                         }
                         MouseEventKind::ScrollRight => {
-                            // Scroll viewport right without moving cursor
-                            editor.scroll_viewport_horizontal(5);
+                            // Check if mouse is over output pane
+                            let (_, height) = crossterm::terminal::size()?;
+                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+
+                            if output_pane_visible && mouse_event.row >= output_start_row {
+                                // Scroll output pane right
+                                output_pane.scroll_horizontal(5);
+                            } else {
+                                // Scroll editor viewport right
+                                editor.scroll_viewport_horizontal(5);
+                            }
                             needs_redraw = true; // Need to redraw for scroll
                         }
                         MouseEventKind::Moved => {

@@ -68,7 +68,10 @@ impl LanguageSelector {
                             let (language, _) = self.languages[self.selected_index];
                             return Ok(Some(language));
                         }
-                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            return Ok(None);
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             return Ok(None);
                         }
                         _ => {}
@@ -107,8 +110,7 @@ impl LanguageSelector {
             SetForegroundColor(Color::Cyan),
             Print("│"),
             ResetColor,
-            Print(" Select Language"),
-            cursor::MoveTo(start_col + box_width - 1, start_row + 1),
+            Print(format!(" {:<width$}", "Select Language", width = (box_width - 3) as usize)),
             SetForegroundColor(Color::Cyan),
             Print("│"),
             ResetColor
@@ -138,7 +140,7 @@ impl LanguageSelector {
                     ResetColor,
                     SetBackgroundColor(Color::DarkGrey),
                     SetForegroundColor(Color::White),
-                    Print(format!(" > {:<width$}", display_name, width = (box_width - 4) as usize)),
+                    Print(format!(" > {:<width$}", display_name, width = (box_width - 5) as usize)),
                     ResetColor,
                     SetForegroundColor(Color::Cyan),
                     Print("│"),
@@ -150,7 +152,7 @@ impl LanguageSelector {
                     SetForegroundColor(Color::Cyan),
                     Print("│"),
                     ResetColor,
-                    Print(format!("   {:<width$}", display_name, width = (box_width - 4) as usize)),
+                    Print(format!("   {:<width$}", display_name, width = (box_width - 5) as usize)),
                     SetForegroundColor(Color::Cyan),
                     Print("│"),
                     ResetColor
