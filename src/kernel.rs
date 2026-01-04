@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 /// Represents the output from code execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,15 +137,33 @@ pub fn discover_kernels() -> Vec<KernelInfo> {
     kernels
 }
 
+// Type alias for deduplication tracking - platform-specific
+#[cfg(unix)]
+type FileId = (u64, u64); // (device, inode) on Unix
+
+#[cfg(not(unix))]
+type FileId = PathBuf; // canonical path on Windows
+
+#[cfg(unix)]
+type SeenSet = HashSet<FileId>;
+
+#[cfg(not(unix))]
+type SeenSet = HashSet<FileId>;
+
 /// Find Python interpreters on the system
 fn discover_python_interpreters() -> Vec<KernelInfo> {
     let mut interpreters = Vec::new();
-    // Track seen files by (device, inode) to avoid duplicates from hardlinks/symlinks
-    let mut seen_inodes = std::collections::HashSet::new();
+    // Track seen files to avoid duplicates from hardlinks/symlinks
+    let mut seen_inodes = SeenSet::new();
 
     // 1. Check environment variable VIRTUAL_ENV (currently active venv)
     if let Ok(venv_path) = std::env::var("VIRTUAL_ENV") {
+        #[cfg(unix)]
         let python_path = format!("{}/bin/python", venv_path);
+
+        #[cfg(not(unix))]
+        let python_path = format!("{}\\Scripts\\python.exe", venv_path);
+
         if std::path::Path::new(&python_path).exists() {
             // Don't canonicalize - preserve venv path for detection
             add_interpreter(&mut interpreters, &mut seen_inodes, python_path, "python [active venv]");
@@ -173,7 +194,7 @@ fn discover_python_interpreters() -> Vec<KernelInfo> {
 /// Helper to add an interpreter with deduplication and metadata
 fn add_interpreter(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
     path: String,
     name_hint: &str,
 ) {
@@ -188,19 +209,41 @@ fn add_interpreter(
         Err(_) => return, // Skip if we can't access the file
     };
 
-    // Check if this is a venv - always include venvs even if they share inodes
+    // Check if this is a venv - always include venvs even if they share inodes/paths
+    #[cfg(unix)]
     let is_venv = path.contains("/venv/") || path.contains("/.venv/") ||
                   path.contains("/virtualenv/") || path.contains("/.virtualenv/") ||
                   (path.contains("/env/bin/") && !path.starts_with("/usr") && !path.starts_with("/bin"));
 
-    let file_id = (metadata.dev(), metadata.ino());
+    #[cfg(not(unix))]
+    let is_venv = path.contains("\\venv\\") || path.contains("\\.venv\\") ||
+                  path.contains("\\virtualenv\\") || path.contains("\\.virtualenv\\") ||
+                  path.contains("\\env\\Scripts\\");
 
-    // Only deduplicate non-venv paths by inode
-    if !is_venv {
-        if seen_inodes.contains(&file_id) {
-            return; // Already seen this file (via symlink or hardlink)
+    // Platform-specific deduplication
+    #[cfg(unix)]
+    {
+        let file_id = (metadata.dev(), metadata.ino());
+        // Only deduplicate non-venv paths by inode
+        if !is_venv {
+            if seen_inodes.contains(&file_id) {
+                return; // Already seen this file (via symlink or hardlink)
+            }
+            seen_inodes.insert(file_id);
         }
-        seen_inodes.insert(file_id);
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On Windows, use canonical path for deduplication
+        if let Ok(canonical) = std::fs::canonicalize(&path) {
+            if !is_venv {
+                if seen_inodes.contains(&canonical) {
+                    return; // Already seen this file
+                }
+                seen_inodes.insert(canonical);
+            }
+        }
     }
 
     // Get Python version
@@ -218,11 +261,18 @@ fn add_interpreter(
         .to_string();
 
     // Detect environment type based on path, not name_hint
-    let is_venv = path.contains("/venv/") || path.contains("/.venv/") ||
-                  path.contains("/virtualenv/") || path.contains("/.virtualenv/") ||
-                  path.contains("/env/bin/") && !path.starts_with("/usr") && !path.starts_with("/bin");
+    #[cfg(unix)]
+    let is_venv_detect = path.contains("/venv/") || path.contains("/.venv/") ||
+                         path.contains("/virtualenv/") || path.contains("/.virtualenv/") ||
+                         path.contains("/env/bin/") && !path.starts_with("/usr") && !path.starts_with("/bin");
 
-    let env_type = if is_venv {
+    #[cfg(not(unix))]
+    let is_venv_detect = path.contains("\\venv\\") || path.contains("\\.venv\\") ||
+                         path.contains("\\virtualenv\\") || path.contains("\\.virtualenv\\") ||
+                         path.contains("\\env\\Scripts\\");
+
+    #[cfg(unix)]
+    let env_type = if is_venv_detect {
         "venv"
     } else if path.contains("/conda") || path.contains("/anaconda") || path.contains("/miniconda") {
         "conda"
@@ -234,6 +284,20 @@ fn add_interpreter(
         "global"
     } else if path.contains("/opt/homebrew") || path.contains("/usr/local/Cellar") {
         "homebrew"
+    } else {
+        ""
+    };
+
+    #[cfg(not(unix))]
+    let env_type = if is_venv_detect {
+        "venv"
+    } else if path.contains("\\conda") || path.contains("\\anaconda") || path.contains("\\miniconda") ||
+              path.contains("\\Anaconda") || path.contains("\\Miniconda") {
+        "conda"
+    } else if path.contains("\\.pyenv\\") {
+        "pyenv"
+    } else if path.starts_with("C:\\Program Files") || path.starts_with("C:\\Python") {
+        "global"
     } else {
         ""
     };
@@ -264,7 +328,7 @@ fn add_interpreter(
 /// Check workspace venvs in current directory and parent directories
 fn check_workspace_venvs(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
     let venv_names = vec![".venv", "venv", ".virtualenv", "env"];
     // Only check "python" for venvs (not "python3") to avoid duplicates
@@ -320,7 +384,7 @@ fn check_workspace_venvs(
 /// Check for venvs in a specific directory
 fn check_venvs_in_directory(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
     dir: &std::path::Path,
     venv_names: &[&str],
     python_names: &[&str],
@@ -345,7 +409,7 @@ fn check_venvs_in_directory(
 /// Check VS Code settings for configured Python interpreter
 fn check_vscode_settings(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
     // Check .vscode/settings.json in current directory and parents
     if let Ok(current_dir) = std::env::current_dir() {
@@ -393,7 +457,7 @@ fn check_vscode_settings(
 /// Check virtualenvwrapper environments
 fn check_virtualenvwrapper(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
     // Check WORKON_HOME environment variable
     let workon_home = std::env::var("WORKON_HOME")
@@ -426,7 +490,7 @@ fn check_virtualenvwrapper(
 /// Check pyenv installations
 fn check_pyenv(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
     let pyenv_root = std::env::var("PYENV_ROOT")
         .ok()
@@ -456,7 +520,7 @@ fn check_pyenv(
 /// Check conda environments
 fn check_conda(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
     // Try to run conda env list
     if let Ok(output) = std::process::Command::new("conda")
@@ -468,7 +532,12 @@ fn check_conda(
                 if let Some(envs) = data.get("envs").and_then(|e| e.as_array()) {
                     for env_path in envs {
                         if let Some(env_str) = env_path.as_str() {
+                            #[cfg(unix)]
                             let python_path = format!("{}/bin/python", env_str);
+
+                            #[cfg(not(unix))]
+                            let python_path = format!("{}\\python.exe", env_str);
+
                             if std::path::Path::new(&python_path).exists() {
                                 let env_name = std::path::Path::new(env_str)
                                     .file_name()
@@ -493,8 +562,9 @@ fn check_conda(
 /// Check common system directories
 fn check_system_paths(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
+    #[cfg(unix)]
     let system_dirs = vec![
         "/usr/bin",
         "/usr/local/bin",
@@ -504,6 +574,28 @@ fn check_system_paths(
         "/opt/homebrew/bin",
         "/usr/local/Cellar/python*/*/bin",
     ];
+
+    #[cfg(not(unix))]
+    let system_dirs = {
+        let mut dirs = vec![
+            "C:\\Python*",
+            "C:\\Python*\\Scripts",
+            "C:\\Program Files\\Python*",
+            "C:\\Program Files\\Python*\\Scripts",
+        ];
+
+        // Add user-specific paths
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            dirs.push(Box::leak(format!("{}\\AppData\\Local\\Programs\\Python\\Python*", home).into_boxed_str()));
+            dirs.push(Box::leak(format!("{}\\AppData\\Local\\Programs\\Python\\Python*\\Scripts", home).into_boxed_str()));
+            dirs.push(Box::leak(format!("{}\\Anaconda3", home).into_boxed_str()));
+            dirs.push(Box::leak(format!("{}\\Anaconda3\\Scripts", home).into_boxed_str()));
+            dirs.push(Box::leak(format!("{}\\Miniconda3", home).into_boxed_str()));
+            dirs.push(Box::leak(format!("{}\\Miniconda3\\Scripts", home).into_boxed_str()));
+        }
+
+        dirs
+    };
 
     // Check common names first, then dynamically discover versioned pythons
     let priority_names = vec!["python3", "python"];
@@ -526,7 +618,7 @@ fn check_system_paths(
 fn check_pythons_in_dir(
     dir: &std::path::Path,
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
     if !dir.exists() {
         return;
@@ -541,6 +633,7 @@ fn check_pythons_in_dir(
             let name_str = file_name.to_string_lossy();
 
             // Match actual Python interpreters, not tools like python3-config, python3-coverage
+            #[cfg(unix)]
             let is_python = if let Some(rest) = name_str.strip_prefix("python") {
                 // After "python", must be: empty OR only digits and dots (version number)
                 // NOT dashes, letters, or other chars (e.g., python3.12-config has dash)
@@ -550,6 +643,16 @@ fn check_pythons_in_dir(
                 // Same for pypy
                 rest.is_empty() ||
                 rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+            } else {
+                false
+            };
+
+            #[cfg(not(unix))]
+            let is_python = if let Some(rest) = name_str.strip_prefix("python") {
+                // Windows: must end with .exe and have optional version numbers
+                rest == ".exe" || (rest.starts_with(|c: char| c.is_ascii_digit()) && rest.ends_with(".exe"))
+            } else if let Some(rest) = name_str.strip_prefix("pypy") {
+                rest == ".exe" || (rest.starts_with(|c: char| c.is_ascii_digit()) && rest.ends_with(".exe"))
             } else {
                 false
             };
@@ -593,7 +696,7 @@ fn check_pythons_in_dir(
 /// Check PATH environment variable for Python interpreters
 fn check_path_pythons(
     interpreters: &mut Vec<KernelInfo>,
-    seen_inodes: &mut std::collections::HashSet<(u64, u64)>,
+    seen_inodes: &mut SeenSet,
 ) {
     // Check common python names in PATH (system dirs already scanned all python* files)
     // This catches pythons in non-standard locations that are in PATH
