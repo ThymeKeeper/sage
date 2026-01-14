@@ -1009,9 +1009,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                                 editor.enable_repl_mode();
                                                 editor.status_message = Some((format!("Python mode enabled with {}", kernel_info.display_name), false));
                                             } else {
+                                                editor.enable_repl_mode();
                                                 editor.status_message = Some(("Python mode enabled. Press Ctrl+K to select a kernel.".to_string(), false));
                                             }
                                         } else {
+                                            editor.enable_repl_mode();
                                             editor.status_message = Some(("Python mode enabled but no Python found. Install Python first.".to_string(), true));
                                         }
                                     } else {
