@@ -693,12 +693,12 @@ impl Renderer {
                     // Red background for errors
                     write!(self.stdout,
                         "\x1b[{};1H\x1b[48;5;196m\x1b[38;5;15m{}\x1b[0m",
-                        height, status_line)?;
+                        status_row + 1, status_line)?;
                 } else {
                     // Normal dark grey background
                     write!(self.stdout,
                         "\x1b[{};1H\x1b[48;5;238m\x1b[38;5;15m{}\x1b[0m",
-                        height, status_line)?;
+                        status_row + 1, status_line)?;
                 }
                 self.last_status = status_line;
             }
@@ -846,6 +846,122 @@ impl Renderer {
         }
 
         self.stdout.flush()?;
+        Ok(())
+    }
+
+    /// Update only the status bar without redrawing the rest of the screen
+    /// This is used during execution to show elapsed time without causing flicker
+    pub fn update_status_bar_only(&mut self, editor: &Editor, bottom_window_height: usize) -> io::Result<()> {
+        let (width, height) = terminal::size()?;
+        let buffer = editor.buffer();
+
+        // Calculate status row position (same as in draw_with_bottom_window)
+        let status_row = (height - 1 - bottom_window_height as u16) as usize;
+
+        let modified_indicator = if editor.is_modified() { "*" } else { "" };
+        let read_only_indicator = if editor.is_read_only() { " [RO]" } else { "" };
+        let file_name = editor.file_name();
+        let (line, col) = editor.cursor_position();
+        let total_lines = buffer.len_lines();
+
+        // Check for status messages (errors)
+        let (status_msg, is_error) = if let Some((msg, is_err)) = &editor.status_message {
+            (msg.as_str(), *is_err)
+        } else {
+            ("", false)
+        };
+
+        let left_status = if !status_msg.is_empty() {
+            format!(" {} ", status_msg)
+        } else {
+            format!(" {}{}{} ", file_name, modified_indicator, read_only_indicator)
+        };
+
+        // Add language indicator
+        let language = editor.get_language();
+        let language_name = match language {
+            crate::syntax::Language::PlainText => "Plain",
+            crate::syntax::Language::Python => "Python",
+            crate::syntax::Language::Sql => "SQL",
+            crate::syntax::Language::Rust => "Rust",
+            crate::syntax::Language::R => "R",
+            crate::syntax::Language::Yaml => "YAML",
+            crate::syntax::Language::Markdown => "Markdown",
+            crate::syntax::Language::Json => "JSON",
+            crate::syntax::Language::Shell => "Shell",
+            crate::syntax::Language::Toml => "TOML",
+        };
+        let language_info = format!(" [{}] ", language_name);
+
+        // Add kernel info if in REPL mode
+        let mut kernel_info = if editor.is_repl_mode() {
+            if let Some(kernel_name) = editor.get_kernel_info() {
+                format!(" [{}] ", kernel_name)
+            } else {
+                " [No kernel] ".to_string()
+            }
+        } else {
+            String::new()
+        };
+
+        // Format the right status
+        let row_info = format!("{}/{}", line + 1, total_lines);
+        let right_status = format!(" {:>19}  {:>4} ", row_info, col + 1);
+
+        // Calculate available space and truncate kernel_info if needed
+        let min_width = left_status.len() + language_info.len() + right_status.len();
+        let max_kernel_width = if min_width < width as usize {
+            (width as usize).saturating_sub(min_width)
+        } else {
+            0
+        };
+
+        if kernel_info.len() > max_kernel_width {
+            if max_kernel_width > 4 {
+                let truncate_to = max_kernel_width.saturating_sub(3);
+                kernel_info = kernel_info.chars().take(truncate_to).collect::<String>() + "...";
+            } else {
+                kernel_info.clear();
+            }
+        }
+
+        let mut status_line = String::with_capacity(width as usize);
+        status_line.push_str(&left_status);
+        status_line.push_str(&language_info);
+        status_line.push_str(&kernel_info);
+
+        let used_width = left_status.chars().count() + language_info.chars().count() + kernel_info.chars().count() + right_status.chars().count();
+        let padding = if used_width < width as usize {
+            width as usize - used_width
+        } else {
+            0
+        };
+        for _ in 0..padding {
+            status_line.push(' ');
+        }
+        status_line.push_str(&right_status);
+
+        // Final safety check
+        let status_chars: Vec<char> = status_line.chars().collect();
+        if status_chars.len() > width as usize {
+            status_line = status_chars.iter().take(width as usize).collect();
+        }
+
+        // Only update if status changed
+        if status_line != self.last_status {
+            if is_error {
+                write!(self.stdout,
+                    "\x1b[{};1H\x1b[48;5;196m\x1b[38;5;15m{}\x1b[0m",
+                    status_row + 1, status_line)?;
+            } else {
+                write!(self.stdout,
+                    "\x1b[{};1H\x1b[48;5;238m\x1b[38;5;15m{}\x1b[0m",
+                    status_row + 1, status_line)?;
+            }
+            self.last_status = status_line;
+            self.stdout.flush()?;
+        }
+
         Ok(())
     }
 }

@@ -66,6 +66,7 @@ pub struct Editor {
     cells: Vec<Cell>,                  // Parsed cells for notebook mode
     kernel: Option<Box<dyn Kernel>>,   // Active Python kernel
     repl_mode: bool,                   // Whether we're in REPL mode
+    executing_kernel_name: Option<String>, // Kernel name while executing (kernel is temporarily taken)
 }
 
 impl Editor {
@@ -96,6 +97,7 @@ impl Editor {
             kernel: None,
             repl_mode: false,
             status_message_persistent: false,
+            executing_kernel_name: None,
         }
     }
 

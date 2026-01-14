@@ -84,10 +84,13 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Still executing - update status bar with elapsed time
+                    // Only update the status bar, not the entire screen (avoid output pane flicker)
                     if let Some(start_time) = execution_start_time {
                         let elapsed = start_time.elapsed().as_secs_f64();
                         editor.status_message = Some((format!("Executing... {:.1}s", elapsed), false));
-                        needs_redraw = true;
+                        // Use status-bar-only update to avoid output pane flicker on Windows
+                        let bottom_window_height = if output_pane_visible { output_pane_height } else { 0 };
+                        renderer.update_status_bar_only(editor, bottom_window_height)?;
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -989,9 +992,28 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             if language == syntax::Language::Python {
                                 // Enable REPL mode for Python
                                 if !editor.is_repl_mode() {
-                                    // If no kernel connected, prompt to select one
+                                    // If no kernel connected, auto-connect to first available kernel
                                     if !editor.is_kernel_connected() {
-                                        editor.status_message = Some(("Python mode enabled. Press Ctrl+K to select a kernel.".to_string(), false));
+                                        let kernels = kernel::discover_kernels();
+                                        if let Some(kernel_info) = kernels.into_iter().next() {
+                                            // Auto-connect to first kernel
+                                            let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(
+                                                direct_kernel::DirectKernel::new(
+                                                    kernel_info.python_path.clone(),
+                                                    kernel_info.name.clone(),
+                                                    kernel_info.display_name.clone()
+                                                )
+                                            );
+                                            if new_kernel.connect().is_ok() {
+                                                editor.set_kernel(new_kernel);
+                                                editor.enable_repl_mode();
+                                                editor.status_message = Some((format!("Python mode enabled with {}", kernel_info.display_name), false));
+                                            } else {
+                                                editor.status_message = Some(("Python mode enabled. Press Ctrl+K to select a kernel.".to_string(), false));
+                                            }
+                                        } else {
+                                            editor.status_message = Some(("Python mode enabled but no Python found. Install Python first.".to_string(), true));
+                                        }
                                     } else {
                                         editor.enable_repl_mode();
                                         editor.status_message = Some(("Switched to Python mode with REPL enabled".to_string(), false));
@@ -1199,8 +1221,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
                     }
                     KeyCode::PageUp => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) && output_pane_visible {
-                            // Shift+PageUp = Scroll output pane up
+                        if output_pane_visible && output_pane.is_focused() {
+                            // When output pane is focused, PageUp moves cursor up by a page
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.page_up(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) && output_pane_visible {
+                            // Shift+PageUp = Scroll output pane up (when editor focused)
                             output_pane.scroll_up();
                             needs_redraw = true;
                             commands::Command::None
@@ -1209,8 +1237,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
                     }
                     KeyCode::PageDown => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) && output_pane_visible {
-                            // Shift+PageDown = Scroll output pane down
+                        if output_pane_visible && output_pane.is_focused() {
+                            // When output pane is focused, PageDown moves cursor down by a page
+                            let with_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+                            output_pane.page_down(with_selection);
+                            needs_redraw = true;
+                            commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) && output_pane_visible {
+                            // Shift+PageDown = Scroll output pane down (when editor focused)
                             output_pane.scroll_down();
                             needs_redraw = true;
                             commands::Command::None

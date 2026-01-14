@@ -110,6 +110,26 @@ pub struct OutputPane {
     last_click_position: Option<(usize, usize)>, // Last click position (line, col)
     output_start_row: u16, // Starting row of output pane on screen
     preferred_column: Option<usize>, // Preferred column for vertical movement
+    // Track last render state to avoid redundant redraws on Windows
+    last_render_state: Option<OutputRenderState>,
+    // Per-line cache to avoid flickering on Windows (similar to renderer.rs)
+    #[cfg(target_os = "windows")]
+    last_screen: Vec<String>,
+}
+
+/// Tracks the state used for the last render to detect if redraw is needed
+#[derive(Clone, PartialEq)]
+struct OutputRenderState {
+    output_count: usize,
+    scroll_offset: usize,
+    horizontal_offset: usize,
+    focused: bool,
+    cursor_line: usize,
+    cursor_col: usize,
+    selection_start: Option<(usize, usize)>,
+    start_row: u16,
+    height: usize,
+    width: u16,
 }
 
 impl OutputPane {
@@ -131,6 +151,9 @@ impl OutputPane {
             last_click_position: None,
             output_start_row: 0,
             preferred_column: None,
+            last_render_state: None,
+            #[cfg(target_os = "windows")]
+            last_screen: Vec::new(),
         }
     }
 
@@ -179,6 +202,8 @@ impl OutputPane {
         self.outputs.push(entry);
         // Auto-scroll to bottom to show newest output
         self.scroll_to_bottom();
+        // Invalidate render cache so next draw will update
+        self.last_render_state = None;
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -193,9 +218,30 @@ impl OutputPane {
         self.selection_start = None;
     }
 
+    /// Disable auto-scroll mode and sync scroll_offset to the current view position.
+    /// This prevents the view from jumping when switching from auto-scroll to manual scroll.
+    fn disable_auto_scroll(&mut self) {
+        if self.auto_scroll {
+            let total_lines = self.count_total_lines();
+            // Sync scroll_offset to match what was being displayed in auto-scroll mode
+            self.scroll_offset = total_lines.saturating_sub(self.viewport_height);
+            self.auto_scroll = false;
+        }
+    }
+
     pub fn clear(&mut self) {
         self.outputs.clear();
         self.scroll_offset = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        self.selection_start = None;
+        self.auto_scroll = true;
+        // Invalidate render caches so next draw will update
+        self.last_render_state = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.last_screen.clear();
+        }
     }
 
     pub fn scroll_up(&mut self) {
@@ -211,6 +257,60 @@ impl OutputPane {
         } else {
             self.auto_scroll = true;
         }
+    }
+
+    /// Move cursor up by one page (viewport height)
+    pub fn page_up(&mut self, with_selection: bool) {
+        if with_selection && self.selection_start.is_none() {
+            self.selection_start = Some((self.cursor_line, self.cursor_col));
+        } else if !with_selection {
+            self.selection_start = None;
+        }
+
+        // Set preferred column if not already set
+        if self.preferred_column.is_none() {
+            self.preferred_column = Some(self.cursor_col);
+        }
+
+        // Move cursor up by viewport height
+        let page_size = self.viewport_height.max(1);
+        self.cursor_line = self.cursor_line.saturating_sub(page_size);
+
+        // Clamp cursor to new line length using preferred column
+        let target_col = self.preferred_column.unwrap();
+        let line_len = self.get_line_length(self.cursor_line);
+        self.cursor_col = target_col.min(line_len);
+
+        self.disable_auto_scroll();
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor down by one page (viewport height)
+    pub fn page_down(&mut self, with_selection: bool) {
+        if with_selection && self.selection_start.is_none() {
+            self.selection_start = Some((self.cursor_line, self.cursor_col));
+        } else if !with_selection {
+            self.selection_start = None;
+        }
+
+        // Set preferred column if not already set
+        if self.preferred_column.is_none() {
+            self.preferred_column = Some(self.cursor_col);
+        }
+
+        let total_lines = self.count_total_lines();
+        let page_size = self.viewport_height.max(1);
+
+        // Move cursor down by viewport height, clamping to last line
+        self.cursor_line = (self.cursor_line + page_size).min(total_lines.saturating_sub(1));
+
+        // Clamp cursor to new line length using preferred column
+        let target_col = self.preferred_column.unwrap();
+        let line_len = self.get_line_length(self.cursor_line);
+        self.cursor_col = target_col.min(line_len);
+
+        self.disable_auto_scroll();
+        self.ensure_cursor_visible();
     }
 
     /// Scroll horizontally by delta columns (positive = right, negative = left)
@@ -243,7 +343,7 @@ impl OutputPane {
             let line_len = self.get_line_length(self.cursor_line);
             self.cursor_col = target_col.min(line_len);
 
-            self.auto_scroll = false;
+            self.disable_auto_scroll();
             self.ensure_cursor_visible();
         }
     }
@@ -270,7 +370,7 @@ impl OutputPane {
             let line_len = self.get_line_length(self.cursor_line);
             self.cursor_col = target_col.min(line_len);
 
-            self.auto_scroll = false;
+            self.disable_auto_scroll();
             self.ensure_cursor_visible();
         }
     }
@@ -344,7 +444,7 @@ impl OutputPane {
         self.ensure_cursor_visible();
     }
 
-    /// Move cursor to previous word boundary
+    /// Move cursor to previous word boundary (stops at line start, doesn't cross lines)
     pub fn move_cursor_word_left(&mut self, with_selection: bool) {
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
@@ -382,18 +482,15 @@ impl OutputPane {
             }
 
             self.cursor_col = new_col;
-        } else if self.cursor_line > 0 {
-            // Move to end of previous line
-            self.cursor_line -= 1;
-            self.cursor_col = self.get_line_length(self.cursor_line);
         }
+        // Already at start of line - stay there (don't cross to previous line)
 
         self.preferred_column = None;
-        self.auto_scroll = false;
+        self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
 
-    /// Move cursor to next word boundary
+    /// Move cursor to next word boundary (stops at line end, doesn't cross lines)
     pub fn move_cursor_word_right(&mut self, with_selection: bool) {
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
@@ -435,17 +532,11 @@ impl OutputPane {
                 // No more words on this line, go to end of line
                 self.cursor_col = line_len;
             }
-        } else {
-            // Move to start of next line
-            let total_lines = self.count_total_lines();
-            if self.cursor_line + 1 < total_lines {
-                self.cursor_line += 1;
-                self.cursor_col = 0;
-            }
         }
+        // Already at end of line - stay there (don't cross to next line)
 
         self.preferred_column = None;
-        self.auto_scroll = false;
+        self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
 
@@ -484,7 +575,7 @@ impl OutputPane {
         }
 
         self.preferred_column = None;
-        self.auto_scroll = false;
+        self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
 
@@ -529,7 +620,7 @@ impl OutputPane {
         }
 
         self.preferred_column = None;
-        self.auto_scroll = false;
+        self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
 
@@ -725,47 +816,144 @@ impl OutputPane {
         // Save start row for mouse position calculations
         self.output_start_row = start_row;
 
-        // Clear all rows in the output pane area first (to handle resizing)
-        for row in start_row..=(start_row + height as u16) {
+        // Calculate the effective scroll offset for rendering
+        let total_lines = self.count_total_lines();
+        let display_lines = (height - 1) as usize;
+        let effective_scroll = if self.auto_scroll {
+            total_lines.saturating_sub(display_lines)
+        } else {
+            self.scroll_offset.min(total_lines.saturating_sub(1))
+        };
+
+        // On Windows, check if we actually need to redraw to avoid flicker
+        #[cfg(target_os = "windows")]
+        {
+            let current_state = OutputRenderState {
+                output_count: self.outputs.len(),
+                scroll_offset: effective_scroll,
+                horizontal_offset: self.horizontal_offset,
+                focused: self.focused,
+                cursor_line: self.cursor_line,
+                cursor_col: self.cursor_col,
+                selection_start: self.selection_start,
+                start_row,
+                height,
+                width,
+            };
+
+            if self.last_render_state.as_ref() == Some(&current_state) {
+                // Nothing changed, skip redraw entirely
+                return Ok(());
+            }
+
+            // Save current state for next comparison
+            self.last_render_state = Some(current_state);
+        }
+
+        // On Windows, use per-line caching to avoid flickering (similar to renderer.rs)
+        // Instead of clearing all rows first, we build each line with padding and only
+        // write lines that have changed from the cache.
+        #[cfg(target_os = "windows")]
+        {
+            // Ensure cache is sized correctly
+            let total_rows = height + 1;
+            if self.last_screen.len() != total_rows {
+                self.last_screen = vec![String::new(); total_rows];
+            }
+
+            // Build separator line with title
+            let title = if self.outputs.is_empty() {
+                " Output (Esc to focus, Ctrl+O to toggle, Ctrl+L to clear) "
+            } else {
+                " Output (Esc to focus, arrows/mouse to scroll, Ctrl+O/L to toggle/clear) "
+            };
+            // Build the complete first line: separator with title overlay (in cyan)
+            let line0 = format!("\x1b[90m──\x1b[36m{}\x1b[90m{}\x1b[0m",
+                title,
+                "─".repeat(width as usize - 2 - title.len()));
+
+            if self.last_screen.get(0) != Some(&line0) {
+                write!(writer, "\x1b[{};1H{}", start_row + 1, line0)?;
+                self.last_screen[0] = line0;
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Clear all rows in the output pane area first (to handle resizing)
+            for row in start_row..=(start_row + height as u16) {
+                execute!(
+                    writer,
+                    cursor::MoveTo(0, row),
+                    Clear(ClearType::CurrentLine)
+                )?;
+            }
+
+            // Draw separator line
             execute!(
                 writer,
-                cursor::MoveTo(0, row),
-                Clear(ClearType::CurrentLine)
+                cursor::MoveTo(0, start_row),
+                SetForegroundColor(Color::DarkGrey),
+                Print("─".repeat(width as usize)),
+                ResetColor
+            )?;
+
+            // Draw title
+            let title = if self.outputs.is_empty() {
+                " Output (Esc to focus, Ctrl+O to toggle, Ctrl+L to clear) "
+            } else {
+                " Output (Esc to focus, arrows/mouse to scroll, Ctrl+O/L to toggle/clear) "
+            };
+            execute!(
+                writer,
+                cursor::MoveTo(2, start_row),
+                SetForegroundColor(Color::Cyan),
+                Print(title),
+                ResetColor
             )?;
         }
 
-        // Draw separator line
-        execute!(
-            writer,
-            cursor::MoveTo(0, start_row),
-            SetForegroundColor(Color::DarkGrey),
-            Print("─".repeat(width as usize)),
-            ResetColor
-        )?;
-
-        // Draw title
-        let title = if self.outputs.is_empty() {
-            " Output (Esc to focus, Ctrl+O to toggle, Ctrl+L to clear) "
-        } else {
-            " Output (Esc to focus, arrows/mouse to scroll, Ctrl+O/L to toggle/clear) "
-        };
-        execute!(
-            writer,
-            cursor::MoveTo(2, start_row),
-            SetForegroundColor(Color::Cyan),
-            Print(title),
-            ResetColor
-        )?;
-
         if self.outputs.is_empty() {
+            // On Windows: Clear all content rows when empty (to handle clear() properly)
+            #[cfg(target_os = "windows")]
+            {
+                let empty_line = " ".repeat(width as usize);
+                for row_idx in 1..=height {
+                    let screen_row = start_row + row_idx as u16;
+                    // Check cache to avoid unnecessary writes
+                    let cache_idx = row_idx as usize;
+                    if cache_idx >= self.last_screen.len() || self.last_screen[cache_idx] != empty_line {
+                        write!(writer, "\x1b[{};1H{}", screen_row + 1, empty_line)?;
+                        if cache_idx < self.last_screen.len() {
+                            self.last_screen[cache_idx] = empty_line.clone();
+                        }
+                    }
+                }
+            }
+
             // Show hint
-            execute!(
-                writer,
-                cursor::MoveTo(2, start_row + 1),
-                SetForegroundColor(Color::DarkGrey),
-                Print("No output yet. Execute a cell with Ctrl+E or Ctrl+Enter"),
-                ResetColor
-            )?;
+            let hint = "No output yet. Execute a cell with Ctrl+E or Ctrl+Enter";
+            #[cfg(target_os = "windows")]
+            {
+                // Build hint with padding
+                let hint_line = format!("\x1b[90m  {}\x1b[0m{}", hint, " ".repeat(width as usize - 2 - hint.len()));
+                if self.last_screen.get(1) != Some(&hint_line) {
+                    write!(writer, "\x1b[{};1H{}", start_row + 2, hint_line)?;
+                    if self.last_screen.len() > 1 {
+                        self.last_screen[1] = hint_line;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                execute!(
+                    writer,
+                    cursor::MoveTo(2, start_row + 1),
+                    SetForegroundColor(Color::DarkGrey),
+                    Print(hint),
+                    ResetColor
+                )?;
+            }
             return Ok(());
         }
 
@@ -817,6 +1005,10 @@ impl OutputPane {
         let mut cursor_screen_col = None;
 
         // Draw lines starting from line_offset
+        // On Windows, we build complete ANSI strings and use per-line caching to avoid flicker
+        #[cfg(target_os = "windows")]
+        let mut screen_row_idx: usize = 1; // Start at 1 (row 0 is the separator/title)
+
         for (absolute_line_idx, (line_text, is_header, is_error)) in all_lines.iter().enumerate() {
             // Skip lines before line_offset
             if absolute_line_idx < line_offset {
@@ -849,6 +1041,7 @@ impl OutputPane {
                 String::new()
             };
             let visible_line = visible_line_owned.as_str();
+            let visible_line_display_len = display_width(visible_line);
 
             // Check if cursor is on this line
             let is_cursor_line = self.focused && absolute_line_idx == self.cursor_line;
@@ -866,89 +1059,208 @@ impl OutputPane {
                 cursor_screen_col = Some(screen_col.min(width - 1));
             }
 
-            // Draw line with selection highlighting
-            // Selection coordinates are in raw line coordinates (without indent)
-            // We need to translate them to full_line coordinates (with indent)
-            if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection_range {
-                if absolute_line_idx >= sel_start_line && absolute_line_idx <= sel_end_line {
-                    // This line has selection
-                    // Convert raw selection coordinates to full_line coordinates
-                    let raw_line_len = display_width(line_text);
-                    let (raw_sel_from, raw_sel_to) = if absolute_line_idx == sel_start_line && absolute_line_idx == sel_end_line {
-                        (sel_start_col, sel_end_col)
-                    } else if absolute_line_idx == sel_start_line {
-                        (sel_start_col, raw_line_len)
-                    } else if absolute_line_idx == sel_end_line {
-                        (0, sel_end_col)
+            // On Windows: Build complete line string with ANSI codes and use caching
+            #[cfg(target_os = "windows")]
+            {
+                let mut line_content = String::new();
+
+                // Calculate selection info for this line
+                let selection_info = if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection_range {
+                    if absolute_line_idx >= sel_start_line && absolute_line_idx <= sel_end_line {
+                        let raw_line_len = display_width(line_text);
+                        let (raw_sel_from, raw_sel_to) = if absolute_line_idx == sel_start_line && absolute_line_idx == sel_end_line {
+                            (sel_start_col, sel_end_col)
+                        } else if absolute_line_idx == sel_start_line {
+                            (sel_start_col, raw_line_len)
+                        } else if absolute_line_idx == sel_end_line {
+                            (0, sel_end_col)
+                        } else {
+                            (0, raw_line_len)
+                        };
+                        let full_sel_from = indent_len + raw_sel_from;
+                        let full_sel_to = indent_len + raw_sel_to;
+                        let vis_sel_from = if full_sel_from > h_offset { full_sel_from - h_offset } else { 0 };
+                        let vis_sel_to = if full_sel_to > h_offset { (full_sel_to - h_offset).min(visible_line_display_len) } else { 0 };
+                        Some((vis_sel_from.min(visible_line_display_len), vis_sel_to.min(visible_line_display_len)))
                     } else {
-                        (0, raw_line_len)
-                    };
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                    // Convert to full_line coordinates (add indent_len)
-                    let full_sel_from = indent_len + raw_sel_from;
-                    let full_sel_to = indent_len + raw_sel_to;
-
-                    // Translate selection to visible range (accounting for horizontal scroll)
-                    let vis_sel_from = if full_sel_from > h_offset {
-                        full_sel_from - h_offset
-                    } else {
-                        0
-                    };
-                    let visible_line_display_len = display_width(visible_line);
-                    let vis_sel_to = if full_sel_to > h_offset {
-                        (full_sel_to - h_offset).min(visible_line_display_len)
-                    } else {
-                        0
-                    };
-
-                    execute!(writer, cursor::MoveTo(0, current_row))?;
-
-                    // Use ANSI-aware slicing to properly handle colored text
-                    let vis_line_display_len = visible_line_display_len;
-                    let vis_sel_from = vis_sel_from.min(vis_line_display_len);
-                    let vis_sel_to = vis_sel_to.min(vis_line_display_len);
-
-                    // Draw before selection (using display-position-aware slicing)
+                // Build line content with colors
+                if let Some((vis_sel_from, vis_sel_to)) = selection_info {
+                    // Line has selection - build in parts
                     if vis_sel_from > 0 {
                         let before = slice_with_ansi(visible_line, 0, vis_sel_from);
-                        // Strip ANSI codes for selection rendering - we apply our own colors
                         let before_plain = strip_ansi(&before);
                         if *is_header {
-                            execute!(writer, SetForegroundColor(Color::Green), Print(before_plain), ResetColor)?;
+                            line_content.push_str("\x1b[32m"); // Green
+                            line_content.push_str(&before_plain);
+                            line_content.push_str("\x1b[0m");
                         } else if *is_error {
-                            execute!(writer, SetForegroundColor(Color::Red), Print(before_plain), ResetColor)?;
+                            line_content.push_str("\x1b[31m"); // Red
+                            line_content.push_str(&before_plain);
+                            line_content.push_str("\x1b[0m");
                         } else {
-                            execute!(writer, Print(before_plain))?;
+                            line_content.push_str(&before_plain);
                         }
                     }
-
-                    // Draw selection (teal background matching editor selection color)
                     if vis_sel_to > vis_sel_from {
                         let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
-                        // Strip ANSI codes - selection has its own styling
                         let selected_plain = strip_ansi(&selected);
-                        // Use RGB(55, 110, 112) background and RGB(0, 0, 0) foreground to match editor selection color
-                        execute!(writer, crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb { r: 55, g: 110, b: 112 }),
-                                 crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb { r: 0, g: 0, b: 0 }),
-                                 Print(selected_plain),
-                                 crossterm::style::ResetColor)?;
+                        // Selection: RGB(55, 110, 112) background, black foreground
+                        line_content.push_str("\x1b[48;2;55;110;112m\x1b[38;2;0;0;0m");
+                        line_content.push_str(&selected_plain);
+                        line_content.push_str("\x1b[0m");
                     }
-
-                    // Draw after selection
-                    if vis_sel_to < vis_line_display_len {
-                        let after = slice_with_ansi(visible_line, vis_sel_to, vis_line_display_len - vis_sel_to);
-                        // Strip ANSI codes for selection rendering - we apply our own colors
+                    if vis_sel_to < visible_line_display_len {
+                        let after = slice_with_ansi(visible_line, vis_sel_to, visible_line_display_len - vis_sel_to);
                         let after_plain = strip_ansi(&after);
                         if *is_header {
-                            execute!(writer, SetForegroundColor(Color::Green), Print(after_plain), ResetColor)?;
+                            line_content.push_str("\x1b[32m");
+                            line_content.push_str(&after_plain);
+                            line_content.push_str("\x1b[0m");
                         } else if *is_error {
-                            execute!(writer, SetForegroundColor(Color::Red), Print(after_plain), ResetColor)?;
+                            line_content.push_str("\x1b[31m");
+                            line_content.push_str(&after_plain);
+                            line_content.push_str("\x1b[0m");
                         } else {
-                            execute!(writer, Print(after_plain))?;
+                            line_content.push_str(&after_plain);
                         }
                     }
                 } else {
-                    // No selection on this line
+                    // No selection - simple colored line
+                    if *is_header {
+                        line_content.push_str("\x1b[32m"); // Green
+                        line_content.push_str(visible_line);
+                        line_content.push_str("\x1b[0m");
+                    } else if *is_error {
+                        line_content.push_str("\x1b[31m"); // Red
+                        line_content.push_str(visible_line);
+                        line_content.push_str("\x1b[0m");
+                    } else {
+                        line_content.push_str(visible_line);
+                    }
+                }
+
+                // Pad to full width to overwrite old content (this avoids needing to clear)
+                let current_display_len = display_width(&strip_ansi(&line_content));
+                if current_display_len < visible_width {
+                    for _ in current_display_len..visible_width {
+                        line_content.push(' ');
+                    }
+                }
+
+                // Only write if changed from cache
+                if screen_row_idx < self.last_screen.len() {
+                    if self.last_screen[screen_row_idx] != line_content {
+                        write!(writer, "\x1b[{};1H{}", current_row + 1, line_content)?;
+                        self.last_screen[screen_row_idx] = line_content;
+                    }
+                } else {
+                    write!(writer, "\x1b[{};1H{}", current_row + 1, line_content)?;
+                }
+                screen_row_idx += 1;
+            }
+
+            // On non-Windows: Use execute! macros as before
+            #[cfg(not(target_os = "windows"))]
+            {
+                // Draw line with selection highlighting
+                // Selection coordinates are in raw line coordinates (without indent)
+                // We need to translate them to full_line coordinates (with indent)
+                if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection_range {
+                    if absolute_line_idx >= sel_start_line && absolute_line_idx <= sel_end_line {
+                        // This line has selection
+                        // Convert raw selection coordinates to full_line coordinates
+                        let raw_line_len = display_width(line_text);
+                        let (raw_sel_from, raw_sel_to) = if absolute_line_idx == sel_start_line && absolute_line_idx == sel_end_line {
+                            (sel_start_col, sel_end_col)
+                        } else if absolute_line_idx == sel_start_line {
+                            (sel_start_col, raw_line_len)
+                        } else if absolute_line_idx == sel_end_line {
+                            (0, sel_end_col)
+                        } else {
+                            (0, raw_line_len)
+                        };
+
+                        // Convert to full_line coordinates (add indent_len)
+                        let full_sel_from = indent_len + raw_sel_from;
+                        let full_sel_to = indent_len + raw_sel_to;
+
+                        // Translate selection to visible range (accounting for horizontal scroll)
+                        let vis_sel_from = if full_sel_from > h_offset {
+                            full_sel_from - h_offset
+                        } else {
+                            0
+                        };
+                        let vis_sel_to = if full_sel_to > h_offset {
+                            (full_sel_to - h_offset).min(visible_line_display_len)
+                        } else {
+                            0
+                        };
+
+                        execute!(writer, cursor::MoveTo(0, current_row))?;
+
+                        // Use ANSI-aware slicing to properly handle colored text
+                        let vis_line_display_len = visible_line_display_len;
+                        let vis_sel_from = vis_sel_from.min(vis_line_display_len);
+                        let vis_sel_to = vis_sel_to.min(vis_line_display_len);
+
+                        // Draw before selection (using display-position-aware slicing)
+                        if vis_sel_from > 0 {
+                            let before = slice_with_ansi(visible_line, 0, vis_sel_from);
+                            // Strip ANSI codes for selection rendering - we apply our own colors
+                            let before_plain = strip_ansi(&before);
+                            if *is_header {
+                                execute!(writer, SetForegroundColor(Color::Green), Print(before_plain), ResetColor)?;
+                            } else if *is_error {
+                                execute!(writer, SetForegroundColor(Color::Red), Print(before_plain), ResetColor)?;
+                            } else {
+                                execute!(writer, Print(before_plain))?;
+                            }
+                        }
+
+                        // Draw selection (teal background matching editor selection color)
+                        if vis_sel_to > vis_sel_from {
+                            let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
+                            // Strip ANSI codes - selection has its own styling
+                            let selected_plain = strip_ansi(&selected);
+                            // Use RGB(55, 110, 112) background and RGB(0, 0, 0) foreground to match editor selection color
+                            execute!(writer, crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb { r: 55, g: 110, b: 112 }),
+                                     crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb { r: 0, g: 0, b: 0 }),
+                                     Print(selected_plain),
+                                     crossterm::style::ResetColor)?;
+                        }
+
+                        // Draw after selection
+                        if vis_sel_to < vis_line_display_len {
+                            let after = slice_with_ansi(visible_line, vis_sel_to, vis_line_display_len - vis_sel_to);
+                            // Strip ANSI codes for selection rendering - we apply our own colors
+                            let after_plain = strip_ansi(&after);
+                            if *is_header {
+                                execute!(writer, SetForegroundColor(Color::Green), Print(after_plain), ResetColor)?;
+                            } else if *is_error {
+                                execute!(writer, SetForegroundColor(Color::Red), Print(after_plain), ResetColor)?;
+                            } else {
+                                execute!(writer, Print(after_plain))?;
+                            }
+                        }
+                    } else {
+                        // No selection on this line
+                        execute!(writer, cursor::MoveTo(0, current_row))?;
+                        if *is_header {
+                            execute!(writer, SetForegroundColor(Color::Green), Print(visible_line), ResetColor)?;
+                        } else if *is_error {
+                            execute!(writer, SetForegroundColor(Color::Red), Print(visible_line), ResetColor)?;
+                        } else {
+                            execute!(writer, Print(visible_line))?;
+                        }
+                    }
+                } else {
+                    // No selection anywhere
                     execute!(writer, cursor::MoveTo(0, current_row))?;
                     if *is_header {
                         execute!(writer, SetForegroundColor(Color::Green), Print(visible_line), ResetColor)?;
@@ -958,19 +1270,25 @@ impl OutputPane {
                         execute!(writer, Print(visible_line))?;
                     }
                 }
-            } else {
-                // No selection anywhere
-                execute!(writer, cursor::MoveTo(0, current_row))?;
-                if *is_header {
-                    execute!(writer, SetForegroundColor(Color::Green), Print(visible_line), ResetColor)?;
-                } else if *is_error {
-                    execute!(writer, SetForegroundColor(Color::Red), Print(visible_line), ResetColor)?;
-                } else {
-                    execute!(writer, Print(visible_line))?;
-                }
             }
 
             current_row += 1;
+        }
+
+        // On Windows: Clear remaining rows if we have fewer lines than before
+        #[cfg(target_os = "windows")]
+        {
+            while screen_row_idx < self.last_screen.len() && current_row < max_row {
+                let empty_line = " ".repeat(width as usize);
+                if self.last_screen.get(screen_row_idx) != Some(&empty_line) {
+                    write!(writer, "\x1b[{};1H{}", current_row + 1, empty_line)?;
+                    if screen_row_idx < self.last_screen.len() {
+                        self.last_screen[screen_row_idx] = empty_line;
+                    }
+                }
+                screen_row_idx += 1;
+                current_row += 1;
+            }
         }
 
         // Show scroll indicator if not showing all lines
@@ -1123,7 +1441,7 @@ impl OutputPane {
                     self.cursor_col = col;
                     self.selection_start = None;
                     self.mouse_selecting = true;
-                    self.auto_scroll = false;
+                    self.disable_auto_scroll();
                     self.preferred_column = None;
                     self.ensure_cursor_visible();
                 }
@@ -1141,45 +1459,36 @@ impl OutputPane {
 
             // Handle dragging above the output pane (scroll up)
             if screen_row < self.output_start_row as usize + 1 {
+                // Sync scroll_offset before manual adjustment
+                self.disable_auto_scroll();
                 // Move cursor to first visible line
                 if self.scroll_offset > 0 {
                     self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 }
-                let total_lines = self.count_total_lines();
-                let line_offset = if self.auto_scroll {
-                    total_lines.saturating_sub(self.viewport_height)
-                } else {
-                    self.scroll_offset.min(total_lines.saturating_sub(1))
-                };
-                self.cursor_line = line_offset;
+                self.cursor_line = self.scroll_offset;
                 self.cursor_col = 0;
-                self.auto_scroll = false;
             }
             // Handle dragging below the output pane (scroll down)
             else if screen_row >= self.output_start_row as usize + self.viewport_height {
+                // Sync scroll_offset before manual adjustment
+                self.disable_auto_scroll();
                 // Move cursor to last visible line and scroll down
                 let total_lines = self.count_total_lines();
                 if self.scroll_offset + self.viewport_height < total_lines {
                     self.scroll_offset += 1;
                 }
-                let line_offset = if self.auto_scroll {
-                    total_lines.saturating_sub(self.viewport_height)
-                } else {
-                    self.scroll_offset.min(total_lines.saturating_sub(1))
-                };
-                self.cursor_line = (line_offset + self.viewport_height - 1).min(total_lines.saturating_sub(1));
+                self.cursor_line = (self.scroll_offset + self.viewport_height - 1).min(total_lines.saturating_sub(1));
                 let lines = self.get_all_lines();
                 if self.cursor_line < lines.len() {
                     self.cursor_col = display_width(&lines[self.cursor_line].0);
                 }
-                self.auto_scroll = false;
             }
             // Normal case: mouse is within the output pane
             else if let Some((line, col)) = self.screen_to_position(screen_col, screen_row) {
                 // Update cursor to current mouse position
                 self.cursor_line = line;
                 self.cursor_col = col;
-                self.auto_scroll = false;
+                self.disable_auto_scroll();
                 self.ensure_cursor_visible_with_scrolloff();
             }
         }
@@ -1229,7 +1538,7 @@ impl OutputPane {
             self.selection_start = Some((line, start_col));
             self.cursor_line = line;
             self.cursor_col = end_col;
-            self.auto_scroll = false;
+            self.disable_auto_scroll();
             self.ensure_cursor_visible();
         }
     }
@@ -1248,7 +1557,7 @@ impl OutputPane {
         self.selection_start = Some((line, 0));
         self.cursor_line = line;
         self.cursor_col = line_len;
-        self.auto_scroll = false;
+        self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
 }

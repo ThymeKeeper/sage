@@ -23,16 +23,22 @@ impl Editor {
 
     /// Set the active kernel
     pub fn set_kernel(&mut self, kernel: Box<dyn Kernel>) {
+        self.executing_kernel_name = None; // Clear executing name since kernel is back
         self.kernel = Some(kernel);
     }
 
-    /// Get kernel info
+    /// Get kernel info (returns executing kernel name if kernel is temporarily taken)
     pub fn get_kernel_info(&self) -> Option<String> {
         self.kernel.as_ref().map(|k| k.info().display_name)
+            .or_else(|| self.executing_kernel_name.clone())
     }
 
     /// Take ownership of the kernel (for background execution)
+    /// Stores the kernel name so get_kernel_info() still works during execution
     pub fn take_kernel(&mut self) -> Option<Box<dyn Kernel>> {
+        if let Some(ref kernel) = self.kernel {
+            self.executing_kernel_name = Some(kernel.info().display_name.clone());
+        }
         self.kernel.take()
     }
 
