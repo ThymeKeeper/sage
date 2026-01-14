@@ -19,6 +19,7 @@ pub enum SyntaxState {
     SqlFunction,        // SQL functions within strings (COUNT, SUM, etc.)
     SqlNumber,          // SQL numeric literals within strings
     SqlText,            // SQL string content (non-keyword text, spaces, punctuation)
+    SqlComment,         // SQL comments within strings (-- or /* */)
 }
 
 /// Language type for syntax highlighting
@@ -393,7 +394,7 @@ impl SyntaxHighlighter {
     }
 
     /// Tokenize SQL content within a string
-    /// Returns spans for SQL keywords, functions, and numbers
+    /// Returns spans for SQL keywords, functions, numbers, and comments
     fn tokenize_sql_content(&self, content: &str, string_start: usize) -> Vec<HighlightSpan> {
         let mut spans = Vec::new();
         let mut char_indices = content.char_indices().peekable();
@@ -402,6 +403,62 @@ impl SyntaxHighlighter {
             // Skip whitespace
             if ch.is_whitespace() {
                 continue;
+            }
+
+            // Check for -- line comment
+            if ch == '-' {
+                if let Some(&(_, next_ch)) = char_indices.peek() {
+                    if next_ch == '-' {
+                        let start = byte_pos;
+                        char_indices.next(); // consume second '-'
+
+                        // Consume until end of line or end of content
+                        let mut end = byte_pos + 2; // "--"
+                        while let Some(&(next_pos, next_ch)) = char_indices.peek() {
+                            if next_ch == '\n' || next_ch == '\r' {
+                                break;
+                            }
+                            end = next_pos + next_ch.len_utf8();
+                            char_indices.next();
+                        }
+
+                        spans.push(HighlightSpan {
+                            start: string_start + start,
+                            end: string_start + end,
+                            state: SyntaxState::SqlComment,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Check for /* block comment */
+            if ch == '/' {
+                if let Some(&(_, next_ch)) = char_indices.peek() {
+                    if next_ch == '*' {
+                        let start = byte_pos;
+                        char_indices.next(); // consume '*'
+
+                        // Consume until */ or end of content
+                        let mut end = byte_pos + 2; // "/*"
+                        let mut prev_ch = '*';
+                        while let Some(&(next_pos, next_ch)) = char_indices.peek() {
+                            end = next_pos + next_ch.len_utf8();
+                            char_indices.next();
+                            if prev_ch == '*' && next_ch == '/' {
+                                break;
+                            }
+                            prev_ch = next_ch;
+                        }
+
+                        spans.push(HighlightSpan {
+                            start: string_start + start,
+                            end: string_start + end,
+                            state: SyntaxState::SqlComment,
+                        });
+                        continue;
+                    }
+                }
             }
 
             // Check for numbers

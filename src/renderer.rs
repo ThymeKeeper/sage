@@ -369,6 +369,10 @@ impl Renderer {
                                                 // Pale spring green for SQL text/identifiers
                                                 formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
                                             }
+                                            SyntaxState::SqlComment => {
+                                                // Dark green for SQL comments
+                                                formatted_line.push_str("\x1b[38;2;80;130;90m"); // #50825A
+                                            }
                                             SyntaxState::Normal => {
                                                 // Bright neutral grey for normal text
                                                 formatted_line.push_str("\x1b[38;2;165;162;157m"); // #A5A29D
@@ -464,6 +468,10 @@ impl Renderer {
                                             SyntaxState::SqlText => {
                                                 // Pale spring green for SQL text/identifiers
                                                 formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
+                                            }
+                                            SyntaxState::SqlComment => {
+                                                // Dark green for SQL comments
+                                                formatted_line.push_str("\x1b[38;2;80;130;90m"); // #50825A
                                             }
                                             SyntaxState::Normal => {
                                                 // Bright neutral grey for normal text
