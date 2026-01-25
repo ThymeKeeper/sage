@@ -3,7 +3,7 @@ use crate::commands::Command;
 use crate::syntax::SyntaxHighlighter;
 use crate::cell::{Cell, parse_cells};
 use crate::kernel::Kernel;
-use arboard::Clipboard;
+use crate::clipboard::ClipboardProvider;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,7 +48,7 @@ pub struct Editor {
     modified: bool,
     viewport_offset: (usize, usize),  // (row, col) offset for scrolling
     last_saved_undo_len: usize,       // Track save point for modified flag
-    clipboard: Clipboard,             // System clipboard
+    clipboard: ClipboardProvider,      // System clipboard (supports native + OSC 52 for SSH)
     mouse_selecting: bool,            // Track if we're actively selecting with mouse
     last_click_time: Option<Instant>, // Track time of last click for double/triple click
     last_click_position: Option<usize>, // Track position of last click
@@ -80,7 +80,7 @@ impl Editor {
             modified: false,
             viewport_offset: (0, 0),
             last_saved_undo_len: 0,
-            clipboard: Clipboard::new().expect("Failed to access clipboard"),
+            clipboard: ClipboardProvider::new(),
             mouse_selecting: false,
             last_click_time: None,
             last_click_position: None,
@@ -1002,7 +1002,7 @@ impl Editor {
             Command::Copy => {
                 if let Some(text) = self.get_selected_text() {
                     if let Err(e) = self.clipboard.set_text(text) {
-                        eprintln!("Failed to copy to clipboard: {}", e);
+                        self.status_message = Some((format!("Copy failed: {}", e), true));
                     }
                 }
             }
@@ -1010,7 +1010,7 @@ impl Editor {
             Command::Cut => {
                 if let Some(text) = self.get_selected_text() {
                     if let Err(e) = self.clipboard.set_text(text) {
-                        eprintln!("Failed to copy to clipboard: {}", e);
+                        self.status_message = Some((format!("Cut failed: {}", e), true));
                     } else {
                         self.delete_selection();
                     }
@@ -1022,17 +1022,17 @@ impl Editor {
                     Ok(text) => {
                         // Delete selection first if any
                         self.delete_selection();
-                        
+
                         // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
                         let text = Self::normalize_text(text);
-                        
+
                         let line_before = self.buffer.byte_to_line(self.cursor);
                         let cursor_before = self.cursor;
                         self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());
                         self.cursor += text.len();
                         self.modified = true;
                         self.preferred_column = None; // Clear preferred column
-                        
+
                         // Update syntax - check if we added newlines
                         let line_after = self.buffer.byte_to_line(self.cursor);
                         if line_after > line_before {
@@ -1042,7 +1042,7 @@ impl Editor {
                         self.syntax.line_modified(line_before);
                     }
                     Err(e) => {
-                        eprintln!("Failed to paste from clipboard: {}", e);
+                        self.status_message = Some((format!("Paste failed: {}", e), true));
                     }
                 }
             }

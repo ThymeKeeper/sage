@@ -16,6 +16,7 @@ mod autocomplete;
 mod event_loop;
 mod sql_context;
 mod help_screen;
+mod clipboard;
 
 use kernel::Kernel;
 
