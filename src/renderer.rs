@@ -315,16 +315,6 @@ impl Renderer {
                                         // Dim version of selection background for matching text
                                         formatted_line.push_str("\x1b[48;5;23m"); // Dimmer teal
                                     } else {
-                                        // Check if we're in SQL context (for background color)
-                                        let is_sql = matches!(syntax_state,
-                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
-                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
-
-                                        // Apply SQL background if in SQL context
-                                        if is_sql {
-                                            formatted_line.push_str("\x1b[48;5;236m"); // Dark grey-blue background for SQL
-                                        }
-
                                         // Apply syntax highlighting colors - ANSI 16/256 colors
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
@@ -391,19 +381,9 @@ impl Renderer {
                                         // Reset background
                                         formatted_line.push_str("\x1b[49m");
                                         formatted_line.push_str(line_bg_color); // Restore line background
-                                    } else {
-                                        // Check if we're in SQL context to reset background
-                                        let is_sql = matches!(syntax_state,
-                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
-                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
-                                        if is_sql {
-                                            // Reset both foreground and background for SQL
-                                            formatted_line.push_str("\x1b[0m");
-                                            formatted_line.push_str(line_bg_color);
-                                        } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
-                                            // Reset color after syntax-highlighted character
-                                            formatted_line.push_str("\x1b[39m"); // Reset foreground only
-                                        }
+                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
+                                        // Reset color after syntax-highlighted character
+                                        formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
                                 }
                                 
@@ -425,16 +405,6 @@ impl Renderer {
                                         // Dim version of selection background for matching text
                                         formatted_line.push_str("\x1b[48;5;23m"); // Dimmer teal
                                     } else {
-                                        // Check if we're in SQL context (for background color)
-                                        let is_sql = matches!(syntax_state,
-                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
-                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
-
-                                        // Apply SQL background if in SQL context
-                                        if is_sql {
-                                            formatted_line.push_str("\x1b[48;5;236m"); // Dark grey-blue background for SQL
-                                        }
-
                                         // Apply syntax highlighting colors - ANSI 16/256 colors
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
@@ -501,19 +471,9 @@ impl Renderer {
                                         // Reset background
                                         formatted_line.push_str("\x1b[49m");
                                         formatted_line.push_str(line_bg_color); // Restore line background
-                                    } else {
-                                        // Check if we're in SQL context to reset background
-                                        let is_sql = matches!(syntax_state,
-                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
-                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
-                                        if is_sql {
-                                            // Reset both foreground and background for SQL
-                                            formatted_line.push_str("\x1b[0m");
-                                            formatted_line.push_str(line_bg_color);
-                                        } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
-                                            // Reset color after syntax-highlighted character
-                                            formatted_line.push_str("\x1b[39m"); // Reset foreground only
-                                        }
+                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
+                                        // Reset color after syntax-highlighted character
+                                        formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
                                 }
                                 
