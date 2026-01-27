@@ -18,28 +18,6 @@ mod viewport;
 mod matching;
 mod notebook;
 
-/// Token type for word boundary detection
-#[derive(Debug, PartialEq, Copy, Clone)]
-enum TokenType {
-    Word,      // Alphanumeric and underscore
-    Operator,  // Programming operators
-    Space,     // Whitespace
-    Other,     // Everything else
-}
-
-/// Categorize a character into a token type for word navigation
-fn get_token_type(ch: char) -> TokenType {
-    if ch.is_alphanumeric() || ch == '_' {
-        TokenType::Word
-    } else if ch.is_whitespace() {
-        TokenType::Space
-    } else if ">=<!=+-*/%&|^~.".contains(ch) {
-        TokenType::Operator
-    } else {
-        TokenType::Other
-    }
-}
-
 pub struct Editor {
     buffer: Buffer,
     cursor: usize,           // Byte position in the buffer
@@ -707,94 +685,42 @@ impl Editor {
             }
             
             Command::SelectWordLeft => {
+                // Set selection anchor if not already set
                 if self.selection_start.is_none() {
-                    // First, we need to adjust the anchor position based on current token
-                    let current_line = self.buffer.byte_to_line(self.cursor);
-                    let line_start = self.buffer.line_to_byte(current_line);
-                    let line_text = self.buffer.line(current_line);
-                    let cursor_in_line = self.cursor - line_start;
-                    
-                    // Find the end of the current token
-                    let mut anchor_pos = self.cursor;
-                    
-                    // Build token list to find current token boundaries
-                    let mut tokens = Vec::new();
-                    let mut byte_pos = 0;
-                    let mut current_token_start = 0;
-                    let mut last_token_type = None;
-                    
-                    for ch in line_text.chars() {
-                        let token_type = get_token_type(ch);
-                        
-                        if last_token_type.is_none() || last_token_type != Some(token_type) {
-                            if last_token_type.is_some() {
-                                tokens.push((current_token_start, byte_pos, last_token_type.unwrap()));
-                            }
-                            current_token_start = byte_pos;
-                            last_token_type = Some(token_type);
-                        }
-                        
-                        byte_pos += ch.len_utf8();
-                    }
-                    
-                    // Don't forget the last token
-                    if last_token_type.is_some() {
-                        tokens.push((current_token_start, byte_pos, last_token_type.unwrap()));
-                    }
-                    
-                    // Find which token contains the cursor and use its end
-                    for &(start, end, _token_type) in &tokens {
-                        if cursor_in_line >= start && cursor_in_line < end {
-                            anchor_pos = line_start + end;
-                            break;
-                        }
-                    }
-                    
-                    self.selection_start = Some(anchor_pos);
+                    self.selection_start = Some(self.cursor);
                 }
-                
+
+                // Use same word boundary logic as MoveWordLeft
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 let line_start = self.buffer.line_to_byte(current_line);
                 let line_text = self.buffer.line(current_line);
                 let cursor_in_line = self.cursor - line_start;
-                
+
                 if cursor_in_line > 0 {
-                    // Build a list of tokens with their positions
-                    let mut tokens = Vec::new();
+                    // Find the previous word boundary within the current line
+                    let mut new_pos = 0;
+                    let mut in_word = false;
                     let mut byte_pos = 0;
-                    let mut current_token_start = 0;
-                    let mut last_token_type = None;
-                    
+
                     for ch in line_text.chars() {
-                        let token_type = get_token_type(ch);
-                        
-                        // Check if we're starting a new token
-                        if last_token_type.is_none() || last_token_type != Some(token_type) {
-                            if last_token_type.is_some() && last_token_type != Some(TokenType::Space) {
-                                tokens.push((current_token_start, byte_pos));
-                            }
-                            current_token_start = byte_pos;
-                            last_token_type = Some(token_type);
-                        }
-                        
-                        byte_pos += ch.len_utf8();
-                    }
-                    
-                    // Don't forget the last token if it's not a space
-                    if last_token_type.is_some() && last_token_type != Some(TokenType::Space) {
-                        tokens.push((current_token_start, byte_pos));
-                    }
-                    
-                    // Find the token to move to
-                    let mut target_pos = 0;
-                    for &(start, _end) in &tokens {
-                        if start >= cursor_in_line {
+                        if byte_pos >= cursor_in_line {
                             break;
                         }
-                        target_pos = start;
+
+                        if ch.is_alphanumeric() || ch == '_' {
+                            if !in_word {
+                                // Start of a new word
+                                new_pos = byte_pos;
+                                in_word = true;
+                            }
+                        } else {
+                            in_word = false;
+                        }
+
+                        byte_pos += ch.len_utf8();
                     }
-                    
-                    self.cursor = line_start + target_pos;
+
+                    self.cursor = line_start + new_pos;
                 } else {
                     // Already at start of line, stay there
                     self.cursor = line_start;
@@ -804,127 +730,46 @@ impl Editor {
             }
             
             Command::SelectWordRight => {
+                // Set selection anchor if not already set
                 if self.selection_start.is_none() {
-                    // First, we need to adjust the anchor position based on current token
-                    let current_line = self.buffer.byte_to_line(self.cursor);
-                    let line_start = self.buffer.line_to_byte(current_line);
-                    let line_text = self.buffer.line(current_line);
-                    let cursor_in_line = self.cursor - line_start;
-                    
-                    // Find the start of the current token
-                    let mut anchor_pos = self.cursor;
-                    if cursor_in_line > 0 {
-                        let mut byte_pos = 0;
-                        let mut current_token_start = 0;
-                        let mut current_token_type = None;
-                        let mut cursor_token_type = None;
-                        let mut cursor_token_start = 0;
-                        
-                        // First, determine what token the cursor is in
-                        for ch in line_text.chars() {
-                            let token_type = get_token_type(ch);
-                            
-                            if byte_pos <= cursor_in_line && byte_pos + ch.len_utf8() > cursor_in_line {
-                                cursor_token_type = Some(token_type);
-                                cursor_token_start = current_token_start;
-                            }
-                            
-                            if current_token_type != Some(token_type) {
-                                current_token_start = byte_pos;
-                                current_token_type = Some(token_type);
-                            }
-                            
-                            byte_pos += ch.len_utf8();
-                        }
-                        
-                        // Special handling for spaces
-                        if cursor_token_type == Some(TokenType::Space) {
-                            // Check if we're in indentation spaces
-                            let mut is_indentation = true;
-                            let mut check_pos = 0;
-                            for ch in line_text.chars() {
-                                if check_pos >= cursor_token_start {
-                                    break;
-                                }
-                                if ch != ' ' && ch != '\t' {
-                                    is_indentation = false;
-                                    break;
-                                }
-                                check_pos += ch.len_utf8();
-                            }
-                            
-                            if !is_indentation {
-                                // For non-indentation spaces, move to end of spaces
-                                let mut pos = cursor_token_start;
-                                for ch in line_text[cursor_token_start..].chars() {
-                                    if get_token_type(ch) != TokenType::Space {
-                                        break;
-                                    }
-                                    pos += ch.len_utf8();
-                                }
-                                anchor_pos = line_start + pos;
-                            } else {
-                                // For indentation spaces, use start of token
-                                anchor_pos = line_start + cursor_token_start;
-                            }
-                        } else {
-                            // For other tokens, move to beginning of token
-                            anchor_pos = line_start + cursor_token_start;
-                        }
-                    }
-                    
-                    self.selection_start = Some(anchor_pos);
+                    self.selection_start = Some(self.cursor);
                 }
-                
+
+                // Use same word boundary logic as MoveWordRight
                 let current_line = self.buffer.byte_to_line(self.cursor);
                 let line_start = self.buffer.line_to_byte(current_line);
                 let line_text = self.buffer.line(current_line);
                 let cursor_in_line = self.cursor - line_start;
-                
+
                 // Remove trailing newline from line text for processing
                 let line_without_newline = if line_text.ends_with('\n') {
                     &line_text[..line_text.len() - 1]
                 } else {
                     &line_text
                 };
-                
+
                 if cursor_in_line < line_without_newline.len() {
-                    // Build a list of tokens with their positions
-                    let mut tokens = Vec::new();
+                    // Find the next word boundary within the current line
+                    let mut in_word = false;
+                    let mut found_next_word = false;
                     let mut byte_pos = 0;
-                    let mut current_token_start = 0;
-                    let mut last_token_type = None;
-                    
+
                     for ch in line_without_newline.chars() {
-                        let token_type = get_token_type(ch);
-                        
-                        // Check if we're starting a new token
-                        if last_token_type.is_none() || last_token_type != Some(token_type) {
-                            if last_token_type.is_some() && last_token_type != Some(TokenType::Space) {
-                                tokens.push((current_token_start, byte_pos));
-                            }
-                            current_token_start = byte_pos;
-                            last_token_type = Some(token_type);
-                        }
-                        
-                        byte_pos += ch.len_utf8();
-                    }
-                    
-                    // Don't forget the last token if it's not a space
-                    if last_token_type.is_some() && last_token_type != Some(TokenType::Space) {
-                        tokens.push((current_token_start, byte_pos));
-                    }
-                    
-                    // Find the next token end after cursor position
-                    let mut target_pos = line_without_newline.len();
-                    for &(_start, end) in &tokens {
-                        if end > cursor_in_line {
-                            target_pos = end;
+                        if byte_pos > cursor_in_line && !in_word && (ch.is_alphanumeric() || ch == '_') {
+                            // Found start of next word
+                            self.cursor = line_start + byte_pos;
+                            found_next_word = true;
                             break;
                         }
+
+                        in_word = ch.is_alphanumeric() || ch == '_';
+                        byte_pos += ch.len_utf8();
                     }
-                    
-                    self.cursor = line_start + target_pos;
+
+                    if !found_next_word {
+                        // No more words on this line, go to end of line
+                        self.cursor = line_start + line_without_newline.len();
+                    }
                 } else {
                     // Already at end of line, stay there
                     self.cursor = line_start + line_without_newline.len();
