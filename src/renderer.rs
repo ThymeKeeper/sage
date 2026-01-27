@@ -47,7 +47,7 @@ impl Renderer {
         
         // Set consistent background color regardless of how we're launched
         // This ensures the same appearance whether launched from terminal or Explorer
-        write!(stdout, "\x1b[48;2;30;30;30m")?; // Background color RGB(30,30,30)
+        write!(stdout, "\x1b[48;5;234m")?; // Background color RGB(30,30,30)
         execute!(stdout, Clear(ClearType::All))?;
         write!(stdout, "\x1b[0m")?; // Reset after clear
         
@@ -128,7 +128,7 @@ impl Renderer {
             self.last_status.clear();
             self.last_cursor_style = CursorStyle::Block; // Force cursor style refresh on resize
             // Maintain consistent background on resize
-            write!(self.stdout, "\x1b[48;2;30;30;30m")?; // Background color RGB(30,30,30)
+            write!(self.stdout, "\x1b[48;5;234m")?; // Background color RGB(30,30,30)
             execute!(self.stdout, Clear(ClearType::All))?;
             write!(self.stdout, "\x1b[0m")?; // Reset after clear
             #[cfg(target_os = "windows")]
@@ -196,8 +196,8 @@ impl Renderer {
                 // Virtual lines before the buffer - respect horizontal scrolling
                 if viewport_offset.1 == 0 {
                     // Only show the ~ if we're not horizontally scrolled
-                    line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
-                    line_content.push_str("\x1b[38;2;110;110;110m"); // Dim grey like comments
+                    line_content.push_str("\x1b[48;5;234m"); // Consistent background
+                    line_content.push_str("\x1b[90m"); // Dim grey (ANSI dark gray) like comments
                     line_content.push('~');
                     line_content.push_str("\x1b[39m"); // Reset foreground color
                     for _ in 1..width {
@@ -206,7 +206,7 @@ impl Renderer {
                     line_content.push_str("\x1b[0m");
                 } else {
                     // If horizontally scrolled, show all spaces
-                    line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
+                    line_content.push_str("\x1b[48;5;234m"); // Consistent background
                     for _ in 0..width {
                         line_content.push(' ');
                     }
@@ -236,9 +236,9 @@ impl Renderer {
                     // Check if this is the current line
                     let is_current_line = file_row == editor.cursor_position().0;
                     let line_bg_color = if is_current_line {
-                        "\x1b[48;2;40;40;40m" // Current line background RGB(40,40,40)
+                        "\x1b[48;5;237m" // Current line background RGB(40,40,40)
                     } else {
-                        "\x1b[48;2;30;30;30m" // Normal background RGB(30,30,30)
+                        "\x1b[48;5;234m" // Normal background RGB(30,30,30)
                     };
                     formatted_line.push_str(line_bg_color); // Set line background
                     let mut byte_pos = line_byte_start;
@@ -300,82 +300,82 @@ impl Renderer {
                                 #[cfg(target_os = "windows")]
                                 {
                                     if is_selected {
-                                        // Use same cadet blue as cursor (#5F9EA0) with black text
-                                        formatted_line.push_str("\x1b[48;2;55;110;112m\x1b[38;2;0;0;0m"); // RGB background + black foreground (dimmer than caret)
+                                        // Selection: use ANSI 256 color for teal background with black text
+                                        formatted_line.push_str("\x1b[48;5;30m\x1b[30m"); // Teal background + black foreground
                                     } else if is_current_find_match {
                                         // Bright orange background for current find match
-                                        formatted_line.push_str("\x1b[48;2;200;150;100m\x1b[38;2;0;0;0m"); // Bright orange + black text
+                                        formatted_line.push_str("\x1b[48;5;172m\x1b[30m"); // Orange + black text
                                     } else if is_find_match {
                                         // Dimmer orange background for other find matches
-                                        formatted_line.push_str("\x1b[48;2;120;90;60m"); // Dim orange background
+                                        formatted_line.push_str("\x1b[48;5;94m"); // Dim orange background
                                     } else if is_matching_bracket {
                                         // Bright yellow for matching brackets
-                                        formatted_line.push_str("\x1b[38;2;220;220;120m\x1b[1m"); // Bright yellow + bold
+                                        formatted_line.push_str("\x1b[93m\x1b[1m"); // Bright yellow + bold
                                     } else if is_matching_text {
                                         // Dim version of selection background for matching text
-                                        formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
+                                        formatted_line.push_str("\x1b[48;5;23m"); // Dimmer teal
                                     } else {
-                                        // Apply syntax highlighting colors - desaturated greys with strong brightness and hue distinction
+                                        // Check if we're in SQL context (for background color)
+                                        let is_sql = matches!(syntax_state,
+                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
+                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
+
+                                        // Apply SQL background if in SQL context
+                                        if is_sql {
+                                            formatted_line.push_str("\x1b[48;5;236m"); // Dark grey-blue background for SQL
+                                        }
+
+                                        // Apply syntax highlighting colors - ANSI 16/256 colors
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                // Medium grey with pronounced warm hint for strings
-                                                formatted_line.push_str("\x1b[38;2;135;128;115m"); // #878073
+                                                formatted_line.push_str("\x1b[33m"); // Yellow for strings
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Medium grey for comments
-                                                formatted_line.push_str("\x1b[38;2;101;101;101m"); // #656565
+                                                formatted_line.push_str("\x1b[90m"); // Bright black (dark gray) for comments
                                             }
                                             SyntaxState::Keyword => {
-                                                // Bright grey with strong warm hint for keywords
-                                                formatted_line.push_str("\x1b[38;2;160;150;135m"); // #A09687
+                                                formatted_line.push_str("\x1b[95m"); // Bright magenta for keywords
                                             }
                                             SyntaxState::Type => {
-                                                // Medium-light neutral grey for types
-                                                formatted_line.push_str("\x1b[38;2;130;130;126m"); // #82827E
+                                                formatted_line.push_str("\x1b[36m"); // Cyan for types
                                             }
                                             SyntaxState::Function => {
-                                                // Brightest grey with strong warm hint for functions
-                                                formatted_line.push_str("\x1b[38;2;175;167;150m"); // #AFA796
+                                                formatted_line.push_str("\x1b[94m"); // Bright blue for functions
                                             }
                                             SyntaxState::Number => {
-                                                // Medium-bright grey with warm hint for numbers
-                                                formatted_line.push_str("\x1b[38;2;150;142;130m"); // #968E82
+                                                formatted_line.push_str("\x1b[93m"); // Bright yellow for numbers
                                             }
                                             SyntaxState::Operator => {
-                                                // Medium-dark neutral grey for operators
-                                                formatted_line.push_str("\x1b[38;2;120;120;117m"); // #787875
+                                                formatted_line.push_str("\x1b[37m"); // White for operators
                                             }
                                             SyntaxState::Punctuation => {
-                                                // Dark neutral grey for punctuation
-                                                formatted_line.push_str("\x1b[38;2;100;100;98m"); // #646462
+                                                formatted_line.push_str("\x1b[90m"); // Dark gray for punctuation
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                // Medium-bright grey with warm-red hint for decorators
-                                                formatted_line.push_str("\x1b[38;2;145;135;125m"); // #91877D
+                                                formatted_line.push_str("\x1b[35m"); // Magenta for decorators
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                // Light sage green for SQL keywords
-                                                formatted_line.push_str("\x1b[38;2;140;180;150m"); // #8CB496
+                                                // SQL keywords use same as regular keywords
+                                                formatted_line.push_str("\x1b[95m"); // Bright magenta
                                             }
                                             SyntaxState::SqlFunction => {
-                                                // Fresh spring green for SQL functions
-                                                formatted_line.push_str("\x1b[38;2;130;200;140m"); // #82C88C
+                                                // SQL functions use same as regular functions
+                                                formatted_line.push_str("\x1b[94m"); // Bright blue
                                             }
                                             SyntaxState::SqlNumber => {
-                                                // Mint green for SQL numbers
-                                                formatted_line.push_str("\x1b[38;2;150;210;170m"); // #96D2AA
+                                                // SQL numbers use same as regular numbers
+                                                formatted_line.push_str("\x1b[93m"); // Bright yellow
                                             }
                                             SyntaxState::SqlText => {
-                                                // Pale spring green for SQL text/identifiers
-                                                formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
+                                                // SQL text/identifiers use normal text color
+                                                formatted_line.push_str("\x1b[37m"); // White
                                             }
                                             SyntaxState::SqlComment => {
-                                                // Dark green for SQL comments
-                                                formatted_line.push_str("\x1b[38;2;80;130;90m"); // #50825A
+                                                // SQL comments use same as regular comments
+                                                formatted_line.push_str("\x1b[90m"); // Dark gray
                                             }
                                             SyntaxState::Normal => {
-                                                // Bright neutral grey for normal text
-                                                formatted_line.push_str("\x1b[38;2;165;162;157m"); // #A5A29D
+                                                formatted_line.push_str("\x1b[37m"); // White for normal text
                                             }
                                         }
                                     }
@@ -391,91 +391,101 @@ impl Renderer {
                                         // Reset background
                                         formatted_line.push_str("\x1b[49m");
                                         formatted_line.push_str(line_bg_color); // Restore line background
-                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation && syntax_state != SyntaxState::SqlText {
-                                        // Reset color after syntax-highlighted character
-                                        formatted_line.push_str("\x1b[39m"); // Reset foreground only
+                                    } else {
+                                        // Check if we're in SQL context to reset background
+                                        let is_sql = matches!(syntax_state,
+                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
+                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
+                                        if is_sql {
+                                            // Reset both foreground and background for SQL
+                                            formatted_line.push_str("\x1b[0m");
+                                            formatted_line.push_str(line_bg_color);
+                                        } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
+                                            // Reset color after syntax-highlighted character
+                                            formatted_line.push_str("\x1b[39m"); // Reset foreground only
+                                        }
                                     }
                                 }
                                 
                                 #[cfg(not(target_os = "windows"))]
                                 {
                                     if is_selected {
-                                        // Use same cadet blue as cursor (#5F9EA0) with black text
-                                        formatted_line.push_str("\x1b[48;2;55;110;112m\x1b[38;2;0;0;0m"); // RGB background + black foreground (dimmer than caret)
+                                        // Selection: use ANSI 256 color for teal background with black text
+                                        formatted_line.push_str("\x1b[48;5;30m\x1b[30m"); // Teal background + black foreground
                                     } else if is_current_find_match {
                                         // Bright orange background for current find match
-                                        formatted_line.push_str("\x1b[48;2;200;150;100m\x1b[38;2;0;0;0m"); // Bright orange + black text
+                                        formatted_line.push_str("\x1b[48;5;172m\x1b[30m"); // Orange + black text
                                     } else if is_find_match {
                                         // Dimmer orange background for other find matches
-                                        formatted_line.push_str("\x1b[48;2;120;90;60m"); // Dim orange background
+                                        formatted_line.push_str("\x1b[48;5;94m"); // Dim orange background
                                     } else if is_matching_bracket {
                                         // Bright yellow for matching brackets
-                                        formatted_line.push_str("\x1b[38;2;220;220;120m\x1b[1m"); // Bright yellow + bold
+                                        formatted_line.push_str("\x1b[93m\x1b[1m"); // Bright yellow + bold
                                     } else if is_matching_text {
                                         // Dim version of selection background for matching text
-                                        formatted_line.push_str("\x1b[48;2;50;80;82m"); // Dimmer version of selection color
+                                        formatted_line.push_str("\x1b[48;5;23m"); // Dimmer teal
                                     } else {
-                                        // Apply syntax highlighting colors - desaturated greys with strong brightness and hue distinction
+                                        // Check if we're in SQL context (for background color)
+                                        let is_sql = matches!(syntax_state,
+                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
+                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
+
+                                        // Apply SQL background if in SQL context
+                                        if is_sql {
+                                            formatted_line.push_str("\x1b[48;5;236m"); // Dark grey-blue background for SQL
+                                        }
+
+                                        // Apply syntax highlighting colors - ANSI 16/256 colors
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                // Medium grey with pronounced warm hint for strings
-                                                formatted_line.push_str("\x1b[38;2;135;128;115m"); // #878073
+                                                formatted_line.push_str("\x1b[33m"); // Yellow for strings
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                // Medium grey for comments
-                                                formatted_line.push_str("\x1b[38;2;101;101;101m"); // #656565
+                                                formatted_line.push_str("\x1b[90m"); // Bright black (dark gray) for comments
                                             }
                                             SyntaxState::Keyword => {
-                                                // Bright grey with strong warm hint for keywords
-                                                formatted_line.push_str("\x1b[38;2;160;150;135m"); // #A09687
+                                                formatted_line.push_str("\x1b[95m"); // Bright magenta for keywords
                                             }
                                             SyntaxState::Type => {
-                                                // Medium-light neutral grey for types
-                                                formatted_line.push_str("\x1b[38;2;130;130;126m"); // #82827E
+                                                formatted_line.push_str("\x1b[36m"); // Cyan for types
                                             }
                                             SyntaxState::Function => {
-                                                // Brightest grey with strong warm hint for functions
-                                                formatted_line.push_str("\x1b[38;2;175;167;150m"); // #AFA796
+                                                formatted_line.push_str("\x1b[94m"); // Bright blue for functions
                                             }
                                             SyntaxState::Number => {
-                                                // Medium-bright grey with warm hint for numbers
-                                                formatted_line.push_str("\x1b[38;2;150;142;130m"); // #968E82
+                                                formatted_line.push_str("\x1b[93m"); // Bright yellow for numbers
                                             }
                                             SyntaxState::Operator => {
-                                                // Medium-dark neutral grey for operators
-                                                formatted_line.push_str("\x1b[38;2;120;120;117m"); // #787875
+                                                formatted_line.push_str("\x1b[37m"); // White for operators
                                             }
                                             SyntaxState::Punctuation => {
-                                                // Dark neutral grey for punctuation
-                                                formatted_line.push_str("\x1b[38;2;100;100;98m"); // #646462
+                                                formatted_line.push_str("\x1b[90m"); // Dark gray for punctuation
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                // Medium-bright grey with warm-red hint for decorators
-                                                formatted_line.push_str("\x1b[38;2;145;135;125m"); // #91877D
+                                                formatted_line.push_str("\x1b[35m"); // Magenta for decorators
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                // Light sage green for SQL keywords
-                                                formatted_line.push_str("\x1b[38;2;140;180;150m"); // #8CB496
+                                                // SQL keywords use same as regular keywords
+                                                formatted_line.push_str("\x1b[95m"); // Bright magenta
                                             }
                                             SyntaxState::SqlFunction => {
-                                                // Fresh spring green for SQL functions
-                                                formatted_line.push_str("\x1b[38;2;130;200;140m"); // #82C88C
+                                                // SQL functions use same as regular functions
+                                                formatted_line.push_str("\x1b[94m"); // Bright blue
                                             }
                                             SyntaxState::SqlNumber => {
-                                                // Mint green for SQL numbers
-                                                formatted_line.push_str("\x1b[38;2;150;210;170m"); // #96D2AA
+                                                // SQL numbers use same as regular numbers
+                                                formatted_line.push_str("\x1b[93m"); // Bright yellow
                                             }
                                             SyntaxState::SqlText => {
-                                                // Pale spring green for SQL text/identifiers
-                                                formatted_line.push_str("\x1b[38;2;160;190;170m"); // #A0BEAA
+                                                // SQL text/identifiers use normal text color
+                                                formatted_line.push_str("\x1b[37m"); // White
                                             }
                                             SyntaxState::SqlComment => {
-                                                // Dark green for SQL comments
-                                                formatted_line.push_str("\x1b[38;2;80;130;90m"); // #50825A
+                                                // SQL comments use same as regular comments
+                                                formatted_line.push_str("\x1b[90m"); // Dark gray
                                             }
                                             SyntaxState::Normal => {
-                                                // Bright neutral grey for normal text
-                                                formatted_line.push_str("\x1b[38;2;165;162;157m"); // #A5A29D
+                                                formatted_line.push_str("\x1b[37m"); // White for normal text
                                             }
                                         }
                                     }
@@ -491,9 +501,19 @@ impl Renderer {
                                         // Reset background
                                         formatted_line.push_str("\x1b[49m");
                                         formatted_line.push_str(line_bg_color); // Restore line background
-                                    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation && syntax_state != SyntaxState::SqlText {
-                                        // Reset color after syntax-highlighted character
-                                        formatted_line.push_str("\x1b[39m"); // Reset foreground only
+                                    } else {
+                                        // Check if we're in SQL context to reset background
+                                        let is_sql = matches!(syntax_state,
+                                            SyntaxState::SqlKeyword | SyntaxState::SqlFunction |
+                                            SyntaxState::SqlNumber | SyntaxState::SqlText | SyntaxState::SqlComment);
+                                        if is_sql {
+                                            // Reset both foreground and background for SQL
+                                            formatted_line.push_str("\x1b[0m");
+                                            formatted_line.push_str(line_bg_color);
+                                        } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
+                                            // Reset color after syntax-highlighted character
+                                            formatted_line.push_str("\x1b[39m"); // Reset foreground only
+                                        }
                                     }
                                 }
                                 
@@ -519,7 +539,7 @@ impl Renderer {
                             // Line is selected if selection overlaps with this line's byte range
                             if sel_start < line_end_byte && sel_end > line_byte_start {
                                 // Draw a vertical bar with selection color to indicate empty line is selected
-                                formatted_line.push_str("\x1b[38;2;55;110;112m"); // Selection color for foreground
+                                formatted_line.push_str("\x1b[36m"); // Cyan for selection indicator
                                 formatted_line.push('│'); // Vertical bar
                                 formatted_line.push_str("\x1b[39m"); // Reset foreground
                                 screen_col += 1;
@@ -539,8 +559,8 @@ impl Renderer {
                     // Virtual line after the buffer - respect horizontal scrolling
                     if viewport_offset.1 == 0 {
                         // Only show the ~ if we're not horizontally scrolled
-                        line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
-                        line_content.push_str("\x1b[38;2;110;110;110m"); // Dim grey like comments
+                        line_content.push_str("\x1b[48;5;234m"); // Consistent background
+                        line_content.push_str("\x1b[90m"); // Dim grey (ANSI dark gray) like comments
                         line_content.push('~');
                         line_content.push_str("\x1b[39m"); // Reset foreground color
                         for _ in 1..width {
@@ -549,7 +569,7 @@ impl Renderer {
                         line_content.push_str("\x1b[0m");
                     } else {
                         // If horizontally scrolled, show all spaces
-                        line_content.push_str("\x1b[48;2;30;30;30m"); // Consistent background
+                        line_content.push_str("\x1b[48;5;234m"); // Consistent background
                         for _ in 0..width {
                             line_content.push(' ');
                         }

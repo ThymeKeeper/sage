@@ -1111,7 +1111,8 @@ impl OutputPane {
                         let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
                         let selected_plain = strip_ansi(&selected);
                         // Selection: RGB(55, 110, 112) background, black foreground
-                        line_content.push_str("\x1b[48;2;55;110;112m\x1b[38;2;0;0;0m");
+                        // Selection: ANSI 256 teal background with black text
+                        line_content.push_str("\x1b[48;5;30m\x1b[30m");
                         line_content.push_str(&selected_plain);
                         line_content.push_str("\x1b[0m");
                     }
@@ -1228,9 +1229,9 @@ impl OutputPane {
                             let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
                             // Strip ANSI codes - selection has its own styling
                             let selected_plain = strip_ansi(&selected);
-                            // Use RGB(55, 110, 112) background and RGB(0, 0, 0) foreground to match editor selection color
-                            execute!(writer, crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb { r: 55, g: 110, b: 112 }),
-                                     crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb { r: 0, g: 0, b: 0 }),
+                            // Use ANSI 256 teal background (30) with black foreground
+                            execute!(writer, crossterm::style::SetBackgroundColor(crossterm::style::Color::AnsiValue(30)),
+                                     crossterm::style::SetForegroundColor(crossterm::style::Color::Black),
                                      Print(selected_plain),
                                      crossterm::style::ResetColor)?;
                         }
