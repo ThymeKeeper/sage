@@ -1,12 +1,124 @@
 use crate::editor::Editor;
-use crate::syntax::{HighlightSpan, SyntaxState};
+use crate::syntax::SyntaxState;
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, Show},
+    event::{poll, read, Event},
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use std::io::{self, Write};
+use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
+
+/// Query the terminal for the RGB value of an ANSI color using OSC 4
+/// Returns None if the terminal doesn't respond or doesn't support the query
+fn query_terminal_color(ansi_code: u8) -> Option<(u8, u8, u8)> {
+    // Convert ANSI code to palette index
+    let palette_index = match ansi_code {
+        30..=37 => ansi_code - 30,      // Standard colors 0-7
+        90..=97 => ansi_code - 90 + 8,  // Bright colors 8-15
+        _ => return None,
+    };
+
+    // Send OSC 4 query: \x1b]4;{index};?\x1b\\
+    let query = format!("\x1b]4;{};?\x1b\\", palette_index);
+    print!("{}", query);
+    std::io::stdout().flush().ok()?;
+
+    // Read response with timeout
+    let mut response = String::new();
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_millis(100) {
+        if poll(Duration::from_millis(10)).ok()? {
+            if let Event::Key(key_event) = read().ok()? {
+                // Collect characters from the response
+                if let crossterm::event::KeyCode::Char(c) = key_event.code {
+                    response.push(c);
+                }
+            }
+        }
+
+        // Check if we have a complete response
+        // Format: \x1b]4;{index};rgb:{rrrr}/{gggg}/{bbbb}\x1b\\
+        if response.contains("rgb:") && (response.ends_with('\x07') || response.ends_with('\\')) {
+            break;
+        }
+    }
+
+    // Parse the response: rgb:rrrr/gggg/bbbb (16-bit hex values)
+    if let Some(rgb_start) = response.find("rgb:") {
+        let rgb_part = &response[rgb_start + 4..];
+        let parts: Vec<&str> = rgb_part.split('/').collect();
+        if parts.len() >= 3 {
+            // Parse 16-bit hex values and convert to 8-bit
+            let r = u16::from_str_radix(parts[0].trim_end_matches(|c: char| !c.is_ascii_hexdigit()), 16).ok()? / 256;
+            let g = u16::from_str_radix(parts[1].trim_end_matches(|c: char| !c.is_ascii_hexdigit()), 16).ok()? / 256;
+            let b = u16::from_str_radix(parts[2].trim_end_matches(|c: char| !c.is_ascii_hexdigit()), 16).ok()? / 256;
+            return Some((r as u8, g as u8, b as u8));
+        }
+    }
+
+    None
+}
+
+/// Cache for terminal colors to avoid repeated queries
+use std::sync::OnceLock;
+static TERMINAL_COLORS: OnceLock<std::collections::HashMap<u8, (u8, u8, u8)>> = OnceLock::new();
+
+/// Get RGB value for an ANSI color, querying terminal if not cached
+fn ansi_to_rgb(ansi_code: u8) -> (u8, u8, u8) {
+    let colors = TERMINAL_COLORS.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        // Query all 16 colors at startup
+        for code in [30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97] {
+            if let Some(rgb) = query_terminal_color(code) {
+                map.insert(code, rgb);
+            }
+        }
+        map
+    });
+
+    // Return cached color or fallback to a neutral gray
+    *colors.get(&ansi_code).unwrap_or(&(128, 128, 128))
+}
+
+/// Blend two RGB colors with a given ratio (0.0 = all color1, 1.0 = all color2)
+fn blend_colors(color1: (u8, u8, u8), color2: (u8, u8, u8), ratio: f32) -> (u8, u8, u8) {
+    let r = (color1.0 as f32 * (1.0 - ratio) + color2.0 as f32 * ratio) as u8;
+    let g = (color1.1 as f32 * (1.0 - ratio) + color2.1 as f32 * ratio) as u8;
+    let b = (color1.2 as f32 * (1.0 - ratio) + color2.2 as f32 * ratio) as u8;
+    (r, g, b)
+}
+
+/// Syntax color escape sequences (single source of truth)
+mod syntax_colors {
+    pub const STRING: &str = "\x1b[33m";       // Yellow
+    pub const COMMENT: &str = "\x1b[90m";      // Dark gray
+    pub const KEYWORD: &str = "\x1b[95m";      // Bright magenta
+    pub const TYPE: &str = "\x1b[36m";         // Cyan
+    pub const FUNCTION: &str = "\x1b[94m";     // Bright blue
+    pub const NUMBER: &str = "\x1b[93m";       // Bright yellow
+    pub const OPERATOR: &str = "\x1b[37m";     // White
+    pub const NORMAL: &str = "\x1b[37m";       // White
+}
+
+/// Extract ANSI color code from an escape sequence like "\x1b[95m"
+fn parse_ansi_code(escape_seq: &str) -> u8 {
+    escape_seq
+        .trim_start_matches("\x1b[")
+        .trim_end_matches('m')
+        .parse()
+        .unwrap_or(37)
+}
+
+/// Get blended SQL color (syntax color blended with string color)
+fn sql_blended_color(syntax_color_seq: &str, string_color_seq: &str) -> String {
+    let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_color_seq));
+    let string_rgb = ansi_to_rgb(parse_ansi_code(string_color_seq));
+    let blended = blend_colors(syntax_rgb, string_rgb, 0.35); // 35% string color
+    format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
+}
 
 pub struct Renderer {
     stdout: io::Stdout,
@@ -318,54 +430,49 @@ impl Renderer {
                                         // Apply syntax highlighting colors - ANSI 16/256 colors
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                formatted_line.push_str("\x1b[33m"); // Yellow for strings
+                                                formatted_line.push_str(syntax_colors::STRING);
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                formatted_line.push_str("\x1b[90m"); // Bright black (dark gray) for comments
+                                                formatted_line.push_str(syntax_colors::COMMENT);
                                             }
                                             SyntaxState::Keyword => {
-                                                formatted_line.push_str("\x1b[95m"); // Bright magenta for keywords
+                                                formatted_line.push_str(syntax_colors::KEYWORD);
                                             }
                                             SyntaxState::Type => {
-                                                formatted_line.push_str("\x1b[36m"); // Cyan for types
+                                                formatted_line.push_str(syntax_colors::TYPE);
                                             }
                                             SyntaxState::Function => {
-                                                formatted_line.push_str("\x1b[94m"); // Bright blue for functions
+                                                formatted_line.push_str(syntax_colors::FUNCTION);
                                             }
                                             SyntaxState::Number => {
-                                                formatted_line.push_str("\x1b[93m"); // Bright yellow for numbers
+                                                formatted_line.push_str(syntax_colors::NUMBER);
                                             }
                                             SyntaxState::Operator => {
-                                                formatted_line.push_str("\x1b[37m"); // White for operators
+                                                formatted_line.push_str(syntax_colors::OPERATOR);
                                             }
                                             SyntaxState::Punctuation => {
-                                                formatted_line.push_str("\x1b[90m"); // Dark gray for punctuation
+                                                formatted_line.push_str(syntax_colors::COMMENT);
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                formatted_line.push_str("\x1b[35m"); // Magenta for decorators
+                                                formatted_line.push_str(syntax_colors::KEYWORD);
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                // SQL keywords use same as regular keywords
-                                                formatted_line.push_str("\x1b[95m"); // Bright magenta
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::KEYWORD, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlFunction => {
-                                                // SQL functions use same as regular functions
-                                                formatted_line.push_str("\x1b[94m"); // Bright blue
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::FUNCTION, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlNumber => {
-                                                // SQL numbers use same as regular numbers
-                                                formatted_line.push_str("\x1b[93m"); // Bright yellow
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NUMBER, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlText => {
-                                                // SQL text/identifiers use normal text color
-                                                formatted_line.push_str("\x1b[37m"); // White
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NORMAL, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlComment => {
-                                                // SQL comments use same as regular comments
-                                                formatted_line.push_str("\x1b[90m"); // Dark gray
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::COMMENT, syntax_colors::STRING));
                                             }
                                             SyntaxState::Normal => {
-                                                formatted_line.push_str("\x1b[37m"); // White for normal text
+                                                formatted_line.push_str(syntax_colors::NORMAL);
                                             }
                                         }
                                     }
@@ -408,54 +515,49 @@ impl Renderer {
                                         // Apply syntax highlighting colors - ANSI 16/256 colors
                                         match syntax_state {
                                             SyntaxState::StringDouble | SyntaxState::StringSingle | SyntaxState::StringTriple | SyntaxState::StringTripleSingle => {
-                                                formatted_line.push_str("\x1b[33m"); // Yellow for strings
+                                                formatted_line.push_str(syntax_colors::STRING);
                                             }
                                             SyntaxState::LineComment | SyntaxState::BlockComment => {
-                                                formatted_line.push_str("\x1b[90m"); // Bright black (dark gray) for comments
+                                                formatted_line.push_str(syntax_colors::COMMENT);
                                             }
                                             SyntaxState::Keyword => {
-                                                formatted_line.push_str("\x1b[95m"); // Bright magenta for keywords
+                                                formatted_line.push_str(syntax_colors::KEYWORD);
                                             }
                                             SyntaxState::Type => {
-                                                formatted_line.push_str("\x1b[36m"); // Cyan for types
+                                                formatted_line.push_str(syntax_colors::TYPE);
                                             }
                                             SyntaxState::Function => {
-                                                formatted_line.push_str("\x1b[94m"); // Bright blue for functions
+                                                formatted_line.push_str(syntax_colors::FUNCTION);
                                             }
                                             SyntaxState::Number => {
-                                                formatted_line.push_str("\x1b[93m"); // Bright yellow for numbers
+                                                formatted_line.push_str(syntax_colors::NUMBER);
                                             }
                                             SyntaxState::Operator => {
-                                                formatted_line.push_str("\x1b[37m"); // White for operators
+                                                formatted_line.push_str(syntax_colors::OPERATOR);
                                             }
                                             SyntaxState::Punctuation => {
-                                                formatted_line.push_str("\x1b[90m"); // Dark gray for punctuation
+                                                formatted_line.push_str(syntax_colors::COMMENT);
                                             }
                                             SyntaxState::MacroOrDecorator => {
-                                                formatted_line.push_str("\x1b[35m"); // Magenta for decorators
+                                                formatted_line.push_str(syntax_colors::KEYWORD);
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                // SQL keywords use same as regular keywords
-                                                formatted_line.push_str("\x1b[95m"); // Bright magenta
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::KEYWORD, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlFunction => {
-                                                // SQL functions use same as regular functions
-                                                formatted_line.push_str("\x1b[94m"); // Bright blue
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::FUNCTION, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlNumber => {
-                                                // SQL numbers use same as regular numbers
-                                                formatted_line.push_str("\x1b[93m"); // Bright yellow
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NUMBER, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlText => {
-                                                // SQL text/identifiers use normal text color
-                                                formatted_line.push_str("\x1b[37m"); // White
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NORMAL, syntax_colors::STRING));
                                             }
                                             SyntaxState::SqlComment => {
-                                                // SQL comments use same as regular comments
-                                                formatted_line.push_str("\x1b[90m"); // Dark gray
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::COMMENT, syntax_colors::STRING));
                                             }
                                             SyntaxState::Normal => {
-                                                formatted_line.push_str("\x1b[37m"); // White for normal text
+                                                formatted_line.push_str(syntax_colors::NORMAL);
                                             }
                                         }
                                     }
