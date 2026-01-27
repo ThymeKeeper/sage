@@ -198,6 +198,16 @@ impl OutputPane {
         }
     }
 
+    /// Invalidate the render cache so the next draw will fully redraw.
+    /// Call this when something external (like autocomplete popup) has drawn over the output pane.
+    pub fn invalidate_cache(&mut self) {
+        self.last_render_state = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.last_screen.clear();
+        }
+    }
+
     pub fn add_output(&mut self, entry: OutputEntry) {
         self.outputs.push(entry);
         // Auto-scroll to bottom to show newest output

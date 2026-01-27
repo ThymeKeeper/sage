@@ -219,6 +219,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             // Hide autocomplete on any mouse click
                             if autocomplete.is_visible() {
                                 autocomplete.hide();
+                                if output_pane_visible {
+                                    output_pane.invalidate_cache();
+                                }
                                 needs_redraw = true;
                             }
 
@@ -621,6 +624,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     KeyCode::Esc => {
                         if autocomplete.is_visible() {
                             autocomplete.hide();
+                            if output_pane_visible {
+                                output_pane.invalidate_cache();
+                            }
                             needs_redraw = true;
                         } else if output_pane_visible {
                             output_pane.toggle_focus();
@@ -1330,6 +1336,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 }
                                 autocomplete.hide();
                                 renderer.force_redraw(); // Force full redraw to clear autocomplete artifacts
+                                if output_pane_visible {
+                                    output_pane.invalidate_cache();
+                                }
                                 suppress_autocomplete_once = true; // Don't show autocomplete on next key
                                 needs_redraw = true;
                             }
@@ -1455,18 +1464,30 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             }
                             autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
                             renderer.force_redraw(); // Clear artifacts when menu changes
+                            if output_pane_visible {
+                                output_pane.invalidate_cache();
+                            }
                         } else if should_check_backspace_delete && editor.is_repl_mode() {
                             let (base_callable, prefix, is_sql_context) = editor.get_completion_context();
                             if prefix.is_empty() && base_callable.is_none() && !is_sql_context {
                                 autocomplete.hide();
                                 renderer.force_redraw();
+                                if output_pane_visible {
+                                    output_pane.invalidate_cache();
+                                }
                             } else {
                                 autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
                                 renderer.force_redraw(); // Clear artifacts when menu changes
+                                if output_pane_visible {
+                                    output_pane.invalidate_cache();
+                                }
                             }
                         } else if should_hide_autocomplete || !editor.is_repl_mode() {
                             autocomplete.hide();
                             renderer.force_redraw();
+                            if output_pane_visible {
+                                output_pane.invalidate_cache();
+                            }
                         }
                     }
                 }
