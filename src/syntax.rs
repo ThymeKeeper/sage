@@ -20,6 +20,7 @@ pub enum SyntaxState {
     SqlNumber,          // SQL numeric literals within strings
     SqlText,            // SQL string content (non-keyword text, spaces, punctuation)
     SqlComment,         // SQL comments within strings (-- or /* */)
+    SqlString,          // SQL string literals within strings ('value' or "value")
 }
 
 /// Language type for syntax highlighting
@@ -459,6 +460,64 @@ impl SyntaxHighlighter {
                         continue;
                     }
                 }
+            }
+
+            // Check for single-quoted strings
+            if ch == '\'' {
+                let start = byte_pos;
+                let mut end = byte_pos + 1; // opening quote
+
+                // Consume until closing quote or end of content
+                while let Some((next_pos, next_ch)) = char_indices.next() {
+                    end = next_pos + next_ch.len_utf8();
+                    if next_ch == '\'' {
+                        // Check for escaped quote ('')
+                        if let Some(&(_, peek_ch)) = char_indices.peek() {
+                            if peek_ch == '\'' {
+                                char_indices.next(); // consume escaped quote
+                                end += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                spans.push(HighlightSpan {
+                    start: string_start + start,
+                    end: string_start + end,
+                    state: SyntaxState::SqlString,
+                });
+                continue;
+            }
+
+            // Check for double-quoted strings (identifiers in SQL, but strings in some dialects)
+            if ch == '"' {
+                let start = byte_pos;
+                let mut end = byte_pos + 1; // opening quote
+
+                // Consume until closing quote or end of content
+                while let Some((next_pos, next_ch)) = char_indices.next() {
+                    end = next_pos + next_ch.len_utf8();
+                    if next_ch == '"' {
+                        // Check for escaped quote ("")
+                        if let Some(&(_, peek_ch)) = char_indices.peek() {
+                            if peek_ch == '"' {
+                                char_indices.next(); // consume escaped quote
+                                end += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                spans.push(HighlightSpan {
+                    start: string_start + start,
+                    end: string_start + end,
+                    state: SyntaxState::SqlString,
+                });
+                continue;
             }
 
             // Check for numbers

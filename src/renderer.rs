@@ -471,6 +471,9 @@ impl Renderer {
                                             SyntaxState::SqlComment => {
                                                 formatted_line.push_str(&sql_blended_color(syntax_colors::COMMENT, syntax_colors::STRING));
                                             }
+                                            SyntaxState::SqlString => {
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::STRING, syntax_colors::STRING));
+                                            }
                                             SyntaxState::Normal => {
                                                 formatted_line.push_str(syntax_colors::NORMAL);
                                             }
@@ -555,6 +558,9 @@ impl Renderer {
                                             }
                                             SyntaxState::SqlComment => {
                                                 formatted_line.push_str(&sql_blended_color(syntax_colors::COMMENT, syntax_colors::STRING));
+                                            }
+                                            SyntaxState::SqlString => {
+                                                formatted_line.push_str(&sql_blended_color(syntax_colors::STRING, syntax_colors::STRING));
                                             }
                                             SyntaxState::Normal => {
                                                 formatted_line.push_str(syntax_colors::NORMAL);
