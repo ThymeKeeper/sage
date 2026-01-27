@@ -652,19 +652,18 @@ impl OutputPane {
         let visible_width = self.viewport_width;
 
         if visible_width > 0 {
+            // Jump all the way left when cursor is at start of line (factoring virtual indent)
+            if self.cursor_col == 0 {
+                self.horizontal_offset = 0;
+            }
             // Scroll left if cursor is before viewport
-            if cursor_screen_col < self.horizontal_offset {
+            else if cursor_screen_col < self.horizontal_offset {
                 self.horizontal_offset = cursor_screen_col;
             }
             // Scroll right if cursor is past viewport
             else if cursor_screen_col >= self.horizontal_offset + visible_width {
                 self.horizontal_offset = cursor_screen_col.saturating_sub(visible_width - 1);
             }
-        }
-
-        // Reset horizontal scroll when on an empty line
-        if self.get_line_length(self.cursor_line) == 0 {
-            self.horizontal_offset = 0;
         }
     }
 
