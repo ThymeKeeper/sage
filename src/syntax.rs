@@ -545,10 +545,19 @@ impl SyntaxHighlighter {
     }
 
     /// Check if an SQL pattern immediately precedes the given position (for single-line strings)
+    /// Handles Python string prefixes like f, r, b, u and combinations (fr, rf, br, etc.)
+    /// Also handles whitespace between the opening paren and the string
     fn sql_pattern_precedes_position(&self, line_content: &str, position: usize) -> bool {
         let prefix = &line_content[..position];
+
+        // Strip Python string prefix characters (f, r, b, u - case insensitive) from end
+        // Then strip any whitespace that might be between ( and the string/prefix
+        let prefix_trimmed = prefix
+            .trim_end_matches(|c: char| "frbuFRBU".contains(c))
+            .trim_end();
+
         for pattern in Self::SQL_PATTERNS {
-            if prefix.ends_with(pattern) {
+            if prefix_trimmed.ends_with(pattern) {
                 return true;
             }
         }
