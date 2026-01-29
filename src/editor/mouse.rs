@@ -42,17 +42,33 @@ impl Editor {
         self.last_click_time = Some(now);
         self.last_click_position = Some(position);
 
+        // Clear word/line selection modes
+        self.word_select_mode = false;
+        self.line_select_mode = false;
+        self.word_select_anchor = None;
+        self.line_select_anchor = None;
+
         match self.click_count {
             2 => {
-                // Double click - select word
-                self.select_word_at(position);
-                self.mouse_selecting = false; // Don't continue selecting on drag
+                // Double click - select word and enable word selection mode for drag
+                let (word_start, word_end) = self.get_word_boundaries_at(position);
+                if word_start < word_end {
+                    self.set_selection_start(word_start);
+                    self.cursor = word_end;
+                    self.word_select_mode = true;
+                    self.word_select_anchor = Some((word_start, word_end));
+                    self.mouse_selecting = true; // Enable drag to extend by words
+                }
                 self.update_viewport_for_cursor();
             }
             3 => {
-                // Triple click - select line
-                self.select_line_at(position);
-                self.mouse_selecting = false; // Don't continue selecting on drag
+                // Triple click - select line and enable line selection mode for drag
+                let (line_start, line_end) = self.get_line_boundaries_at(position);
+                self.set_selection_start(line_start);
+                self.cursor = line_end;
+                self.line_select_mode = true;
+                self.line_select_anchor = Some((line_start, line_end));
+                self.mouse_selecting = true; // Enable drag to extend by lines
                 self.update_viewport_for_cursor();
             }
             _ => {
@@ -99,8 +115,8 @@ impl Editor {
         pos
     }
 
-    /// Select the word at the given position
-    fn select_word_at(&mut self, position: usize) {
+    /// Get the word boundaries at the given position (returns start and end byte positions)
+    fn get_word_boundaries_at(&self, position: usize) -> (usize, usize) {
         let content = self.buffer.to_string();
         let chars: Vec<char> = content.chars().collect();
 
@@ -140,33 +156,87 @@ impl Editor {
             end_byte += chars[i].len_utf8();
         }
 
-        // Set selection
+        (start_byte, end_byte)
+    }
+
+    /// Select the word at the given position
+    fn select_word_at(&mut self, position: usize) {
+        let (start_byte, end_byte) = self.get_word_boundaries_at(position);
         if start_byte < end_byte {
             self.set_selection_start(start_byte);
             self.cursor = end_byte;
         }
     }
 
-    /// Select the line at the given position
-    fn select_line_at(&mut self, position: usize) {
+    /// Get the line boundaries at the given position (returns start and end byte positions)
+    fn get_line_boundaries_at(&self, position: usize) -> (usize, usize) {
         let line = self.buffer.byte_to_line(position);
         let line_start = self.buffer.line_to_byte(line);
         let line_text = self.buffer.line(line);
 
-        // Don't include the newline in the selection
-        let line_end = if line_text.ends_with('\n') {
-            line_start + line_text.len() - 1
-        } else {
-            line_start + line_text.len()
-        };
+        // Include the newline in the selection for line selection mode
+        let line_end = line_start + line_text.len();
 
+        (line_start, line_end)
+    }
+
+    /// Select the line at the given position
+    fn select_line_at(&mut self, position: usize) {
+        let (line_start, line_end) = self.get_line_boundaries_at(position);
         self.set_selection_start(line_start);
         self.cursor = line_end;
     }
 
     /// Update mouse selection while dragging
     pub fn update_mouse_selection(&mut self, position: usize) {
-        if self.mouse_selecting {
+        if !self.mouse_selecting {
+            return;
+        }
+
+        if self.word_select_mode {
+            // Word selection mode: extend selection by whole words
+            if let Some((anchor_start, anchor_end)) = self.word_select_anchor {
+                let (drag_word_start, drag_word_end) = self.get_word_boundaries_at(position);
+
+                // Determine selection bounds based on drag direction relative to anchor
+                if position < anchor_start {
+                    // Dragging before the anchor word: select from drag word start to anchor word end
+                    self.set_selection_start(drag_word_start);
+                    self.cursor = anchor_end;
+                } else if position >= anchor_end {
+                    // Dragging after the anchor word: select from anchor word start to drag word end
+                    self.set_selection_start(anchor_start);
+                    self.cursor = drag_word_end;
+                } else {
+                    // Dragging within the anchor word: just select the anchor word
+                    self.set_selection_start(anchor_start);
+                    self.cursor = anchor_end;
+                }
+            }
+            self.update_viewport_for_cursor();
+        } else if self.line_select_mode {
+            // Line selection mode: extend selection by whole lines
+            if let Some((anchor_start, anchor_end)) = self.line_select_anchor {
+                let (drag_line_start, drag_line_end) = self.get_line_boundaries_at(position);
+
+                // Determine selection bounds based on drag direction relative to anchor
+                if position < anchor_start {
+                    // Dragging before the anchor line: select from drag line start to anchor line end
+                    self.set_selection_start(drag_line_start);
+                    self.cursor = anchor_end;
+                } else if position >= anchor_end {
+                    // Dragging after the anchor line: select from anchor line start to drag line end
+                    self.set_selection_start(anchor_start);
+                    self.cursor = drag_line_end;
+                } else {
+                    // Dragging within the anchor line: just select the anchor line
+                    self.set_selection_start(anchor_start);
+                    self.cursor = anchor_end;
+                }
+            }
+            self.update_viewport_for_cursor();
+        } else {
+            // Normal character-by-character selection
             if self.selection_start.is_none() {
                 // Start selection from the initial cursor position
                 self.set_selection_start(self.cursor);
@@ -180,6 +250,10 @@ impl Editor {
     /// Finish mouse selection
     pub fn finish_mouse_selection(&mut self) {
         self.mouse_selecting = false;
+        self.word_select_mode = false;
+        self.line_select_mode = false;
+        self.word_select_anchor = None;
+        self.line_select_anchor = None;
         // If selection start equals cursor, clear the selection
         if let Some(start) = self.selection_start {
             if start == self.cursor {

@@ -168,6 +168,7 @@ impl OutputPane {
                 // Position cursor at the last line (same as auto-scroll position)
                 self.cursor_line = total_lines.saturating_sub(1);
                 self.cursor_col = 0;
+                self.horizontal_offset = 0;
                 self.auto_scroll = true; // Ensure we're showing the bottom
             }
             // Clear any selection when gaining focus
@@ -190,6 +191,7 @@ impl OutputPane {
                 // Position cursor at the last line (same as auto-scroll position)
                 self.cursor_line = total_lines.saturating_sub(1);
                 self.cursor_col = 0;
+                self.horizontal_offset = 0;
                 self.auto_scroll = true; // Ensure we're showing the bottom
             }
             // Clear any selection when gaining focus
@@ -219,6 +221,7 @@ impl OutputPane {
     pub fn scroll_to_bottom(&mut self) {
         // Enable auto-scroll mode and move cursor to end
         self.auto_scroll = true;
+        self.horizontal_offset = 0;
         let total_lines = self.count_total_lines();
         if total_lines > 0 {
             self.cursor_line = total_lines - 1;
@@ -242,6 +245,7 @@ impl OutputPane {
     pub fn clear(&mut self) {
         self.outputs.clear();
         self.scroll_offset = 0;
+        self.horizontal_offset = 0;
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.selection_start = None;
@@ -265,7 +269,9 @@ impl OutputPane {
         if self.scroll_offset + 1 < total_lines {
             self.scroll_offset += 1;
         } else {
+            // Reached bottom, enable auto-scroll and reset horizontal position
             self.auto_scroll = true;
+            self.horizontal_offset = 0;
         }
     }
 
@@ -827,7 +833,7 @@ impl OutputPane {
 
         // Calculate the effective scroll offset for rendering
         let total_lines = self.count_total_lines();
-        let display_lines = (height - 1) as usize;
+        let display_lines = height;
         let effective_scroll = if self.auto_scroll {
             total_lines.saturating_sub(display_lines)
         } else {
@@ -851,7 +857,17 @@ impl OutputPane {
             };
 
             if self.last_render_state.as_ref() == Some(&current_state) {
-                // Nothing changed, skip redraw entirely
+                // Nothing changed, skip redraw - but still show cursor if focused
+                // (because the renderer hides cursor at start of each draw cycle)
+                if self.focused {
+                    let line_offset = effective_scroll;
+                    if self.cursor_line >= line_offset && self.cursor_line < line_offset + display_lines {
+                        let cursor_row = start_row + (self.cursor_line - line_offset) as u16;
+                        let indent = self.get_line_indent(self.cursor_line);
+                        let cursor_screen_col = (indent + self.cursor_col).saturating_sub(self.horizontal_offset);
+                        execute!(writer, cursor::MoveTo(cursor_screen_col as u16, cursor_row), crossterm::cursor::Show)?;
+                    }
+                }
                 return Ok(());
             }
 
@@ -865,61 +881,22 @@ impl OutputPane {
         #[cfg(target_os = "windows")]
         {
             // Ensure cache is sized correctly
-            let total_rows = height + 1;
+            let total_rows = height;
             if self.last_screen.len() != total_rows {
                 self.last_screen = vec![String::new(); total_rows];
-            }
-
-            // Build separator line with title
-            let title = if self.outputs.is_empty() {
-                " Output (Esc to focus, Ctrl+O to toggle, Ctrl+L to clear) "
-            } else {
-                " Output (Esc to focus, arrows/mouse to scroll, Ctrl+O/L to toggle/clear) "
-            };
-            // Build the complete first line: separator with title overlay (in cyan)
-            let line0 = format!("\x1b[90m──\x1b[36m{}\x1b[90m{}\x1b[0m",
-                title,
-                "─".repeat(width as usize - 2 - title.len()));
-
-            if self.last_screen.get(0) != Some(&line0) {
-                write!(writer, "\x1b[{};1H{}", start_row + 1, line0)?;
-                self.last_screen[0] = line0;
             }
         }
 
         #[cfg(not(target_os = "windows"))]
         {
             // Clear all rows in the output pane area first (to handle resizing)
-            for row in start_row..=(start_row + height as u16) {
+            for row in start_row..(start_row + height as u16) {
                 execute!(
                     writer,
                     cursor::MoveTo(0, row),
                     Clear(ClearType::CurrentLine)
                 )?;
             }
-
-            // Draw separator line
-            execute!(
-                writer,
-                cursor::MoveTo(0, start_row),
-                SetForegroundColor(Color::DarkGrey),
-                Print("─".repeat(width as usize)),
-                ResetColor
-            )?;
-
-            // Draw title
-            let title = if self.outputs.is_empty() {
-                " Output (Esc to focus, Ctrl+O to toggle, Ctrl+L to clear) "
-            } else {
-                " Output (Esc to focus, arrows/mouse to scroll, Ctrl+O/L to toggle/clear) "
-            };
-            execute!(
-                writer,
-                cursor::MoveTo(2, start_row),
-                SetForegroundColor(Color::Cyan),
-                Print(title),
-                ResetColor
-            )?;
         }
 
         if self.outputs.is_empty() {
@@ -927,10 +904,10 @@ impl OutputPane {
             #[cfg(target_os = "windows")]
             {
                 let empty_line = " ".repeat(width as usize);
-                for row_idx in 1..=height {
+                for row_idx in 0..height {
                     let screen_row = start_row + row_idx as u16;
                     // Check cache to avoid unnecessary writes
-                    let cache_idx = row_idx as usize;
+                    let cache_idx = row_idx;
                     if cache_idx >= self.last_screen.len() || self.last_screen[cache_idx] != empty_line {
                         write!(writer, "\x1b[{};1H{}", screen_row + 1, empty_line)?;
                         if cache_idx < self.last_screen.len() {
@@ -946,10 +923,10 @@ impl OutputPane {
             {
                 // Build hint with padding
                 let hint_line = format!("\x1b[90m  {}\x1b[0m{}", hint, " ".repeat(width as usize - 2 - hint.len()));
-                if self.last_screen.get(1) != Some(&hint_line) {
-                    write!(writer, "\x1b[{};1H{}", start_row + 2, hint_line)?;
-                    if self.last_screen.len() > 1 {
-                        self.last_screen[1] = hint_line;
+                if self.last_screen.get(0) != Some(&hint_line) {
+                    write!(writer, "\x1b[{};1H{}", start_row + 1, hint_line)?;
+                    if !self.last_screen.is_empty() {
+                        self.last_screen[0] = hint_line;
                     }
                 }
             }
@@ -957,7 +934,7 @@ impl OutputPane {
             {
                 execute!(
                     writer,
-                    cursor::MoveTo(2, start_row + 1),
+                    cursor::MoveTo(2, start_row),
                     SetForegroundColor(Color::DarkGrey),
                     Print(hint),
                     ResetColor
@@ -967,11 +944,11 @@ impl OutputPane {
         }
 
         // Draw outputs with line-by-line scrolling
-        let mut current_row = start_row + 1;
+        let mut current_row = start_row;
         let max_row = start_row + height as u16;
 
         // Update viewport dimensions
-        let display_lines = (height - 1) as usize; // Lines available for display
+        let display_lines = height; // Lines available for display
         self.viewport_height = display_lines;
         self.viewport_width = width as usize;
 
@@ -1301,23 +1278,7 @@ impl OutputPane {
             }
         }
 
-        // Show scroll indicator if not showing all lines
-        if line_offset > 0 || line_offset + display_lines < all_lines.len() {
-            let scroll_info = format!(" {}-{}/{} ",
-                line_offset + 1,
-                (line_offset + display_lines).min(all_lines.len()),
-                all_lines.len()
-            );
-            execute!(
-                writer,
-                cursor::MoveTo(width.saturating_sub(scroll_info.len() as u16 + 2), start_row),
-                SetForegroundColor(Color::DarkGrey),
-                Print(scroll_info),
-                ResetColor
-            )?;
-        }
-
-        // Show cursor if focused and visible (AFTER drawing scroll indicator)
+        // Show cursor if focused and visible
         if self.focused {
             if let (Some(row), Some(col)) = (cursor_screen_row, cursor_screen_col) {
                 // Set cursor style based on whether we have a selection
@@ -1332,23 +1293,17 @@ impl OutputPane {
             }
         }
 
-        writer.flush()?;
         Ok(())
     }
 
     /// Convert screen coordinates to (line, col) position in output
     pub fn screen_to_position(&self, screen_col: usize, screen_row: usize) -> Option<(usize, usize)> {
         // Check if screen row is within the output pane
-        if screen_row <= self.output_start_row as usize {
+        if screen_row < self.output_start_row as usize {
             return None;
         }
 
         let relative_row = screen_row - self.output_start_row as usize;
-
-        // Row 0 is the separator line, content starts at row 1
-        if relative_row < 1 {
-            return None;
-        }
 
         // Calculate which line this corresponds to
         let display_lines = self.viewport_height;
@@ -1359,7 +1314,7 @@ impl OutputPane {
             self.scroll_offset.min(total_lines.saturating_sub(1))
         };
 
-        let line_idx = line_offset + (relative_row - 1); // -1 for separator line
+        let line_idx = line_offset + relative_row;
 
         if line_idx >= total_lines {
             return None;
@@ -1392,7 +1347,15 @@ impl OutputPane {
     }
 
     /// Start a mouse selection
-    pub fn start_mouse_selection(&mut self, screen_col: usize, screen_row: usize) {
+    pub fn start_mouse_selection(&mut self, screen_col: usize, screen_row: usize, output_start_row: u16, pane_height: usize) {
+        // Set focus directly without resetting scroll position
+        // (unlike set_focused which jumps to bottom)
+        self.focused = true;
+
+        // Update layout info so screen_to_position uses current values
+        self.output_start_row = output_start_row;
+        self.viewport_height = pane_height;
+
         let now = Instant::now();
         let double_click_time = Duration::from_millis(500);
 
@@ -1447,20 +1410,31 @@ impl OutputPane {
                 }
                 _ => {
                     // Single click - start normal selection
+                    // Keep scroll position where it is, just move cursor to click position
                     self.cursor_line = line;
                     self.cursor_col = col;
                     self.selection_start = None;
                     self.mouse_selecting = true;
                     self.disable_auto_scroll();
                     self.preferred_column = None;
-                    self.ensure_cursor_visible();
+
+                    // Adjust horizontal scroll if cursor is left of viewport
+                    let indent = self.get_line_indent(line);
+                    let cursor_display_col = indent + col;
+                    if cursor_display_col < self.horizontal_offset {
+                        self.horizontal_offset = cursor_display_col;
+                    }
                 }
             }
         }
     }
 
     /// Update mouse selection while dragging
-    pub fn update_mouse_selection(&mut self, screen_col: usize, screen_row: usize) {
+    pub fn update_mouse_selection(&mut self, screen_col: usize, screen_row: usize, output_start_row: u16, pane_height: usize) {
+        // Update layout info in case terminal was resized during drag
+        self.output_start_row = output_start_row;
+        self.viewport_height = pane_height;
+
         if self.mouse_selecting {
             if self.selection_start.is_none() {
                 // Start selection from the initial cursor position

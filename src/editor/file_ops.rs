@@ -79,6 +79,10 @@ impl Editor {
         self.viewport_offset = (0, 0);
         self.last_saved_undo_len = 0;
         self.mouse_selecting = false;
+        self.word_select_mode = false;
+        self.line_select_mode = false;
+        self.word_select_anchor = None;
+        self.line_select_anchor = None;
         self.preferred_column = None;
 
         // Check if file is read-only

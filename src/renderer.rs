@@ -66,6 +66,56 @@ fn query_terminal_color(ansi_code: u8) -> Option<(u8, u8, u8)> {
 use std::sync::OnceLock;
 static TERMINAL_COLORS: OnceLock<std::collections::HashMap<u8, (u8, u8, u8)>> = OnceLock::new();
 
+/// Cached blended SQL colors (computed once at startup)
+struct SqlBlendedColors {
+    keyword: String,
+    function: String,
+    number: String,
+    text: String,
+    comment: String,
+    string: String,
+}
+
+static SQL_BLENDED_COLORS: OnceLock<SqlBlendedColors> = OnceLock::new();
+
+fn get_sql_colors() -> &'static SqlBlendedColors {
+    SQL_BLENDED_COLORS.get_or_init(|| {
+        let string_rgb = ansi_to_rgb(parse_ansi_code(syntax_colors::STRING));
+        SqlBlendedColors {
+            keyword: {
+                let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_colors::KEYWORD));
+                let blended = blend_colors(syntax_rgb, string_rgb, 0.35);
+                format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
+            },
+            function: {
+                let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_colors::FUNCTION));
+                let blended = blend_colors(syntax_rgb, string_rgb, 0.35);
+                format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
+            },
+            number: {
+                let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_colors::NUMBER));
+                let blended = blend_colors(syntax_rgb, string_rgb, 0.35);
+                format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
+            },
+            text: {
+                let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_colors::NORMAL));
+                let blended = blend_colors(syntax_rgb, string_rgb, 0.35);
+                format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
+            },
+            comment: {
+                let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_colors::COMMENT));
+                let blended = blend_colors(syntax_rgb, string_rgb, 0.35);
+                format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
+            },
+            string: {
+                let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_colors::STRING));
+                let blended = blend_colors(syntax_rgb, string_rgb, 0.35);
+                format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
+            },
+        }
+    })
+}
+
 /// Get RGB value for an ANSI color, querying terminal if not cached
 fn ansi_to_rgb(ansi_code: u8) -> (u8, u8, u8) {
     let colors = TERMINAL_COLORS.get_or_init(|| {
@@ -110,14 +160,6 @@ fn parse_ansi_code(escape_seq: &str) -> u8 {
         .trim_end_matches('m')
         .parse()
         .unwrap_or(37)
-}
-
-/// Get blended SQL color (syntax color blended with string color)
-fn sql_blended_color(syntax_color_seq: &str, string_color_seq: &str) -> String {
-    let syntax_rgb = ansi_to_rgb(parse_ansi_code(syntax_color_seq));
-    let string_rgb = ansi_to_rgb(parse_ansi_code(string_color_seq));
-    let blended = blend_colors(syntax_rgb, string_rgb, 0.35); // 35% string color
-    format!("\x1b[38;2;{};{};{}m", blended.0, blended.1, blended.2)
 }
 
 pub struct Renderer {
@@ -189,11 +231,10 @@ impl Renderer {
     }
     
     pub fn draw(&mut self, editor: &mut Editor) -> io::Result<()> {
-        self.draw_with_bottom_window(editor, 0)
+        self.draw_with_bottom_window(editor, 0, false)
     }
-    
-    pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize) -> io::Result<()> {
-        crate::debug_log("draw_with_bottom_window: start");
+
+    pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize, bottom_window_focused: bool) -> io::Result<()> {
         // Update cursor style based on selection
         // Note: Output pane handles its own cursor style when focused
         let desired_style = if editor.selection().is_some() {
@@ -211,13 +252,9 @@ impl Renderer {
             self.last_cursor_style = desired_style;
         }
 
-        crate::debug_log("draw_with_bottom_window: getting file_name");
         // Update terminal title with filename and modified indicator
         let file_name = editor.file_name();
-        crate::debug_log("draw_with_bottom_window: getting is_modified");
         let modified_indicator = if editor.is_modified() { " *" } else { "" };
-
-        crate::debug_log("draw_with_bottom_window: formatting title");
         let title = if file_name == "[No Name]" {
             format!("No Name{}", modified_indicator)
         } else {
@@ -229,12 +266,10 @@ impl Renderer {
             self.last_title = title;
         }
 
-        crate::debug_log("draw_with_bottom_window: getting terminal size");
         let (width, height) = terminal::size()?;
 
         // Handle resize
         if (width, height) != self.last_size {
-            crate::debug_log("draw_with_bottom_window: handling resize");
             self.last_size = (width, height);
             self.last_screen = vec![String::new(); height as usize];
             self.last_status.clear();
@@ -249,55 +284,45 @@ impl Renderer {
             }
         }
 
-        crate::debug_log("draw_with_bottom_window: calculating content_height");
         // Get viewport dimensions for rendering
         let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize; // Reserve for status and bottom window
         // Note: viewport is only updated when cursor moves, not on every render
 
-        crate::debug_log("draw_with_bottom_window: about to update_syntax_viewport");
         // Process syntax highlighting first (requires mutable borrow)
         // Update viewport for large files
         let viewport_height = content_height;
         editor.update_syntax_viewport(viewport_height);
-        crate::debug_log("draw_with_bottom_window: update_syntax_viewport complete");
         // Only update syntax highlighting if we have work to do
-        crate::debug_log(&format!("draw_with_bottom_window: has_syntax_work = {}", editor.has_syntax_work()));
         if editor.has_syntax_work() {
-            crate::debug_log("draw_with_bottom_window: about to update_syntax_highlighting");
             editor.update_syntax_highlighting();
-            crate::debug_log("draw_with_bottom_window: update_syntax_highlighting complete");
         }
 
-        crate::debug_log("draw_with_bottom_window: getting viewport_offset");
         // Now get all the data we need with immutable borrows
         let viewport_offset = editor.viewport_offset();
-        crate::debug_log("draw_with_bottom_window: getting selection");
         let selection = editor.selection();
-        crate::debug_log("draw_with_bottom_window: getting buffer");
         let buffer = editor.buffer();
-        crate::debug_log("draw_with_bottom_window: getting matching_brackets");
         let matching_brackets = editor.get_matching_brackets();
-        crate::debug_log("draw_with_bottom_window: getting matching_text_positions");
         let matching_text_positions = editor.get_matching_text_positions();
-        crate::debug_log("draw_with_bottom_window: getting find_matches");
         let find_matches = editor.get_find_matches();
-        crate::debug_log("draw_with_bottom_window: getting current_find_match");
         let current_find_match = editor.get_current_find_match();
 
-        crate::debug_log("draw_with_bottom_window: hiding cursor");
-        // Hide cursor while drawing
+        // Hide cursor while drawing (but not if bottom window is focused - it handles its own cursor)
+        // Only hide cursor for full redraws to avoid blinking on differential updates (e.g., mouse clicks)
         #[cfg(target_os = "windows")]
-        write!(self.stdout, "\x1b[?25l")?;
-
+        let should_hide_cursor = !bottom_window_focused && self.needs_full_redraw;
         #[cfg(not(target_os = "windows"))]
-        execute!(self.stdout, Hide)?;
+        let should_hide_cursor = !bottom_window_focused;
 
-        crate::debug_log(&format!("draw_with_bottom_window: starting line drawing loop, content_height = {}", content_height));
+        if should_hide_cursor {
+            #[cfg(target_os = "windows")]
+            write!(self.stdout, "\x1b[?25l")?;
+
+            #[cfg(not(target_os = "windows"))]
+            execute!(self.stdout, Hide)?;
+        }
+
         // Draw all lines
         for screen_row in 0..content_height {
-            if screen_row == 0 || screen_row == content_height - 1 || screen_row % 10 == 0 {
-                crate::debug_log(&format!("draw_with_bottom_window: drawing screen_row {}", screen_row));
-            }
             let mut line_content = String::with_capacity(width as usize);
             
             // Calculate which logical line we're displaying
@@ -457,22 +482,28 @@ impl Renderer {
                                                 formatted_line.push_str(syntax_colors::KEYWORD);
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::KEYWORD, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.keyword);
                                             }
                                             SyntaxState::SqlFunction => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::FUNCTION, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.function);
                                             }
                                             SyntaxState::SqlNumber => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NUMBER, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.number);
                                             }
                                             SyntaxState::SqlText => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NORMAL, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.text);
                                             }
                                             SyntaxState::SqlComment => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::COMMENT, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.comment);
                                             }
                                             SyntaxState::SqlString => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::STRING, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.string);
                                             }
                                             SyntaxState::Normal => {
                                                 formatted_line.push_str(syntax_colors::NORMAL);
@@ -496,7 +527,7 @@ impl Renderer {
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
                                 }
-                                
+
                                 #[cfg(not(target_os = "windows"))]
                                 {
                                     if is_selected {
@@ -545,22 +576,28 @@ impl Renderer {
                                                 formatted_line.push_str(syntax_colors::KEYWORD);
                                             }
                                             SyntaxState::SqlKeyword => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::KEYWORD, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.keyword);
                                             }
                                             SyntaxState::SqlFunction => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::FUNCTION, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.function);
                                             }
                                             SyntaxState::SqlNumber => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NUMBER, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.number);
                                             }
                                             SyntaxState::SqlText => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::NORMAL, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.text);
                                             }
                                             SyntaxState::SqlComment => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::COMMENT, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.comment);
                                             }
                                             SyntaxState::SqlString => {
-                                                formatted_line.push_str(&sql_blended_color(syntax_colors::STRING, syntax_colors::STRING));
+                                                let sql_colors = get_sql_colors();
+                                                formatted_line.push_str(&sql_colors.string);
                                             }
                                             SyntaxState::Normal => {
                                                 formatted_line.push_str(syntax_colors::NORMAL);
@@ -584,7 +621,7 @@ impl Renderer {
                                         formatted_line.push_str("\x1b[39m"); // Reset foreground only
                                     }
                                 }
-                                
+
                                 screen_col += char_width;
                             }
                         }
@@ -669,28 +706,21 @@ impl Renderer {
             }
         }
 
-        crate::debug_log("draw_with_bottom_window: drawing loop completed, building status line");
         // Build status line - position it above any bottom window
         let status_row = (height - 1 - bottom_window_height as u16) as usize;
-        crate::debug_log("draw_with_bottom_window: calling is_modified");
         let modified_indicator = if editor.is_modified() { "*" } else { "" };
-        crate::debug_log("draw_with_bottom_window: calling is_read_only");
         let read_only_indicator = if editor.is_read_only() { " [RO]" } else { "" };
-        crate::debug_log("draw_with_bottom_window: calling file_name");
         let file_name = editor.file_name();
-        crate::debug_log("draw_with_bottom_window: calling cursor_position");
         let (line, col) = editor.cursor_position();
-        crate::debug_log("draw_with_bottom_window: calling buffer.len_lines");
         let total_lines = buffer.len_lines();
-        
+
         // Check for status messages (errors)
         let (status_msg, is_error) = if let Some((msg, is_err)) = &editor.status_message {
             (msg.as_str(), *is_err)
         } else {
             ("", false)
         };
-        
-        crate::debug_log("draw_with_bottom_window: formatting left_status");
+
         let left_status = if !status_msg.is_empty() {
             // Show error message instead of filename
             format!(" {} ", status_msg)
@@ -714,10 +744,8 @@ impl Renderer {
         };
         let language_info = format!(" [{}] ", language_name);
 
-        crate::debug_log("draw_with_bottom_window: calling is_repl_mode");
         // Add kernel info if in REPL mode
         let mut kernel_info = if editor.is_repl_mode() {
-            crate::debug_log("draw_with_bottom_window: in REPL mode, calling get_kernel_info");
             if let Some(kernel_name) = editor.get_kernel_info() {
                 format!(" [{}] ", kernel_name)
             } else {
@@ -726,9 +754,6 @@ impl Renderer {
         } else {
             String::new()
         };
-        crate::debug_log("draw_with_bottom_window: kernel_info formatted");
-
-        crate::debug_log("draw_with_bottom_window: formatting right_status");
         // Format the right status with fixed-width fields
         // Right-align the entire row/total as one unit (19 chars) and column (4 chars)
         // This accommodates up to 999,999,999 lines (9 digits + "/" + 9 digits)
@@ -738,7 +763,6 @@ impl Renderer {
             col + 1
         );
 
-        crate::debug_log("draw_with_bottom_window: building full status_line");
         // Calculate available space and truncate kernel_info if needed
         let min_width = left_status.len() + language_info.len() + right_status.len();
         let max_kernel_width = if min_width < width as usize {
@@ -780,7 +804,6 @@ impl Renderer {
             status_line = status_chars.iter().take(width as usize).collect();
         }
 
-        crate::debug_log("draw_with_bottom_window: about to write status line to stdout");
         // Only update status if it changed
         #[cfg(target_os = "windows")]
         {
@@ -804,7 +827,6 @@ impl Renderer {
         #[cfg(not(target_os = "windows"))]
         {
             if status_line != self.last_status {
-                crate::debug_log("draw_with_bottom_window: status line changed, executing crossterm commands");
                 if is_error {
                     // Red background for errors
                     execute!(
@@ -826,13 +848,9 @@ impl Renderer {
                         crossterm::style::ResetColor
                     )?;
                 }
-                crate::debug_log("draw_with_bottom_window: status line written");
                 self.last_status = status_line;
-            } else {
-                crate::debug_log("draw_with_bottom_window: status line unchanged, skipping write");
             }
         }
-        crate::debug_log("draw_with_bottom_window: status line complete");
         
         // Position cursor - map buffer position to screen position
         // Only show cursor if there's no bottom window (find/replace is closed)
@@ -868,11 +886,11 @@ impl Renderer {
             }
         }
         // If find/replace is open, cursor will be positioned by find_replace.draw()
-        
+
         self.stdout.flush()?;
         Ok(())
     }
-    
+
     /// Force a complete redraw by clearing cached state
     pub fn force_redraw(&mut self) {
         self.last_screen = vec![String::new(); self.last_size.1 as usize];

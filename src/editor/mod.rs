@@ -31,6 +31,10 @@ pub struct Editor {
     last_click_time: Option<Instant>, // Track time of last click for double/triple click
     last_click_position: Option<usize>, // Track position of last click
     click_count: usize,               // Track consecutive clicks (1=single, 2=double, 3=triple)
+    word_select_mode: bool,           // Track if we're in word selection mode (double-click + drag)
+    line_select_mode: bool,           // Track if we're in line selection mode (triple-click + drag)
+    word_select_anchor: Option<(usize, usize)>, // Original word boundaries (start, end) for word selection
+    line_select_anchor: Option<(usize, usize)>, // Original line boundaries (start, end) for line selection
     preferred_column: Option<usize>,  // Preferred column for vertical movement
     syntax: SyntaxHighlighter,       // Syntax highlighting state
     read_only: bool,                  // Whether the file is read-only
@@ -63,6 +67,10 @@ impl Editor {
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
+            word_select_mode: false,
+            line_select_mode: false,
+            word_select_anchor: None,
+            line_select_anchor: None,
             preferred_column: None,
             syntax: SyntaxHighlighter::new(),
             read_only: false,
@@ -93,6 +101,10 @@ impl Editor {
 
         // Clear mouse selection mode on any keyboard input
         self.mouse_selecting = false;
+        self.word_select_mode = false;
+        self.line_select_mode = false;
+        self.word_select_anchor = None;
+        self.line_select_anchor = None;
         
         // Clear error messages on any input (except for save commands)
         if !matches!(cmd, Command::Save | Command::SaveAs) && self.status_message.is_some() {

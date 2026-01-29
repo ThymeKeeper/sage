@@ -6,14 +6,6 @@ use crossterm::{
 use std::io::{self, Write};
 use std::time::Duration;
 
-fn debug_log(msg: &str) {
-    use std::fs::OpenOptions;
-    if let Ok(mut log) = OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
-        let _ = writeln!(log, "{}", msg);
-        let _ = log.flush();
-    }
-}
-
 pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
     let mut output_pane = output_pane::OutputPane::new();
@@ -34,8 +26,6 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut suppress_autocomplete_once = false; // Suppress after Tab completion
 
     loop {
-        debug_log(&format!("Loop iteration start"));
-
         // Check if background execution is complete
         if let Some(ref rx) = execution_rx {
             match rx.try_recv() {
@@ -106,14 +96,10 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
         // Only draw if needed
         if needs_redraw {
-            debug_log(&format!("needs_redraw is true, starting draw"));
-
             // If help screen is visible, draw it and skip everything else
             if let Some(ref help) = help_screen {
-                debug_log(&format!("Drawing help screen"));
                 help.draw(&mut io::stdout())?;
                 needs_redraw = false;
-                debug_log(&format!("Help screen draw completed"));
             } else {
                 // Calculate bottom window height
                 let bottom_window_height = if find_replace.is_some() {
@@ -124,17 +110,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     0
                 };
 
-                debug_log(&format!("About to call draw_with_bottom_window"));
                 // Draw the editor with bottom window if needed
-                renderer.draw_with_bottom_window(editor, bottom_window_height)?;
-                debug_log(&format!("draw_with_bottom_window completed"));
+                let bottom_focused = output_pane_visible && output_pane.is_focused();
+                renderer.draw_with_bottom_window(editor, bottom_window_height, bottom_focused)?;
 
                 // Draw the appropriate pane
                 if let Some(ref fr) = find_replace {
-                    debug_log(&format!("Drawing find_replace"));
                     fr.draw(&mut io::stdout())?;
                 } else if output_pane_visible {
-                    debug_log(&format!("Drawing output_pane"));
                     let (width, height) = crossterm::terminal::size()?;
                     // Output pane starts after the status bar
                     let output_start_row = height.saturating_sub(output_pane_height as u16);
@@ -143,7 +126,6 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     if !output_pane.is_focused() {
                         renderer.reposition_cursor(editor, bottom_window_height)?;
                     }
-                    debug_log(&format!("output_pane draw completed"));
                 }
 
                 // Draw autocomplete dropdown if visible
@@ -151,24 +133,22 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     let (screen_col, screen_row) = editor.cursor_screen_position();
                     let (width, height) = crossterm::terminal::size()?;
                     autocomplete.draw(&mut io::stdout(), screen_row as u16, screen_col as u16, height, width)?;
-                    // Reposition cursor after drawing autocomplete
-                    renderer.reposition_cursor(editor, bottom_window_height)?;
+                    // Reposition cursor after drawing autocomplete (but not if output pane is focused)
+                    if !output_pane.is_focused() {
+                        renderer.reposition_cursor(editor, bottom_window_height)?;
+                    }
                 }
 
-                needs_redraw = false; // Reset flag after drawing
-                debug_log(&format!("Draw complete, needs_redraw set to false"));
+                needs_redraw = false;
             }
         }
 
         // Skip event read if we need immediate redraw (after cell execution)
         if skip_event_read {
-            debug_log(&format!("Skipping event read, continuing loop"));
             skip_event_read = false;
             needs_redraw = true;
             continue;
         }
-
-        debug_log(&format!("About to read event"));
         // Handle input - use polling with timeout when execution is running
         let event_available = if execution_rx.is_some() {
             // Poll with 100ms timeout to update timer frequently
@@ -184,12 +164,6 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
         }
 
         let event = event::read()?;
-        debug_log(&format!("Event read completed: {:?}", match &event {
-            Event::Key(k) => format!("Key({:?})", k.code),
-            Event::Mouse(_) => "Mouse".to_string(),
-            Event::Resize(w, h) => format!("Resize({}, {})", w, h),
-            _ => "Other".to_string(),
-        }));
         match event {
             Event::Mouse(mouse_event) => {
                 // Check if shift is held for horizontal scrolling
@@ -227,14 +201,18 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                             // Check if click is in output pane area
                             let (_, height) = crossterm::terminal::size()?;
-                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+                            // The actual output pane start row (matching draw calculation)
+                            let pane_start_row = height.saturating_sub(output_pane_height as u16);
+                            // Include status line row in click area
+                            let click_area_start = height.saturating_sub(output_pane_height as u16 + 1);
 
-                            if output_pane_visible && mouse_event.row >= output_start_row {
-                                // Click is in output pane - focus it and start mouse selection
-                                output_pane.set_focused(true);
+                            if output_pane_visible && mouse_event.row >= click_area_start {
+                                // Click is in output pane - start mouse selection (which handles focus)
                                 output_pane.start_mouse_selection(
                                     mouse_event.column as usize,
                                     mouse_event.row as usize,
+                                    pane_start_row,
+                                    output_pane_height,
                                 );
                                 needs_redraw = true;
                             } else {
@@ -248,21 +226,24 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                     // Update viewport with correct bottom window height
                                     let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
                                     editor.update_viewport_for_cursor_with_bottom(bottom_height);
-                                    renderer.force_redraw();
-                                    needs_redraw = true; // Need to redraw for selection
+                                    // Don't force full redraw - differential rendering handles cursor movement
+                                    needs_redraw = true;
                                 }
                             }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
                             // Check if we're dragging in the output pane
                             let (_, height) = crossterm::terminal::size()?;
-                            let output_start_row = height.saturating_sub(output_pane_height as u16 + 1);
+                            let pane_start_row = height.saturating_sub(output_pane_height as u16);
+                            let click_area_start = height.saturating_sub(output_pane_height as u16 + 1);
 
-                            if output_pane.is_focused() && output_pane_visible && mouse_event.row >= output_start_row {
+                            if output_pane.is_focused() && output_pane_visible && mouse_event.row >= click_area_start {
                                 // Update selection in output pane
                                 output_pane.update_mouse_selection(
                                     mouse_event.column as usize,
                                     mouse_event.row as usize,
+                                    pane_start_row,
+                                    output_pane_height,
                                 );
                                 needs_redraw = true;
                             } else {
@@ -875,25 +856,18 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                         execute!(io::stdout(), crossterm::cursor::Hide)?;
 
-                        debug_log(&format!("About to run kernel selector"));
                         let result = match selector.run(&mut io::stdout()) {
-                            Ok(r) => {
-                                debug_log(&format!("Kernel selector returned: {:?}", r.is_some()));
-                                r
-                            }
+                            Ok(r) => r,
                             Err(e) => {
-                                debug_log(&format!("Kernel selector error: {}", e));
                                 editor.status_message = Some((format!("Selector error: {}", e), true));
                                 None
                             }
                         };
 
-                        debug_log(&format!("Clearing screen"));
                         // Clear and redraw - important to clear the entire screen
                         execute!(io::stdout(),
                             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
                         )?;
-                        debug_log(&format!("Screen cleared"));
 
                         // Reset terminal state completely
                         execute!(io::stdout(), crossterm::cursor::Hide)?;
@@ -927,25 +901,18 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                             // Disconnect old kernel first if exists
                             if editor.is_kernel_connected() {
-                                debug_log(&format!("Disconnecting old kernel"));
                                 let _ = editor.disconnect_kernel();
-                                debug_log(&format!("Old kernel disconnected"));
                             }
 
                             // Connect to kernel
-                            debug_log(&format!("Connecting to new kernel: {}", kernel_info.display_name));
                             match kernel.connect() {
                                 Ok(_) => {
-                                    debug_log(&format!("Connected successfully"));
                                     editor.set_kernel(kernel);
                                     editor.enable_repl_mode();
                                     editor.status_message = Some(("Connected to kernel".to_string(), false));
-                                    debug_log(&format!("Kernel set"));
                                 }
                                 Err(e) => {
-                                    debug_log(&format!("Connection failed: {}", e));
                                     editor.status_message = Some((format!("Failed to connect: {}", e), true));
-                                    // Don't set the kernel if connection failed
                                 }
                             }
                         } else {
@@ -953,14 +920,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             editor.status_message = None;
                         }
 
-                        debug_log(&format!("About to force full redraw"));
                         // Force full redraw after kernel selector
                         execute!(io::stdout(),
                             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
                         )?;
-                        debug_log(&format!("Screen cleared 2"));
                         renderer.force_redraw();
-                        debug_log(&format!("Force redraw done, setting needs_redraw"));
                         needs_redraw = true;
 
                         commands::Command::None
