@@ -193,6 +193,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             // Hide autocomplete on any mouse click
                             if autocomplete.is_visible() {
                                 autocomplete.hide();
+                                renderer.force_redraw(); // Force full redraw to clear autocomplete popup
                                 if output_pane_visible {
                                     output_pane.invalidate_cache();
                                 }
