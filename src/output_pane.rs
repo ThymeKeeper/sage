@@ -8,37 +8,85 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 /// Calculate the display width of a string, ignoring ANSI escape sequences.
-/// ANSI escape sequences like \x1b[31m (for colors) take up bytes but no display columns.
+/// Handles both CSI sequences (\x1b[...m for colors) and OSC sequences (\x1b]...ST for hyperlinks).
+/// OSC 8 hyperlinks: \x1b]8;;URL\x1b\\ or \x1b]8;;URL\x07
 fn display_width(s: &str) -> usize {
     let mut width = 0;
-    let mut in_escape = false;
-    for ch in s.chars() {
-        if ch == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if ch == 'm' {
-                in_escape = false;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1b' && i + 1 < chars.len() {
+            if chars[i + 1] == '[' {
+                // CSI sequence: \x1b[...m
+                i += 2;
+                while i < chars.len() && chars[i] != 'm' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1; // Skip the 'm'
+                }
+            } else if chars[i + 1] == ']' {
+                // OSC sequence: \x1b]...ST (ST is \x1b\\ or \x07)
+                i += 2;
+                while i < chars.len() {
+                    if chars[i] == '\x07' {
+                        i += 1;
+                        break;
+                    } else if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                // Unknown escape, skip just the ESC
+                i += 1;
             }
         } else {
             width += 1;
+            i += 1;
         }
     }
     width
 }
 
 /// Strip all ANSI escape sequences from a string, returning only the visible text.
+/// Handles both CSI sequences (\x1b[...m) and OSC sequences (\x1b]...ST).
 fn strip_ansi(s: &str) -> String {
     let mut result = String::new();
-    let mut in_escape = false;
-    for ch in s.chars() {
-        if ch == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if ch == 'm' {
-                in_escape = false;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1b' && i + 1 < chars.len() {
+            if chars[i + 1] == '[' {
+                // CSI sequence: \x1b[...m
+                i += 2;
+                while i < chars.len() && chars[i] != 'm' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1; // Skip the 'm'
+                }
+            } else if chars[i + 1] == ']' {
+                // OSC sequence: \x1b]...ST (ST is \x1b\\ or \x07)
+                i += 2;
+                while i < chars.len() {
+                    if chars[i] == '\x07' {
+                        i += 1;
+                        break;
+                    } else if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                // Unknown escape, skip just the ESC
+                i += 1;
             }
         } else {
-            result.push(ch);
+            result.push(chars[i]);
+            i += 1;
         }
     }
     result
@@ -46,38 +94,63 @@ fn strip_ansi(s: &str) -> String {
 
 /// Extract a visible substring from a string containing ANSI escape sequences.
 /// Returns a substring that displays `visible_width` characters starting from display position `start`.
+/// Handles both CSI sequences (\x1b[...m) and OSC sequences (\x1b]...ST).
 /// ANSI escape sequences are preserved in the output as they don't consume display space.
 fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
     let mut result = String::new();
     let mut display_pos = 0;
-    let mut in_escape = false;
-    let mut escape_seq = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
 
-    for ch in s.chars() {
-        if ch == '\x1b' {
-            in_escape = true;
-            escape_seq.clear();
-            escape_seq.push(ch);
-        } else if in_escape {
-            escape_seq.push(ch);
-            if ch == 'm' {
-                in_escape = false;
-                // Always include escape sequences that are within or before our visible range
-                if display_pos < start + visible_width {
-                    result.push_str(&escape_seq);
+    while i < chars.len() {
+        if chars[i] == '\x1b' && i + 1 < chars.len() {
+            if chars[i + 1] == '[' {
+                // CSI sequence: \x1b[...m
+                let seq_start = i;
+                i += 2;
+                while i < chars.len() && chars[i] != 'm' {
+                    i += 1;
                 }
+                if i < chars.len() {
+                    i += 1; // Include the 'm'
+                }
+                // Include escape sequences that are within or before our visible range
+                if display_pos < start + visible_width {
+                    for j in seq_start..i {
+                        result.push(chars[j]);
+                    }
+                }
+            } else if chars[i + 1] == ']' {
+                // OSC sequence: \x1b]...ST (ST is \x1b\\ or \x07)
+                let seq_start = i;
+                i += 2;
+                while i < chars.len() {
+                    if chars[i] == '\x07' {
+                        i += 1;
+                        break;
+                    } else if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                // Include OSC sequences that are within or before our visible range
+                if display_pos < start + visible_width {
+                    for j in seq_start..i {
+                        result.push(chars[j]);
+                    }
+                }
+            } else {
+                // Unknown escape, skip just the ESC
+                i += 1;
             }
         } else {
             // This is a visible character
             if display_pos >= start && display_pos < start + visible_width {
-                result.push(ch);
+                result.push(chars[i]);
             }
             display_pos += 1;
-            // Stop if we've collected enough visible characters
-            if display_pos >= start + visible_width {
-                // Continue to collect any trailing escape sequences
-                // (but we'll break on the next visible char)
-            }
+            i += 1;
         }
     }
 
@@ -259,12 +332,14 @@ impl OutputPane {
     }
 
     pub fn scroll_up(&mut self) {
-        self.auto_scroll = false;
+        // Sync scroll_offset to current view position before manual scrolling
+        self.disable_auto_scroll();
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 
     pub fn scroll_down(&mut self) {
-        self.auto_scroll = false;
+        // Sync scroll_offset to current view position before manual scrolling
+        self.disable_auto_scroll();
         let total_lines = self.count_total_lines();
         if self.scroll_offset + 1 < total_lines {
             self.scroll_offset += 1;
@@ -474,10 +549,12 @@ impl OutputPane {
         }
 
         let line_text = &lines[self.cursor_line].0;
+        // Work with visible text only (strip ANSI escape sequences)
+        let visible_text = strip_ansi(line_text);
 
         if self.cursor_col > 0 {
             // Find the previous word boundary within the current line
-            let chars: Vec<char> = line_text.chars().collect();
+            let chars: Vec<char> = visible_text.chars().collect();
             let mut new_col = 0;
             let mut in_word = false;
 
@@ -520,7 +597,9 @@ impl OutputPane {
         }
 
         let line_text = &lines[self.cursor_line].0;
-        let chars: Vec<char> = line_text.chars().collect();
+        // Work with visible text only (strip ANSI escape sequences)
+        let visible_text = strip_ansi(line_text);
+        let chars: Vec<char> = visible_text.chars().collect();
         let line_len = chars.len();
 
         if self.cursor_col < line_len {
@@ -755,7 +834,7 @@ impl OutputPane {
         all_lines
     }
 
-    /// Get selected text
+    /// Get selected text (returns only visible text, stripping ANSI escape sequences)
     pub fn get_selected_text(&self) -> Option<String> {
         if let Some((start_line, start_col)) = self.selection_start {
             let lines = self.get_all_lines();
@@ -772,29 +851,31 @@ impl OutputPane {
             let mut selected = String::new();
             for line_idx in sel_start_line..=sel_end_line.min(lines.len().saturating_sub(1)) {
                 let line_text = &lines[line_idx].0;
-                let line_chars: Vec<char> = line_text.chars().collect();
-                let line_char_count = line_chars.len();
+                // Work with visible text only (strip ANSI escape sequences)
+                let visible_text = strip_ansi(line_text);
+                let visible_chars: Vec<char> = visible_text.chars().collect();
+                let visible_len = visible_chars.len();
 
                 if line_idx == sel_start_line && line_idx == sel_end_line {
-                    // Selection within single line - use char-based indexing
-                    let start = sel_start_col.min(line_char_count);
-                    let end = sel_end_col.min(line_char_count);
-                    let substring: String = line_chars[start..end].iter().collect();
+                    // Selection within single line - use display position indexing
+                    let start = sel_start_col.min(visible_len);
+                    let end = sel_end_col.min(visible_len);
+                    let substring: String = visible_chars[start..end].iter().collect();
                     selected.push_str(&substring);
                 } else if line_idx == sel_start_line {
                     // First line of multi-line selection
-                    let start = sel_start_col.min(line_char_count);
-                    let substring: String = line_chars[start..].iter().collect();
+                    let start = sel_start_col.min(visible_len);
+                    let substring: String = visible_chars[start..].iter().collect();
                     selected.push_str(&substring);
                     selected.push('\n');
                 } else if line_idx == sel_end_line {
                     // Last line of multi-line selection
-                    let end = sel_end_col.min(line_char_count);
-                    let substring: String = line_chars[..end].iter().collect();
+                    let end = sel_end_col.min(visible_len);
+                    let substring: String = visible_chars[..end].iter().collect();
                     selected.push_str(&substring);
                 } else {
-                    // Middle lines
-                    selected.push_str(line_text);
+                    // Middle lines - use full visible text
+                    selected.push_str(&visible_text);
                     selected.push('\n');
                 }
             }
@@ -1489,7 +1570,7 @@ impl OutputPane {
         }
     }
 
-    /// Select the word at the given position
+    /// Select the word at the given position (col is a display position)
     fn select_word_at(&mut self, line: usize, col: usize) {
         let lines = self.get_all_lines();
         if line >= lines.len() {
@@ -1497,13 +1578,15 @@ impl OutputPane {
         }
 
         let line_text = &lines[line].0;
-        let chars: Vec<char> = line_text.chars().collect();
+        // Work with visible text only (strip ANSI escape sequences)
+        let visible_text = strip_ansi(line_text);
+        let chars: Vec<char> = visible_text.chars().collect();
 
         if col >= chars.len() {
             return;
         }
 
-        // Find word boundaries
+        // Find word boundaries on visible text
         let mut start_col = col;
         let mut end_col = col;
 
@@ -1517,7 +1600,7 @@ impl OutputPane {
             end_col += 1;
         }
 
-        // Set selection
+        // Set selection (coordinates are display positions)
         if start_col < end_col {
             self.selection_start = Some((line, start_col));
             self.cursor_line = line;
@@ -1619,5 +1702,63 @@ mod tests {
         let after = slice_with_ansi(text, 18, 100);
         let after_plain = strip_ansi(&after);
         assert_eq!(after_plain, "Error message");
+    }
+
+    #[test]
+    fn test_display_width_with_osc8_hyperlink() {
+        // OSC 8 hyperlink with BEL terminator: \x1b]8;;URL\x07text\x1b]8;;\x07
+        let link_bel = "\x1b]8;;https://example.com\x07click here\x1b]8;;\x07";
+        assert_eq!(display_width(link_bel), 10); // "click here" = 10 chars
+
+        // OSC 8 hyperlink with ST terminator: \x1b]8;;URL\x1b\\text\x1b]8;;\x1b\\
+        let link_st = "\x1b]8;;https://example.com\x1b\\click here\x1b]8;;\x1b\\";
+        assert_eq!(display_width(link_st), 10); // "click here" = 10 chars
+
+        // Mixed content: colored hyperlink
+        let colored_link = "\x1b[34m\x1b]8;;https://example.com\x07link\x1b]8;;\x07\x1b[0m";
+        assert_eq!(display_width(colored_link), 4); // "link" = 4 chars
+    }
+
+    #[test]
+    fn test_strip_ansi_with_osc8_hyperlink() {
+        // OSC 8 hyperlink with BEL terminator
+        let link_bel = "\x1b]8;;https://example.com\x07click here\x1b]8;;\x07";
+        assert_eq!(strip_ansi(link_bel), "click here");
+
+        // OSC 8 hyperlink with ST terminator
+        let link_st = "\x1b]8;;https://example.com\x1b\\click here\x1b]8;;\x1b\\";
+        assert_eq!(strip_ansi(link_st), "click here");
+
+        // Mixed: CSI color + OSC hyperlink
+        let mixed = "\x1b[31mError: \x1b]8;;file://path\x07file.txt\x1b]8;;\x07\x1b[0m";
+        assert_eq!(strip_ansi(mixed), "Error: file.txt");
+    }
+
+    #[test]
+    fn test_slice_with_ansi_osc8_hyperlink() {
+        // OSC 8 hyperlink
+        let link = "\x1b]8;;https://example.com\x07click here\x1b]8;;\x07 more text";
+
+        // Slice just the link text
+        let result = slice_with_ansi(link, 0, 10);
+        assert!(result.contains("\x1b]8;;https://example.com\x07")); // OSC start preserved
+        assert!(result.contains("click here"));
+        assert_eq!(display_width(&result), 10);
+
+        // Slice after the link
+        let after = slice_with_ansi(link, 11, 9);
+        assert_eq!(strip_ansi(&after), "more text");
+    }
+
+    #[test]
+    fn test_slice_with_ansi_preserves_hyperlink_across_slice() {
+        // When slicing in the middle of hyperlink text, OSC sequences should be preserved
+        let link = "prefix \x1b]8;;https://example.com\x07click here\x1b]8;;\x07 suffix";
+
+        // Slice starting from "click"
+        let result = slice_with_ansi(link, 7, 10);
+        // Should contain the OSC start sequence since it's before/at our start position
+        assert!(result.contains("\x1b]8;;"));
+        assert_eq!(strip_ansi(&result), "click here");
     }
 }
