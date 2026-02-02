@@ -56,7 +56,10 @@ pub enum Command {
     // Undo/Redo
     Undo,
     Redo,
-    
+
+    // Text transformation
+    ToggleCase,
+
     // No operation
     None,
 }

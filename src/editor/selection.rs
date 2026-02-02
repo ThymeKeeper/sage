@@ -8,16 +8,22 @@ impl Editor {
     }
 
     /// Get the current selection as (start, end) byte positions
+    /// Returns None if there's no selection or if selection has zero length
     pub(super) fn get_selection(&self) -> Option<(usize, usize)> {
-        self.selection_start.map(|start| {
+        self.selection_start.and_then(|start| {
             // Ensure both positions are on character boundaries
             let start = self.ensure_char_boundary(start);
             let cursor = self.ensure_char_boundary(self.cursor);
 
+            // No selection if start equals cursor (zero-length selection)
+            if start == cursor {
+                return None;
+            }
+
             if start < cursor {
-                (start, cursor)
+                Some((start, cursor))
             } else {
-                (cursor, start)
+                Some((cursor, start))
             }
         })
     }

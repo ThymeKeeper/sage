@@ -791,6 +791,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         commands::Command::SelectAll
                     }
 
+                    // Toggle Case (Ctrl+U)
+                    KeyCode::Char('u') | KeyCode::Char('U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        commands::Command::ToggleCase
+                    }
+
                     // Execute Cell (Ctrl+E as alternative)
                     KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Only allow execution in Python/REPL mode

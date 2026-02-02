@@ -1201,6 +1201,29 @@ impl Editor {
                 self.modified = true;
             }
             
+            Command::ToggleCase => {
+                if let Some(text) = self.get_selected_text() {
+                    // Count uppercase letters to decide which way to toggle
+                    let upper_count = text.chars().filter(|c| c.is_uppercase()).count();
+                    let lower_count = text.chars().filter(|c| c.is_lowercase()).count();
+
+                    let toggled = if upper_count > lower_count {
+                        // More uppercase, convert to lowercase
+                        text.to_lowercase()
+                    } else {
+                        // More lowercase (or equal), convert to uppercase
+                        text.to_uppercase()
+                    };
+
+                    if let Some((start, end)) = self.get_selection() {
+                        // Preserve selection after replacement
+                        let new_end = start + toggled.len();
+                        self.replace_at(start, end, &toggled);
+                        self.select_range(start, new_end);
+                    }
+                }
+            }
+
             Command::None => {}
         }
         
