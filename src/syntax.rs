@@ -51,15 +51,20 @@ pub struct HighlightSpan {
 pub struct LineState {
     /// The state we're in when we start processing this line (from previous line)
     pub entry_state: SyntaxState,
-    
+
     /// The state we're in when we finish processing this line (for next line)
     pub exit_state: SyntaxState,
-    
+
     /// All the highlight spans in this line
     pub spans: Vec<HighlightSpan>,
-    
+
     /// Hash of the line content for change detection
     pub content_hash: u64,
+
+    /// Whether this line is inside a triple-quoted string with SQL context
+    /// Propagated forward from the line where the string opened, so that
+    /// continuation lines can check this in O(1) instead of walking backwards.
+    pub in_sql_context: bool,
 }
 
 impl LineState {
@@ -69,6 +74,7 @@ impl LineState {
             exit_state: SyntaxState::Normal,
             spans: Vec::new(),
             content_hash: 0,
+            in_sql_context: false,
         }
     }
 }
@@ -623,8 +629,9 @@ impl SyntaxHighlighter {
         false
     }
 
-    /// Check if we're in an SQL context, looking back at recent lines for multiline strings
-    fn check_sql_context<F>(&self, line_index: usize, line_content: &str, entry_state: SyntaxState, get_line: &F) -> bool
+    /// Check if we're in an SQL context by reading the previous line's propagated flag.
+    /// This is O(1) - the flag is computed in process_line and propagated forward.
+    fn check_sql_context<F>(&self, line_index: usize, line_content: &str, entry_state: SyntaxState, _get_line: &F) -> bool
     where
         F: Fn(usize) -> Option<String>
     {
@@ -633,67 +640,10 @@ impl SyntaxHighlighter {
             return true;
         }
 
-        // If we're in a string continuation (entry_state is a string state),
-        // find where this specific string started and check if that line has SQL context
-        if matches!(entry_state, SyntaxState::StringTriple | SyntaxState::StringTripleSingle |
-                                 SyntaxState::StringDouble | SyntaxState::StringSingle) {
-
-            // Determine the quote pattern for this string type
-            let quote_pattern = match entry_state {
-                SyntaxState::StringTriple => "\"\"\"",
-                SyntaxState::StringTripleSingle => "'''",
-                SyntaxState::StringDouble => "\"",
-                SyntaxState::StringSingle => "'",
-                _ => return false,
-            };
-
-            // Look back to find the line where this string started
-            let start = line_index.saturating_sub(100);
-            for i in (start..line_index).rev() {
-                if i < self.line_states.len() {
-                    let line_entry = self.line_states[i].entry_state;
-                    let line_exit = self.line_states[i].exit_state;
-
-                    // If this line's exit state doesn't match our current string state,
-                    // then our string didn't exist yet on this line - stop looking
-                    if line_exit != entry_state {
-                        return false;
-                    }
-
-                    // Check if this line has BOTH closing and opening quotes (string boundary)
-                    // This catches cases like: """).show(null_value=""" where entry==exit
-                    if line_entry == line_exit {
-                        if let Some(prev_line) = get_line(i) {
-                            // Count occurrences of the quote pattern
-                            let count = prev_line.matches(quote_pattern).count();
-                            // If there are 2+ occurrences, one string closed and another opened
-                            // Our current string started on this line, not earlier
-                            if count >= 2 {
-                                // Find the LAST occurrence of the quote pattern
-                                if let Some(last_pos) = prev_line.rfind(quote_pattern) {
-                                    // Check if SQL pattern precedes this last opening quote
-                                    return self.sql_pattern_precedes_position(&prev_line, last_pos);
-                                }
-                                return false;
-                            }
-                        }
-                    }
-
-                    // If this line's entry state differs from exit state,
-                    // then this line is where our string started
-                    if line_entry != line_exit {
-                        // String started on this line - check for SQL pattern preceding the opening
-                        if let Some(prev_line) = get_line(i) {
-                            // Find where the string opened on this line
-                            if let Some(pos) = prev_line.find(quote_pattern) {
-                                return self.sql_pattern_precedes_position(&prev_line, pos);
-                            }
-                            // Fallback to line-level check
-                            return self.line_has_sql_context(&prev_line);
-                        }
-                        return false;
-                    }
-                }
+        // For continuation strings, check the previous line's cached flag
+        if matches!(entry_state, SyntaxState::StringTriple | SyntaxState::StringTripleSingle) {
+            if line_index > 0 && line_index - 1 < self.line_states.len() {
+                return self.line_states[line_index - 1].in_sql_context;
             }
         }
 
@@ -741,12 +691,33 @@ impl SyntaxHighlighter {
             false
         };
 
+        // Compute in_sql_context for propagation to subsequent lines
+        let in_sql_context = if self.language == Language::Python
+            && matches!(new_exit_state, SyntaxState::StringTriple | SyntaxState::StringTripleSingle)
+        {
+            if matches!(entry_state, SyntaxState::StringTriple | SyntaxState::StringTripleSingle) {
+                // Continuation line - propagate from previous line
+                if line_index > 0 { self.line_states[line_index - 1].in_sql_context } else { false }
+            } else {
+                // String opened on this line - check if SQL pattern precedes it
+                let quote = if new_exit_state == SyntaxState::StringTriple { "\"\"\"" } else { "'''" };
+                if let Some(pos) = line_content.find(quote) {
+                    self.sql_pattern_precedes_position(line_content, pos)
+                } else {
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         // Now update the line state
         let line_state = &mut self.line_states[line_index];
         line_state.entry_state = entry_state;
         line_state.exit_state = new_exit_state;
         line_state.spans = new_spans;
         line_state.content_hash = content_hash;
+        line_state.in_sql_context = in_sql_context;
 
         // Mark next line as dirty if needed
         if should_mark_next {
