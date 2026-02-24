@@ -193,7 +193,7 @@ impl Editor {
         self.current_find_match
     }
 
-    /// Find all occurrences of a string in the buffer
+    /// Find all occurrences of a string in the buffer (case-insensitive)
     pub fn find_all(&self, search_text: &str) -> Vec<(usize, usize)> {
         // Skip search if text is too short to avoid performance issues
         // (single characters can match thousands of times in large files)
@@ -202,21 +202,49 @@ impl Editor {
         }
 
         let buffer_text = self.buffer.to_string();
+        let search_lower = search_text.to_lowercase();
+        let buffer_lower = buffer_text.to_lowercase();
         let mut matches = Vec::new();
-        let mut pos = 0;
 
-        while pos < buffer_text.len() {
-            // Ensure we're on a character boundary
-            if !buffer_text.is_char_boundary(pos) {
+        // Build a mapping from lowercase byte positions to original byte positions.
+        // This is needed because lowercasing can change byte lengths (e.g. 'İ' 2 bytes -> 'i̇' 3 bytes).
+        let mut lower_to_orig: Vec<usize> = Vec::with_capacity(buffer_lower.len() + 1);
+        {
+            let mut orig_chars = buffer_text.char_indices().peekable();
+            for (_lower_idx, lower_ch) in buffer_lower.char_indices() {
+                if let Some(&(orig_idx, _orig_ch)) = orig_chars.peek() {
+                    // Map each byte of this lowercase char to the original byte position
+                    for _ in 0..lower_ch.len_utf8() {
+                        lower_to_orig.push(orig_idx);
+                    }
+                    // Only advance the original iterator when we've consumed a full original character.
+                    // A single original char may map to multiple lowercase chars (rare), but for
+                    // the common case (same number of chars), advance one-to-one.
+                    orig_chars.next();
+                }
+            }
+            // Sentinel for end position
+            lower_to_orig.push(buffer_text.len());
+        }
+
+        let mut pos = 0;
+        while pos < buffer_lower.len() {
+            if !buffer_lower.is_char_boundary(pos) {
                 pos += 1;
                 continue;
             }
 
-            if let Some(found) = buffer_text[pos..].find(search_text) {
-                let match_start = pos + found;
-                let match_end = match_start + search_text.len();
-                matches.push((match_start, match_end));
-                pos = match_end;
+            if let Some(found) = buffer_lower[pos..].find(&search_lower) {
+                let lower_start = pos + found;
+                let lower_end = lower_start + search_lower.len();
+                let orig_start = lower_to_orig[lower_start];
+                let orig_end = if lower_end < lower_to_orig.len() {
+                    lower_to_orig[lower_end]
+                } else {
+                    buffer_text.len()
+                };
+                matches.push((orig_start, orig_end));
+                pos = lower_end;
             } else {
                 break;
             }

@@ -65,6 +65,11 @@ pub struct LineState {
     /// Propagated forward from the line where the string opened, so that
     /// continuation lines can check this in O(1) instead of walking backwards.
     pub in_sql_context: bool,
+
+    /// Whether this line ends inside an unclosed SQL block comment (/* ... */)
+    /// within a triple-quoted SQL string. Propagated forward so continuation
+    /// lines know to treat their content as a comment until */ is found.
+    pub in_sql_block_comment: bool,
 }
 
 impl LineState {
@@ -75,6 +80,7 @@ impl LineState {
             spans: Vec::new(),
             content_hash: 0,
             in_sql_context: false,
+            in_sql_block_comment: false,
         }
     }
 }
@@ -401,10 +407,44 @@ impl SyntaxHighlighter {
     }
 
     /// Tokenize SQL content within a string
-    /// Returns spans for SQL keywords, functions, numbers, and comments
-    fn tokenize_sql_content(&self, content: &str, string_start: usize) -> Vec<HighlightSpan> {
+    /// Returns (spans, in_block_comment) where in_block_comment indicates whether
+    /// a /* block comment is still open at the end of this content.
+    fn tokenize_sql_content(&self, content: &str, string_start: usize, entering_block_comment: bool) -> (Vec<HighlightSpan>, bool) {
         let mut spans = Vec::new();
         let mut char_indices = content.char_indices().peekable();
+        let mut in_block_comment = entering_block_comment;
+
+        // If we're continuing a block comment from a previous line, consume until */
+        if in_block_comment {
+            let start = 0;
+            let mut end = 0;
+            let mut prev_ch = '\0';
+            let mut found_close = false;
+            while let Some(&(next_pos, next_ch)) = char_indices.peek() {
+                end = next_pos + next_ch.len_utf8();
+                char_indices.next();
+                if prev_ch == '*' && next_ch == '/' {
+                    found_close = true;
+                    break;
+                }
+                prev_ch = next_ch;
+            }
+
+            if end > start {
+                spans.push(HighlightSpan {
+                    start: string_start + start,
+                    end: string_start + end,
+                    state: SyntaxState::SqlComment,
+                });
+            }
+
+            if found_close {
+                in_block_comment = false;
+            } else {
+                // Still in block comment at end of content
+                return (spans, true);
+            }
+        }
 
         while let Some((byte_pos, ch)) = char_indices.next() {
             // Skip whitespace
@@ -449,10 +489,12 @@ impl SyntaxHighlighter {
                         // Consume until */ or end of content
                         let mut end = byte_pos + 2; // "/*"
                         let mut prev_ch = '*';
+                        let mut found_close = false;
                         while let Some(&(next_pos, next_ch)) = char_indices.peek() {
                             end = next_pos + next_ch.len_utf8();
                             char_indices.next();
                             if prev_ch == '*' && next_ch == '/' {
+                                found_close = true;
                                 break;
                             }
                             prev_ch = next_ch;
@@ -463,6 +505,10 @@ impl SyntaxHighlighter {
                             end: string_start + end,
                             state: SyntaxState::SqlComment,
                         });
+
+                        if !found_close {
+                            in_block_comment = true;
+                        }
                         continue;
                     }
                 }
@@ -585,7 +631,7 @@ impl SyntaxHighlighter {
             // Skip other characters (operators, punctuation, etc.) - iterator advances automatically
         }
 
-        spans
+        (spans, in_block_comment)
     }
 
     /// SQL patterns that indicate a string argument should be highlighted as SQL
@@ -672,10 +718,11 @@ impl SyntaxHighlighter {
         let bytes = line_content.as_bytes();
 
         // Use the enhanced tokenizer if we're processing a programming language
-        let (new_spans, final_state) = if self.language != Language::PlainText {
+        let (new_spans, final_state, sql_block_comment_open) = if self.language != Language::PlainText {
             self.tokenize_line_enhanced(line_content, entry_state, bytes, line_index, get_line)
         } else {
-            self.tokenize_line_simple(line_content, entry_state, bytes)
+            let (spans, state) = self.tokenize_line_simple(line_content, entry_state, bytes);
+            (spans, state, false)
         };
 
         // Set exit state (line comments don't carry over)
@@ -685,8 +732,10 @@ impl SyntaxHighlighter {
         };
 
         // Check if we need to mark the next line as dirty before updating
+        let old_sql_block_comment = self.line_states[line_index].in_sql_block_comment;
         let should_mark_next = if line_index + 1 < self.line_states.len() {
             self.line_states[line_index + 1].entry_state != new_exit_state
+                || old_sql_block_comment != sql_block_comment_open
         } else {
             false
         };
@@ -718,6 +767,7 @@ impl SyntaxHighlighter {
         line_state.spans = new_spans;
         line_state.content_hash = content_hash;
         line_state.in_sql_context = in_sql_context;
+        line_state.in_sql_block_comment = sql_block_comment_open;
 
         // Mark next line as dirty if needed
         if should_mark_next {
@@ -1093,19 +1143,29 @@ impl SyntaxHighlighter {
     }
 
     /// Enhanced tokenizer for programming languages
-    fn tokenize_line_enhanced<F>(&self, line_content: &str, entry_state: SyntaxState, bytes: &[u8], line_index: usize, get_line: &F) -> (Vec<HighlightSpan>, SyntaxState)
+    /// Returns (spans, final_state, in_sql_block_comment)
+    fn tokenize_line_enhanced<F>(&self, line_content: &str, entry_state: SyntaxState, bytes: &[u8], line_index: usize, get_line: &F) -> (Vec<HighlightSpan>, SyntaxState, bool)
     where
         F: Fn(usize) -> Option<String>
     {
         // Special handling for Markdown
         if self.language == Language::Markdown {
-            return self.tokenize_markdown_line(line_content, entry_state, bytes);
+            let (spans, state) = self.tokenize_markdown_line(line_content, entry_state, bytes);
+            return (spans, state, false);
         }
 
         let mut new_spans = Vec::new();
         let mut current_state = entry_state;
         let mut current_pos = 0;
         let mut span_start = 0;
+        let mut sql_block_comment_open = false;
+
+        // Get previous line's SQL block comment state for continuation lines
+        let prev_sql_block_comment = if line_index > 0 && line_index - 1 < self.line_states.len() {
+            self.line_states[line_index - 1].in_sql_block_comment
+        } else {
+            false
+        };
 
         while current_pos < bytes.len() {
             match current_state {
@@ -1243,7 +1303,7 @@ impl SyntaxHighlighter {
                             });
 
                             // Get SQL spans for content
-                            let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+                            let (sql_spans, _) = self.tokenize_sql_content(string_content, string_content_start, false);
 
                             // Fill gaps with string spans
                             let mut last_end = string_content_start;
@@ -1323,7 +1383,7 @@ impl SyntaxHighlighter {
                             });
 
                             // Get SQL spans for content
-                            let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+                            let (sql_spans, _) = self.tokenize_sql_content(string_content, string_content_start, false);
 
                             // Fill gaps with string spans
                             let mut last_end = string_content_start;
@@ -1390,7 +1450,8 @@ impl SyntaxHighlighter {
 
                             if !has_closing {
                                 // This is a full continuation line - tokenize entire line as SQL
-                                let sql_spans = self.tokenize_sql_content(line_content, 0);
+                                let (sql_spans, bc_open) = self.tokenize_sql_content(line_content, 0, prev_sql_block_comment);
+                                sql_block_comment_open = bc_open;
 
                                 // Fill gaps with SQL text spans
                                 let mut last_end = 0;
@@ -1460,8 +1521,9 @@ impl SyntaxHighlighter {
                             if string_content_start < string_content_end {
                                 let string_content = &line_content[string_content_start..string_content_end];
 
-                                // Get SQL spans for content
-                                let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+                                // Get SQL spans for content (use prev block comment state for continuation lines)
+                                let entering_bc = if is_continuation { prev_sql_block_comment } else { false };
+                                let (sql_spans, _) = self.tokenize_sql_content(string_content, string_content_start, entering_bc);
 
                                 // Fill gaps with SQL text spans
                                 let mut last_end = string_content_start;
@@ -1529,7 +1591,8 @@ impl SyntaxHighlighter {
 
                             if !has_closing {
                                 // This is a full continuation line - tokenize entire line as SQL
-                                let sql_spans = self.tokenize_sql_content(line_content, 0);
+                                let (sql_spans, bc_open) = self.tokenize_sql_content(line_content, 0, prev_sql_block_comment);
+                                sql_block_comment_open = bc_open;
 
                                 // Fill gaps with SQL text spans
                                 let mut last_end = 0;
@@ -1599,8 +1662,9 @@ impl SyntaxHighlighter {
                             if string_content_start < string_content_end {
                                 let string_content = &line_content[string_content_start..string_content_end];
 
-                                // Get SQL spans for content
-                                let sql_spans = self.tokenize_sql_content(string_content, string_content_start);
+                                // Get SQL spans for content (use prev block comment state for continuation lines)
+                                let entering_bc = if is_continuation { prev_sql_block_comment } else { false };
+                                let (sql_spans, _) = self.tokenize_sql_content(string_content, string_content_start, entering_bc);
 
                                 // Fill gaps with SQL text spans
                                 let mut last_end = string_content_start;
@@ -1700,7 +1764,8 @@ impl SyntaxHighlighter {
                     // Tokenize content after quotes as SQL
                     if quote_end < bytes.len() {
                         let string_content = &line_content[quote_end..];
-                        let sql_spans = self.tokenize_sql_content(string_content, quote_end);
+                        let (sql_spans, bc_open) = self.tokenize_sql_content(string_content, quote_end, false);
+                        sql_block_comment_open = bc_open;
 
                         // Fill gaps with SQL text spans
                         let mut last_end = quote_end;
@@ -1743,9 +1808,9 @@ impl SyntaxHighlighter {
             }
         }
 
-        (new_spans, current_state)
+        (new_spans, current_state, sql_block_comment_open)
     }
-    
+
     /// Process all dirty lines
     pub fn process_dirty_lines(&mut self, get_line: impl Fn(usize) -> Option<String>) {
         // Early exit if no dirty lines
