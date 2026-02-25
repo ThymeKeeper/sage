@@ -681,19 +681,17 @@ impl SyntaxHighlighter {
     where
         F: Fn(usize) -> Option<String>
     {
-        // First check current line - if SQL pattern is on this line before any string, use it
-        if self.line_has_sql_context(line_content) {
-            return true;
-        }
-
-        // For continuation strings, check the previous line's cached flag
+        // For continuation lines (already inside a triple-quoted string),
+        // only use the propagated flag — don't scan string content for SQL patterns.
         if matches!(entry_state, SyntaxState::StringTriple | SyntaxState::StringTripleSingle) {
             if line_index > 0 && line_index - 1 < self.line_states.len() {
                 return self.line_states[line_index - 1].in_sql_context;
             }
+            return false;
         }
 
-        false
+        // For strings opening on this line, check if SQL pattern exists
+        self.line_has_sql_context(line_content)
     }
 
     /// Process a single line and update its state
@@ -1490,8 +1488,8 @@ impl SyntaxHighlighter {
                        bytes[current_pos + 2] == b'"' {
                         current_pos += 3;
 
-                        // Check if this is a continuation line (span_start == 0)
-                        let is_continuation = span_start == 0;
+                        // Check if this is a continuation line (span_start == 0 AND we entered in triple-string state)
+                        let is_continuation = span_start == 0 && entry_state == SyntaxState::StringTriple;
 
                         // Check if this string should have SQL highlighting
                         // For strings that started on this line, check if SQL pattern immediately precedes it
@@ -1631,8 +1629,8 @@ impl SyntaxHighlighter {
                        bytes[current_pos + 2] == b'\'' {
                         current_pos += 3;
 
-                        // Check if this is a continuation line (span_start == 0)
-                        let is_continuation = span_start == 0;
+                        // Check if this is a continuation line (span_start == 0 AND we entered in triple-string state)
+                        let is_continuation = span_start == 0 && entry_state == SyntaxState::StringTripleSingle;
 
                         // Check if this string should have SQL highlighting
                         // For strings that started on this line, check if SQL pattern immediately precedes it
