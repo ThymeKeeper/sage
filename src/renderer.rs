@@ -1,7 +1,7 @@
 use crate::editor::Editor;
 use crate::syntax::SyntaxState;
 use crossterm::{
-    cursor::{Hide, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{poll, read, Event},
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
