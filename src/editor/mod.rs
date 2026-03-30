@@ -1220,6 +1220,13 @@ impl Editor {
                         let new_end = start + toggled.len();
                         self.replace_at(start, end, &toggled);
                         self.select_range(start, new_end);
+
+                        // Mark affected lines as dirty for syntax highlighting
+                        let start_line = self.buffer.byte_to_line(start);
+                        let end_line = self.buffer.byte_to_line(new_end.saturating_sub(1).max(start));
+                        for line in start_line..=end_line {
+                            self.syntax.mark_dirty(line);
+                        }
                     }
                 }
             }

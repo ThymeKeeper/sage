@@ -438,6 +438,37 @@ impl Editor {
         self.kernel.as_ref().map(|k| k.is_connected()).unwrap_or(false)
     }
 
+    /// Auto-discover and connect to the first available Python kernel
+    pub fn auto_connect_kernel(&mut self) {
+        let kernels = crate::kernel::discover_kernels();
+        if let Some(kernel_info) = kernels.into_iter().next() {
+            let mut new_kernel: Box<dyn Kernel> = Box::new(
+                crate::direct_kernel::DirectKernel::new(
+                    kernel_info.python_path.clone(),
+                    kernel_info.name.clone(),
+                    kernel_info.display_name.clone(),
+                )
+            );
+            if new_kernel.connect().is_ok() {
+                self.kernel = Some(new_kernel);
+                self.status_message = Some((
+                    format!("Python mode enabled with {}", kernel_info.display_name),
+                    false,
+                ));
+            } else {
+                self.status_message = Some((
+                    "Python mode enabled. Press Ctrl+K to select a kernel.".to_string(),
+                    false,
+                ));
+            }
+        } else {
+            self.status_message = Some((
+                "Python mode enabled but no Python found. Install Python first.".to_string(),
+                true,
+            ));
+        }
+    }
+
     /// Connect to the kernel
     pub fn connect_kernel(&mut self) -> Result<(), String> {
         if let Some(kernel) = self.kernel.as_mut() {
