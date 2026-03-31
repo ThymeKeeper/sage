@@ -1044,6 +1044,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             }
                             needs_redraw = true;
                             commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                            commands::Command::MoveLineUp
                         } else if key.modifiers.contains(KeyModifiers::ALT) {
                             // Alt+Up = Increase output pane height
                             let (_, term_height) = crossterm::terminal::size()?;
@@ -1084,6 +1086,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             }
                             needs_redraw = true;
                             commands::Command::None
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                            commands::Command::MoveLineDown
                         } else if key.modifiers.contains(KeyModifiers::ALT) {
                             // Alt+Down = Decrease output pane height
                             if output_pane_visible && output_pane_height > 3 {

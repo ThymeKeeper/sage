@@ -28,6 +28,10 @@ pub enum Command {
     SelectParagraphUp,
     SelectParagraphDown,
     
+    // Line movement
+    MoveLineUp,
+    MoveLineDown,
+
     // Editing
     InsertChar(char),
     InsertNewline,

@@ -1230,6 +1230,15 @@ impl Editor {
                 }
             }
 
+            Command::MoveLineUp => {
+                self.move_lines_up();
+                cursor_moved = true;
+            }
+            Command::MoveLineDown => {
+                self.move_lines_down();
+                cursor_moved = true;
+            }
+
             Command::None => {}
         }
         
@@ -1243,7 +1252,8 @@ impl Editor {
             Command::MoveWordLeft | Command::MoveWordRight |
             Command::MoveParagraphUp | Command::MoveParagraphDown |
             Command::SelectWordLeft | Command::SelectWordRight |
-            Command::SelectParagraphUp | Command::SelectParagraphDown
+            Command::SelectParagraphUp | Command::SelectParagraphDown |
+            Command::MoveLineUp | Command::MoveLineDown
         ) {
             self.update_viewport_for_cursor();
             // Update bracket and text matching after cursor/selection changes
@@ -1256,9 +1266,117 @@ impl Editor {
     // Getters for the renderer
     
 
-    
+    /// Move the current line (or all selected lines) up by one line.
+    fn move_lines_up(&mut self) {
+        let (first_line, last_line) = self.affected_line_range();
+        if first_line == 0 {
+            return;
+        }
+
+        let swap_line = first_line - 1;
+        let region_start = self.buffer.line_to_byte(swap_line);
+        let selected_start = self.buffer.line_to_byte(first_line);
+        let region_end = if last_line + 1 < self.buffer.len_lines() {
+            self.buffer.line_to_byte(last_line + 1)
+        } else {
+            self.buffer.len_bytes()
+        };
+
+        let swap_text = self.buffer.rope().byte_slice(region_start..selected_start).to_string();
+        let selected_text = self.buffer.rope().byte_slice(selected_start..region_end).to_string();
+
+        let new_text = if selected_text.ends_with('\n') {
+            format!("{}{}", selected_text, swap_text)
+        } else {
+            let swap_stripped = swap_text.strip_suffix('\n').unwrap_or(&swap_text);
+            format!("{}\n{}", selected_text, swap_stripped)
+        };
+
+        let cursor_before = self.cursor;
+        self.buffer.delete(region_start, region_end, cursor_before, cursor_before);
+        self.buffer.insert(region_start, &new_text, cursor_before, cursor_before);
+        self.buffer.finalize_undo_group();
+
+        let offset = selected_start - region_start;
+        self.cursor = self.cursor.saturating_sub(offset);
+        if let Some(ref mut sel) = self.selection_start {
+            *sel = sel.saturating_sub(offset);
+        }
+
+        self.modified = true;
+        self.reinit_syntax_highlighting();
+    }
+
+    /// Move the current line (or all selected lines) down by one line.
+    fn move_lines_down(&mut self) {
+        let (first_line, last_line) = self.affected_line_range();
+        let swap_line = last_line + 1;
+        // Treat buffer length as length+1 so the last real line is swappable,
+        // but ropey's phantom empty line (at exactly len_bytes) is not.
+        if swap_line >= self.buffer.len_lines() {
+            return;
+        }
+        if self.buffer.line_to_byte(swap_line) > self.buffer.len_bytes() {
+            return;
+        }
+
+        let region_start = self.buffer.line_to_byte(first_line);
+        let selected_end = if last_line + 1 < self.buffer.len_lines() {
+            self.buffer.line_to_byte(last_line + 1)
+        } else {
+            self.buffer.len_bytes()
+        };
+        let region_end = if swap_line + 1 < self.buffer.len_lines() {
+            self.buffer.line_to_byte(swap_line + 1)
+        } else {
+            self.buffer.len_bytes()
+        };
+
+        let selected_text = self.buffer.rope().byte_slice(region_start..selected_end).to_string();
+        let swap_text = self.buffer.rope().byte_slice(selected_end..region_end).to_string();
+
+        let new_text = if swap_text.ends_with('\n') {
+            format!("{}{}", swap_text, selected_text)
+        } else {
+            let selected_stripped = selected_text.strip_suffix('\n').unwrap_or(&selected_text);
+            format!("{}\n{}", swap_text, selected_stripped)
+        };
+
+        let cursor_before = self.cursor;
+        self.buffer.delete(region_start, region_end, cursor_before, cursor_before);
+        self.buffer.insert(region_start, &new_text, cursor_before, cursor_before);
+        self.buffer.finalize_undo_group();
+
+        let offset = if swap_text.ends_with('\n') {
+            swap_text.len()
+        } else {
+            swap_text.len() + 1
+        };
+        self.cursor += offset;
+        if let Some(ref mut sel) = self.selection_start {
+            *sel += offset;
+        }
+
+        self.modified = true;
+        self.reinit_syntax_highlighting();
+    }
+
+    /// Get the range of lines affected by the current cursor/selection
+    fn affected_line_range(&self) -> (usize, usize) {
+        if let Some(sel_start) = self.selection_start {
+            let start = sel_start.min(self.cursor);
+            let end = sel_start.max(self.cursor);
+            let first_line = self.buffer.byte_to_line(start);
+            let last_line = self.buffer.byte_to_line(end);
+            (first_line, last_line)
+        } else {
+            let line = self.buffer.byte_to_line(self.cursor);
+            (line, line)
+        }
+    }
+
     // Getters for the renderer
-    
+
     pub fn cursor(&self) -> usize {
         self.cursor
     }

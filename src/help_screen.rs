@@ -53,6 +53,7 @@ impl HelpScreen {
                 ("Ctrl+V", "Paste"),
                 ("Tab", "Indent selection / Autocomplete"),
                 ("Shift+Tab", "Unindent selection"),
+                ("Ctrl+Alt+Up/Down", "Move line(s) up/down"),
             ]),
             ("NAVIGATION", vec![
                 ("Arrow Keys", "Move cursor"),
