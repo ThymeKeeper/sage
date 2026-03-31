@@ -420,22 +420,53 @@ impl OutputPane {
             self.selection_start = None;
         }
 
-        if self.cursor_line > 0 {
-            // Set preferred column if not already set
-            if self.preferred_column.is_none() {
-                self.preferred_column = Some(self.cursor_col);
-            }
-
-            self.cursor_line -= 1;
-
-            // Clamp cursor to new line length using preferred column
-            let target_col = self.preferred_column.unwrap();
-            let line_len = self.get_line_length(self.cursor_line);
-            self.cursor_col = target_col.min(line_len);
-
-            self.disable_auto_scroll();
-            self.ensure_cursor_visible();
+        if self.cursor_line == 0 {
+            return;
         }
+
+        // Check if we're on a table data row for cell-aware navigation
+        if let Some(cur_stripped) = self.get_stripped_line(self.cursor_line) {
+            if Self::is_table_data_row(&cur_stripped) {
+                let cur_bounds = Self::find_cell_boundaries(&cur_stripped);
+                if !cur_bounds.is_empty() {
+                    let cell_idx = Self::cursor_to_cell_index(&cur_bounds, self.cursor_col);
+
+                    // Search upward for the next data row, skipping separators
+                    let mut target = self.cursor_line - 1;
+                    loop {
+                        if let Some(s) = self.get_stripped_line(target) {
+                            if Self::is_table_data_row(&s) {
+                                let new_bounds = Self::find_cell_boundaries(&s);
+                                let clamped = cell_idx.min(new_bounds.len().saturating_sub(1));
+                                self.cursor_line = target;
+                                self.cursor_col = Self::cell_cursor_col(&new_bounds, clamped);
+                                self.preferred_column = None;
+                                self.disable_auto_scroll();
+                                self.ensure_cursor_visible();
+                                return;
+                            } else if !Self::is_table_separator_row(&s) {
+                                break; // Left the table — fall through to normal movement
+                            }
+                        } else {
+                            break;
+                        }
+                        if target == 0 { break; }
+                        target -= 1;
+                    }
+                }
+            }
+        }
+
+        // Normal movement
+        if self.preferred_column.is_none() {
+            self.preferred_column = Some(self.cursor_col);
+        }
+        self.cursor_line -= 1;
+        let target_col = self.preferred_column.unwrap();
+        let line_len = self.get_line_length(self.cursor_line);
+        self.cursor_col = target_col.min(line_len);
+        self.disable_auto_scroll();
+        self.ensure_cursor_visible();
     }
 
     /// Move cursor down one line
@@ -447,25 +478,55 @@ impl OutputPane {
         }
 
         let total_lines = self.count_total_lines();
-        if self.cursor_line + 1 < total_lines {
-            // Set preferred column if not already set
-            if self.preferred_column.is_none() {
-                self.preferred_column = Some(self.cursor_col);
-            }
-
-            self.cursor_line += 1;
-
-            // Clamp cursor to new line length using preferred column
-            let target_col = self.preferred_column.unwrap();
-            let line_len = self.get_line_length(self.cursor_line);
-            self.cursor_col = target_col.min(line_len);
-
-            self.disable_auto_scroll();
-            self.ensure_cursor_visible();
+        if self.cursor_line + 1 >= total_lines {
+            return;
         }
+
+        // Check if we're on a table data row for cell-aware navigation
+        if let Some(cur_stripped) = self.get_stripped_line(self.cursor_line) {
+            if Self::is_table_data_row(&cur_stripped) {
+                let cur_bounds = Self::find_cell_boundaries(&cur_stripped);
+                if !cur_bounds.is_empty() {
+                    let cell_idx = Self::cursor_to_cell_index(&cur_bounds, self.cursor_col);
+
+                    // Search downward for the next data row, skipping separators
+                    let mut target = self.cursor_line + 1;
+                    while target < total_lines {
+                        if let Some(s) = self.get_stripped_line(target) {
+                            if Self::is_table_data_row(&s) {
+                                let new_bounds = Self::find_cell_boundaries(&s);
+                                let clamped = cell_idx.min(new_bounds.len().saturating_sub(1));
+                                self.cursor_line = target;
+                                self.cursor_col = Self::cell_cursor_col(&new_bounds, clamped);
+                                self.preferred_column = None;
+                                self.disable_auto_scroll();
+                                self.ensure_cursor_visible();
+                                return;
+                            } else if !Self::is_table_separator_row(&s) {
+                                break; // Left the table
+                            }
+                        } else {
+                            break;
+                        }
+                        target += 1;
+                    }
+                }
+            }
+        }
+
+        // Normal movement
+        if self.preferred_column.is_none() {
+            self.preferred_column = Some(self.cursor_col);
+        }
+        self.cursor_line += 1;
+        let target_col = self.preferred_column.unwrap();
+        let line_len = self.get_line_length(self.cursor_line);
+        self.cursor_col = target_col.min(line_len);
+        self.disable_auto_scroll();
+        self.ensure_cursor_visible();
     }
 
-    /// Move cursor left one character
+    /// Move cursor left one character (or one table cell if on a table row)
     pub fn move_cursor_left(&mut self, with_selection: bool) {
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
@@ -473,18 +534,45 @@ impl OutputPane {
             self.selection_start = None;
         }
 
+        if let Some(stripped) = self.get_stripped_line(self.cursor_line) {
+            if Self::is_table_data_row(&stripped) {
+                let bounds = Self::find_cell_boundaries(&stripped);
+                if !bounds.is_empty() {
+                    let on_separator = stripped.chars().nth(self.cursor_col)
+                        .map_or(false, Self::is_cell_separator);
+                    if on_separator {
+                        // On a separator — enter the cell to the left
+                        for i in (0..bounds.len()).rev() {
+                            if bounds[i].1 <= self.cursor_col {
+                                self.cursor_col = Self::cell_cursor_col(&bounds, i);
+                                break;
+                            }
+                        }
+                    } else {
+                        // Inside a cell — jump to previous cell
+                        let cell = Self::cursor_to_cell_index(&bounds, self.cursor_col);
+                        if cell > 0 {
+                            self.cursor_col = Self::cell_cursor_col(&bounds, cell - 1);
+                        }
+                    }
+                    self.preferred_column = None;
+                    self.ensure_cursor_visible();
+                    return;
+                }
+            }
+        }
+
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
         } else if self.cursor_line > 0 {
-            // Move to end of previous line
             self.cursor_line -= 1;
             self.cursor_col = self.get_line_length(self.cursor_line);
         }
-        self.preferred_column = None; // Clear preferred column on horizontal movement
+        self.preferred_column = None;
         self.ensure_cursor_visible();
     }
 
-    /// Move cursor right one character
+    /// Move cursor right one character (or one table cell if on a table row)
     pub fn move_cursor_right(&mut self, with_selection: bool) {
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
@@ -492,19 +580,45 @@ impl OutputPane {
             self.selection_start = None;
         }
 
+        if let Some(stripped) = self.get_stripped_line(self.cursor_line) {
+            if Self::is_table_data_row(&stripped) {
+                let bounds = Self::find_cell_boundaries(&stripped);
+                if !bounds.is_empty() {
+                    let on_separator = stripped.chars().nth(self.cursor_col)
+                        .map_or(false, Self::is_cell_separator);
+                    if on_separator {
+                        // On a separator — enter the cell to the right
+                        for i in 0..bounds.len() {
+                            if bounds[i].0 > self.cursor_col {
+                                self.cursor_col = Self::cell_cursor_col(&bounds, i);
+                                break;
+                            }
+                        }
+                    } else {
+                        // Inside a cell — jump to next cell
+                        let cell = Self::cursor_to_cell_index(&bounds, self.cursor_col);
+                        if cell + 1 < bounds.len() {
+                            self.cursor_col = Self::cell_cursor_col(&bounds, cell + 1);
+                        }
+                    }
+                    self.preferred_column = None;
+                    self.ensure_cursor_visible();
+                    return;
+                }
+            }
+        }
+
         let line_len = self.get_line_length(self.cursor_line);
-        // Allow cursor up to line_len (one past last char) for full scrolling
         if self.cursor_col < line_len {
             self.cursor_col += 1;
         } else if self.cursor_col == line_len {
-            // At the virtual position after last char - move to next line
             let total_lines = self.count_total_lines();
             if self.cursor_line + 1 < total_lines {
                 self.cursor_line += 1;
                 self.cursor_col = 0;
             }
         }
-        self.preferred_column = None; // Clear preferred column on horizontal movement
+        self.preferred_column = None;
         self.ensure_cursor_visible();
     }
 
@@ -807,6 +921,73 @@ impl OutputPane {
         // Reset horizontal scroll when on an empty line
         if self.get_line_length(self.cursor_line) == 0 {
             self.horizontal_offset = 0;
+        }
+    }
+
+    /// Check if a character is a vertical box-drawing separator (│ or ┆)
+    fn is_cell_separator(ch: char) -> bool {
+        matches!(ch, '│' | '┆')
+    }
+
+    /// Check if a line (ANSI-stripped) is a table data row (starts and ends with │ or ┆)
+    fn is_table_data_row(stripped: &str) -> bool {
+        let trimmed = stripped.trim_end();
+        if trimmed.len() <= 1 { return false; }
+        let first = trimmed.chars().next().unwrap();
+        let last = trimmed.chars().last().unwrap();
+        Self::is_cell_separator(first) && Self::is_cell_separator(last)
+    }
+
+    /// Check if a line is a table separator row (┌├└╞ lines)
+    fn is_table_separator_row(stripped: &str) -> bool {
+        let trimmed = stripped.trim_end();
+        !trimmed.is_empty() && matches!(trimmed.chars().next(), Some('┌' | '├' | '└' | '╞'))
+    }
+
+    /// Find cell boundaries in a table data row. Returns vec of (start_col, end_col)
+    /// pairs for each cell's content region (between separator characters).
+    fn find_cell_boundaries(stripped: &str) -> Vec<(usize, usize)> {
+        let mut pipes: Vec<usize> = Vec::new();
+        for (i, ch) in stripped.chars().enumerate() {
+            if Self::is_cell_separator(ch) {
+                pipes.push(i);
+            }
+        }
+        let mut cells = Vec::new();
+        for w in pipes.windows(2) {
+            cells.push((w[0] + 1, w[1]));
+        }
+        cells
+    }
+
+    /// Map a cursor column to a cell index within the given boundaries.
+    /// If the cursor is on a separator or before the first cell, returns the
+    /// nearest cell to the right; past the last cell returns the last cell.
+    fn cursor_to_cell_index(boundaries: &[(usize, usize)], col: usize) -> usize {
+        for (i, &(_start, end)) in boundaries.iter().enumerate() {
+            if col < end {
+                return i;
+            }
+        }
+        boundaries.len().saturating_sub(1)
+    }
+
+    /// Get the column to place the cursor at within a cell (first char after leading space).
+    fn cell_cursor_col(boundaries: &[(usize, usize)], cell_idx: usize) -> usize {
+        if cell_idx < boundaries.len() {
+            boundaries[cell_idx].0 + 1
+        } else {
+            0
+        }
+    }
+
+    /// Get the stripped text for a given line index, or None if out of range.
+    fn get_stripped_line(&self, line_idx: usize) -> Option<String> {
+        let lines = self.get_all_lines();
+        if line_idx < lines.len() {
+            Some(strip_ansi(&lines[line_idx].0))
+        } else {
+            None
         }
     }
 
