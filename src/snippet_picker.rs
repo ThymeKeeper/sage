@@ -76,13 +76,21 @@ impl SnippetPicker {
 
     fn draw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let (width, height) = terminal::size()?;
-        let box_width = width.min(70);
+
+        // Size box to fit config path if needed
+        let path_str = crate::config::Config::config_path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "~/.config/sage/config.toml".to_string());
+        let min_width = (path_str.len() + 5).max(70);
+        let box_width = width.min(min_width as u16);
+
         let max_list_height = (height as usize).saturating_sub(10);
         let list_height = self.snippets.len().min(max_list_height);
-        let box_height = list_height + 4;
+        let box_height = list_height + 6; // +2 extra for config path + separator
 
         let start_col = (width.saturating_sub(box_width)) / 2;
         let start_row = (height.saturating_sub(box_height as u16)) / 2;
+        let inner = (box_width as usize).saturating_sub(3);
 
         // Scroll offset
         let scroll_offset = if self.selected_index >= list_height {
@@ -116,10 +124,25 @@ impl SnippetPicker {
             ResetColor
         )?;
 
-        // Separator
+        // Config path subtitle
         execute!(
             writer,
             cursor::MoveTo(start_col, start_row + 2),
+            SetForegroundColor(Color::Cyan),
+            Print("\u{2502}"),
+            ResetColor,
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!(" {:<w$}", path_str, w = inner)),
+            ResetColor,
+            SetForegroundColor(Color::Cyan),
+            Print("\u{2502}"),
+            ResetColor
+        )?;
+
+        // Separator
+        execute!(
+            writer,
+            cursor::MoveTo(start_col, start_row + 3),
             SetForegroundColor(Color::Cyan),
             Print("\u{251c}"),
             Print("\u{2500}".repeat((box_width - 2) as usize)),
@@ -135,7 +158,7 @@ impl SnippetPicker {
             }
 
             let snippet = &self.snippets[snippet_idx];
-            let row = start_row + 3 + i as u16;
+            let row = start_row + 4 + i as u16;
             execute!(writer, cursor::MoveTo(start_col, row))?;
 
             // Format: "1. name" with number for first 9
@@ -184,7 +207,7 @@ impl SnippetPicker {
         }
 
         // Bottom border
-        let bottom_row = start_row + 3 + list_height as u16;
+        let bottom_row = start_row + 4 + list_height as u16;
         execute!(
             writer,
             cursor::MoveTo(start_col, bottom_row),
