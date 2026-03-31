@@ -465,6 +465,19 @@ impl OutputPane {
         let line_len = self.get_line_length(self.cursor_line);
         self.cursor_col = target_col.min(line_len);
         self.disable_auto_scroll();
+
+        // If we just landed on a table data row (entering from outside), snap to cell
+        if let Some(new_stripped) = self.get_stripped_line(self.cursor_line) {
+            if Self::is_table_data_row(&new_stripped) {
+                let bounds = Self::find_cell_boundaries(&new_stripped);
+                if !bounds.is_empty() {
+                    let cell_idx = Self::cursor_to_cell_index(&bounds, self.cursor_col);
+                    self.select_table_cell(&new_stripped, &bounds, cell_idx);
+                    self.preferred_column = None;
+                }
+            }
+        }
+
         self.ensure_cursor_visible();
     }
 
@@ -521,6 +534,19 @@ impl OutputPane {
         let line_len = self.get_line_length(self.cursor_line);
         self.cursor_col = target_col.min(line_len);
         self.disable_auto_scroll();
+
+        // If we just landed on a table data row (entering from outside), snap to cell
+        if let Some(new_stripped) = self.get_stripped_line(self.cursor_line) {
+            if Self::is_table_data_row(&new_stripped) {
+                let bounds = Self::find_cell_boundaries(&new_stripped);
+                if !bounds.is_empty() {
+                    let cell_idx = Self::cursor_to_cell_index(&bounds, self.cursor_col);
+                    self.select_table_cell(&new_stripped, &bounds, cell_idx);
+                    self.preferred_column = None;
+                }
+            }
+        }
+
         self.ensure_cursor_visible();
     }
 
@@ -862,17 +888,46 @@ impl OutputPane {
         let visible_width = self.viewport_width;
 
         if visible_width > 0 {
+            // When on a table row, scroll to show the full cell (including pipe delimiters)
+            // so center-aligned headers in wide columns are fully visible
+            let (cell_left, cell_right) = if let Some(stripped) = self.get_stripped_line(self.cursor_line) {
+                if Self::is_table_data_row(&stripped) {
+                    let bounds = Self::find_cell_boundaries(&stripped);
+                    let cell = Self::cursor_to_cell_index(&bounds, self.cursor_col);
+                    if cell < bounds.len() {
+                        // Include the pipe characters on either side of the cell
+                        let left = indent + bounds[cell].0.saturating_sub(1);
+                        let right = indent + bounds[cell].1; // the right pipe position
+                        (Some(left), Some(right))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
             // Jump all the way left when cursor is at start of line (factoring virtual indent)
             if self.cursor_col == 0 {
                 self.horizontal_offset = 0;
-            }
-            // Scroll left if cursor is before viewport
-            else if cursor_screen_col < self.horizontal_offset {
-                self.horizontal_offset = cursor_screen_col;
-            }
-            // Scroll right if cursor is past viewport
-            else if cursor_screen_col >= self.horizontal_offset + visible_width {
-                self.horizontal_offset = cursor_screen_col.saturating_sub(visible_width - 1);
+            } else if let (Some(cl), Some(cr)) = (cell_left, cell_right) {
+                // For table cells: ensure the entire cell is visible
+                if cl < self.horizontal_offset {
+                    // Cell's left edge is off-screen — scroll left to show it
+                    self.horizontal_offset = cl;
+                } else if cr >= self.horizontal_offset + visible_width {
+                    // Cell's right edge is off-screen — scroll right to show it
+                    self.horizontal_offset = cr.saturating_sub(visible_width - 1);
+                }
+            } else {
+                // Normal (non-table) scrolling
+                if cursor_screen_col < self.horizontal_offset {
+                    self.horizontal_offset = cursor_screen_col;
+                } else if cursor_screen_col >= self.horizontal_offset + visible_width {
+                    self.horizontal_offset = cursor_screen_col.saturating_sub(visible_width - 1);
+                }
             }
         }
     }
@@ -1115,7 +1170,7 @@ impl OutputPane {
         // Calculate the effective scroll offset for rendering
         let total_lines = self.count_total_lines();
         let display_lines = height;
-        let _effective_scroll = if self.auto_scroll {
+        let effective_scroll = if self.auto_scroll {
             total_lines.saturating_sub(display_lines)
         } else {
             self.scroll_offset.min(total_lines.saturating_sub(1))

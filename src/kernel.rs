@@ -3,6 +3,8 @@ use std::error::Error;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::collections::HashSet;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 
 /// Represents the output from code execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
