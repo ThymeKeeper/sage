@@ -1266,6 +1266,20 @@ impl Editor {
     // Getters for the renderer
     
 
+    /// Rebuild a region of rearranged lines with correct newline structure.
+    /// Every line gets a \n except the last line when the region is at the buffer end.
+    fn rebuild_region(lines: &[String], at_buffer_end: bool) -> String {
+        let mut result = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            let content = line.trim_end_matches('\n');
+            result.push_str(content);
+            if i < lines.len() - 1 || !at_buffer_end {
+                result.push('\n');
+            }
+        }
+        result
+    }
+
     /// Move the current line (or all selected lines) up by one line.
     fn move_lines_up(&mut self) {
         let (first_line, last_line) = self.affected_line_range();
@@ -1281,16 +1295,17 @@ impl Editor {
         } else {
             self.buffer.len_bytes()
         };
+        let at_buffer_end = region_end >= self.buffer.len_bytes();
 
-        let swap_text = self.buffer.rope().byte_slice(region_start..selected_start).to_string();
-        let selected_text = self.buffer.rope().byte_slice(selected_start..region_end).to_string();
+        // Collect lines individually so phantom trailing lines are captured
+        let mut lines: Vec<String> = (swap_line..=last_line)
+            .map(|i| self.buffer.line(i).to_string())
+            .collect();
+        // Rearrange: [swap, selected...] → [selected..., swap]
+        let swap = lines.remove(0);
+        lines.push(swap);
 
-        let new_text = if selected_text.ends_with('\n') {
-            format!("{}{}", selected_text, swap_text)
-        } else {
-            let swap_stripped = swap_text.strip_suffix('\n').unwrap_or(&swap_text);
-            format!("{}\n{}", selected_text, swap_stripped)
-        };
+        let new_text = Self::rebuild_region(&lines, at_buffer_end);
 
         let cursor_before = self.cursor;
         self.buffer.delete(region_start, region_end, cursor_before, cursor_before);
@@ -1311,8 +1326,6 @@ impl Editor {
     fn move_lines_down(&mut self) {
         let (first_line, last_line) = self.affected_line_range();
         let swap_line = last_line + 1;
-        // Treat buffer length as length+1 so the last real line is swappable,
-        // but ropey's phantom empty line (at exactly len_bytes) is not.
         if swap_line >= self.buffer.len_lines() {
             return;
         }
@@ -1321,37 +1334,31 @@ impl Editor {
         }
 
         let region_start = self.buffer.line_to_byte(first_line);
-        let selected_end = if last_line + 1 < self.buffer.len_lines() {
-            self.buffer.line_to_byte(last_line + 1)
-        } else {
-            self.buffer.len_bytes()
-        };
         let region_end = if swap_line + 1 < self.buffer.len_lines() {
             self.buffer.line_to_byte(swap_line + 1)
         } else {
             self.buffer.len_bytes()
         };
+        let at_buffer_end = region_end >= self.buffer.len_bytes();
 
-        let selected_text = self.buffer.rope().byte_slice(region_start..selected_end).to_string();
-        let swap_text = self.buffer.rope().byte_slice(selected_end..region_end).to_string();
+        // Collect lines individually so phantom trailing lines are captured
+        let mut lines: Vec<String> = (first_line..=swap_line)
+            .map(|i| self.buffer.line(i).to_string())
+            .collect();
+        // Rearrange: [selected..., swap] → [swap, selected...]
+        let swap = lines.pop().unwrap();
+        lines.insert(0, swap);
 
-        let new_text = if swap_text.ends_with('\n') {
-            format!("{}{}", swap_text, selected_text)
-        } else {
-            let selected_stripped = selected_text.strip_suffix('\n').unwrap_or(&selected_text);
-            format!("{}\n{}", swap_text, selected_stripped)
-        };
+        let new_text = Self::rebuild_region(&lines, at_buffer_end);
 
         let cursor_before = self.cursor;
         self.buffer.delete(region_start, region_end, cursor_before, cursor_before);
         self.buffer.insert(region_start, &new_text, cursor_before, cursor_before);
         self.buffer.finalize_undo_group();
 
-        let offset = if swap_text.ends_with('\n') {
-            swap_text.len()
-        } else {
-            swap_text.len() + 1
-        };
+        // Offset = swap line content + \n (it's always first, never last)
+        let swap_content_len = lines[0].trim_end_matches('\n').len();
+        let offset = swap_content_len + 1;
         self.cursor += offset;
         if let Some(ref mut sel) = self.selection_start {
             *sel += offset;
