@@ -85,6 +85,9 @@ impl HelpScreen {
             ("LANGUAGE", vec![
                 ("Ctrl+Y", "Select language"),
             ]),
+            ("SNIPPETS", vec![
+                ("Ctrl+J", "Open snippet library"),
+            ]),
             ("OTHER", vec![
                 ("F1", "Toggle this help screen"),
             ]),

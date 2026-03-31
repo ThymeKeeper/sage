@@ -1,4 +1,4 @@
-use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, language_selector, commands, direct_kernel, syntax, help_screen};
+use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, language_selector, commands, direct_kernel, syntax, help_screen, config, snippet_picker};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
     execute,
@@ -910,6 +910,30 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                         commands::Command::None
                         }
+                    }
+
+                    // Snippet Library (Ctrl+J)
+                    KeyCode::Char('j') | KeyCode::Char('J') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let cfg = config::Config::load();
+                        let mut picker = snippet_picker::SnippetPicker::new(cfg.snippets);
+
+                        execute!(io::stdout(), crossterm::cursor::Hide)?;
+
+                        let result = picker.run(&mut io::stdout());
+
+                        // Clear and redraw
+                        execute!(io::stdout(),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                        )?;
+                        execute!(io::stdout(), crossterm::cursor::Hide)?;
+                        renderer.force_redraw();
+
+                        if let Ok(Some(text)) = result {
+                            editor.paste_text(text);
+                        }
+
+                        needs_redraw = true;
+                        commands::Command::None
                     }
 
                     // Language Selection (Ctrl+Y)

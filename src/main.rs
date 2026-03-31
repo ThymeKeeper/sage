@@ -17,6 +17,8 @@ mod event_loop;
 mod sql_context;
 mod help_screen;
 mod clipboard;
+mod config;
+mod snippet_picker;
 
 use kernel::Kernel;
 
