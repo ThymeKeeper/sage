@@ -21,7 +21,7 @@ mod clipboard;
 use kernel::Kernel;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton, EnableBracketedPaste, DisableBracketedPaste},
+    event,
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };

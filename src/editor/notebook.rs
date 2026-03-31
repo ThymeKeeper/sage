@@ -1,6 +1,5 @@
-use crate::cell::{Cell, parse_cells, get_cell_at_position, get_cell_content};
+use crate::cell::{Cell, parse_cells};
 use crate::kernel::Kernel;
-use std::io;
 
 use super::Editor;
 
@@ -116,7 +115,7 @@ impl Editor {
                     // Now look for closing paren
                     let mut paren_depth = 0;
                     let mut found_callable = false;
-                    let mut callable_end = pos;
+                    let mut _callable_end = pos;
 
                     // Move back through whitespace
                     while pos > 0 {
@@ -139,7 +138,7 @@ impl Editor {
                             if ch == ')' {
                                 paren_depth = 1;
                                 pos -= ch.len_utf8();
-                                callable_end = pos;
+                                _callable_end = pos;
                                 found_callable = true;
                             }
                         }
@@ -203,234 +202,6 @@ impl Editor {
     /// Update cells by parsing the buffer
     pub fn update_cells(&mut self) {
         self.cells = parse_cells(self.buffer.rope());
-    }
-
-    /// Get cells for rendering
-    pub fn get_cells(&self) -> &[Cell] {
-        &self.cells
-    }
-
-    /// Execute all cells within selection (or current cell if no selection)
-    /// Returns: Vec<(execution_count, cell_line, output_text, is_error, elapsed_secs)>
-    pub fn execute_selected_cells_with_output(&mut self) -> Vec<(usize, usize, String, bool, f64)> {
-        let mut results = Vec::new();
-
-        if !self.repl_mode || self.kernel.is_none() {
-            return results;
-        }
-
-        // Parse cells
-        self.update_cells();
-
-        // Find cells to execute
-        let cells_to_execute: Vec<usize> = if let Some((sel_start, sel_end)) = self.get_selection() {
-            // Execute all cells that overlap with the selection
-            self.cells.iter().enumerate()
-                .filter(|(_, cell)| {
-                    // Cell overlaps with selection if:
-                    // cell.start < sel_end && cell.end > sel_start
-                    cell.start < sel_end && cell.end > sel_start
-                })
-                .map(|(idx, _)| idx)
-                .collect()
-        } else {
-            // No selection - execute current cell only
-            if let Some(cell_idx) = get_cell_at_position(&self.cells, self.cursor) {
-                vec![cell_idx]
-            } else {
-                vec![]
-            }
-        };
-
-        // Save total cell count before loop consumes the vector
-        let total_cells_to_execute = cells_to_execute.len();
-
-        // Execute each cell in order
-        for cell_idx in cells_to_execute {
-            let cell = &self.cells[cell_idx];
-            let code = get_cell_content(self.buffer.rope(), cell);
-            let cell_number = cell_idx + 1; // Cell number is 1-indexed
-
-            // Execute code with timing
-            if let Some(kernel) = self.kernel.as_mut() {
-                let start_time = std::time::Instant::now();
-
-                match kernel.execute(&code) {
-                    Ok(result) => {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-
-                        // Store result in cell
-                        self.cells[cell_idx].output = Some(result.clone());
-
-                        let execution_count = result.execution_count.unwrap_or(0);
-                        let output_text = crate::cell::format_output(&result);
-                        let is_error = !result.success;
-
-                        results.push((execution_count, cell_number, output_text, is_error, elapsed));
-
-                        // Stop execution if this cell had an error
-                        if is_error {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        results.push((0, cell_number, format!("Error: {}", e), true, elapsed));
-                        // Stop execution on kernel error
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Set status message
-        if !results.is_empty() {
-            if results.len() == 1 {
-                let (_, cell_num, _, is_error, elapsed) = &results[0];
-                if *is_error {
-                    self.status_message = Some((format!("Cell {} error ({:.3}s)", cell_num, elapsed), true));
-                } else {
-                    self.status_message = Some((format!("Cell {} executed ({:.3}s)", cell_num, elapsed), false));
-                }
-            } else {
-                let error_count = results.iter().filter(|(_, _, _, is_err, _)| *is_err).count();
-                let total_time: f64 = results.iter().map(|(_, _, _, _, elapsed)| elapsed).sum();
-
-                if error_count > 0 {
-                    // Check if execution stopped early due to error
-                    if results.len() < total_cells_to_execute {
-                        self.status_message = Some((
-                            format!("Executed {} of {} cells (stopped on error, {:.3}s)", results.len(), total_cells_to_execute, total_time),
-                            true
-                        ));
-                    } else {
-                        self.status_message = Some((
-                            format!("Executed {} cells ({} errors, {:.3}s)", results.len(), error_count, total_time),
-                            true
-                        ));
-                    }
-                } else {
-                    self.status_message = Some((
-                        format!("Executed {} cells ({:.3}s)", results.len(), total_time),
-                        false
-                    ));
-                }
-            }
-            self.status_message_persistent = false;
-        }
-
-        results
-    }
-
-    /// Execute the current cell and return output info for output pane
-    /// Returns: Option<(execution_count, cell_line, output_text, is_error, elapsed_secs)>
-    pub fn execute_current_cell_with_output(&mut self) -> Option<(usize, usize, String, bool, f64)> {
-        // Use the new method and return first result
-        let results = self.execute_selected_cells_with_output();
-        results.into_iter().next()
-    }
-
-    /// Execute the current cell (cell containing cursor) - legacy method
-    pub fn execute_current_cell(&mut self) -> io::Result<()> {
-        if !self.repl_mode {
-            self.status_message = Some(("Not in REPL mode. Press Ctrl+K to select a kernel.".to_string(), true));
-            return Ok(());
-        }
-
-        if self.kernel.is_none() {
-            self.status_message = Some(("No kernel connected. Press Ctrl+K to select a kernel.".to_string(), true));
-            return Ok(());
-        }
-
-        // Parse cells
-        self.update_cells();
-
-        // Find cell at cursor position
-        if let Some(cell_idx) = get_cell_at_position(&self.cells, self.cursor) {
-            let cell = &self.cells[cell_idx];
-            let code = get_cell_content(self.buffer.rope(), cell);
-
-            // Get cell line number for display
-            let cell_line = self.buffer.rope().byte_to_line(cell.start) + 1;
-
-            // Execute code
-            if let Some(kernel) = self.kernel.as_mut() {
-                match kernel.execute(&code) {
-                    Ok(result) => {
-                        // Store result in cell
-                        self.cells[cell_idx].output = Some(result.clone());
-
-                        if result.success {
-                            // Format output for display
-                            let output_text = self.format_execution_output(&result);
-                            if output_text.is_empty() {
-                                self.status_message = Some((format!("Cell {} executed (no output)", cell_line), false));
-                            } else {
-                                self.status_message = Some((format!("Cell {}: {}", cell_line, output_text), false));
-                            }
-                            self.status_message_persistent = false; // Will clear on next action
-                        } else {
-                            // Show error (keep persistent until user acknowledges)
-                            let error_text = self.format_execution_output(&result);
-                            self.status_message = Some((format!("Cell {} error: {}", cell_line, error_text), true));
-                            self.status_message_persistent = true; // Errors stay visible
-                        }
-                    }
-                    Err(e) => {
-                        self.status_message = Some((format!("Cell {} error: {}", cell_line, e), true));
-                    }
-                }
-            }
-        } else {
-            self.status_message = Some(("Cursor not in a cell. Use # %% to define cells.".to_string(), true));
-        }
-
-        Ok(())
-    }
-
-    /// Format execution output for status display
-    fn format_execution_output(&self, result: &crate::kernel::ExecutionResult) -> String {
-        let mut parts = Vec::new();
-
-        for exec_output in &result.outputs {
-            match exec_output {
-                crate::kernel::ExecutionOutput::Result(text) => {
-                    parts.push(text.trim().to_string());
-                }
-                crate::kernel::ExecutionOutput::Stdout(text) => {
-                    // Replace newlines with space to keep output on single line
-                    let formatted = text.trim().replace('\n', " ");
-                    if !formatted.is_empty() {
-                        parts.push(formatted);
-                    }
-                }
-                crate::kernel::ExecutionOutput::Stderr(text) => {
-                    let formatted = text.trim().replace('\n', " ");
-                    if !formatted.is_empty() {
-                        parts.push(formatted);
-                    }
-                }
-                crate::kernel::ExecutionOutput::Error { ename, evalue, .. } => {
-                    parts.push(format!("{}: {}", ename, evalue));
-                }
-                crate::kernel::ExecutionOutput::Display { data, .. } => {
-                    let formatted = data.trim().replace('\n', " ");
-                    if !formatted.is_empty() {
-                        parts.push(formatted);
-                    }
-                }
-            }
-        }
-
-        // Join parts with separator to distinguish different outputs
-        let output = parts.join(" → ");
-
-        // Truncate if too long
-        if output.len() > 200 {
-            format!("{}...", &output[..200])
-        } else {
-            output
-        }
     }
 
     /// Check if kernel is connected

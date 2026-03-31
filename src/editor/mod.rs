@@ -1,13 +1,12 @@
 use crate::buffer::Buffer;
 use crate::commands::Command;
 use crate::syntax::SyntaxHighlighter;
-use crate::cell::{Cell, parse_cells};
+use crate::cell::Cell;
 use crate::kernel::Kernel;
 use crate::clipboard::ClipboardProvider;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
 // Submodules
@@ -1291,14 +1290,6 @@ impl Editor {
         }
     }
     
-    /// Move cursor to a specific position
-    pub fn move_cursor_to(&mut self, position: usize) {
-        self.cursor = position.min(self.buffer.len_bytes());
-        self.selection_start = None;
-        self.preferred_column = None; // Clear preferred column
-        self.update_viewport_for_cursor();
-    }
-    
     /// Get cursor position as (line, display_column)
     /// The column value accounts for Unicode character widths
     /// Check if syntax highlighting has pending work
@@ -1337,6 +1328,7 @@ impl Editor {
         if line_count > 50_000 {
             // Calculate current viewport from cursor position
             let (cursor_line, _) = self.cursor_position();
+            let _ = cursor_line;
             let viewport_height = 50; // Approximate visible lines
             let viewport_start = self.viewport_offset.0;
             let viewport_end = viewport_start + viewport_height;
@@ -1371,11 +1363,6 @@ impl Editor {
         self.syntax.get_line_spans(line_index)
     }
     
-    /// Clear the status message
-    pub fn clear_status_message(&mut self) {
-        self.status_message = None;
-    }
-
     /// Reinitialize syntax highlighting (e.g., after undo/redo that changes line count)
     fn reinit_syntax_highlighting(&mut self) {
         let line_count = self.buffer.len_lines();

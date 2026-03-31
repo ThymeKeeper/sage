@@ -3,7 +3,6 @@ use std::error::Error;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// Represents the output from code execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,16 +91,6 @@ pub struct KernelInfo {
     pub name: String,
     pub display_name: String,
     pub python_path: String,
-    pub kernel_type: KernelType,
-}
-
-/// Type of kernel connection
-#[derive(Debug, Clone, PartialEq)]
-pub enum KernelType {
-    /// Direct Python subprocess
-    Direct,
-    /// Jupyter kernel via ZMQ
-    Jupyter,
 }
 
 /// Trait for Python kernel implementations
@@ -321,7 +310,6 @@ fn add_interpreter(
         name: name_hint.to_string(),
         display_name,
         python_path: path,
-        kernel_type: KernelType::Direct,
     });
 }
 
@@ -598,7 +586,7 @@ fn check_system_paths(
     };
 
     // Check common names first, then dynamically discover versioned pythons
-    let priority_names = vec!["python3", "python"];
+    let _priority_names = vec!["python3", "python"];
 
     for dir in system_dirs {
         // Handle glob patterns (e.g., homebrew cellar)
@@ -718,47 +706,3 @@ fn check_path_pythons(
     }
 }
 
-/// Find Jupyter kernels
-fn discover_jupyter_kernels() -> Vec<KernelInfo> {
-    let mut kernels = Vec::new();
-
-    // Try to run `jupyter kernelspec list`
-    if let Ok(output) = std::process::Command::new("jupyter")
-        .args(&["kernelspec", "list", "--json"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let Some(kernelspecs) = data.get("kernelspecs").and_then(|k| k.as_object()) {
-                    for (name, spec) in kernelspecs {
-                        if let Some(spec_obj) = spec.as_object() {
-                            if let Some(resource_dir) = spec_obj.get("resource_dir")
-                                .and_then(|v| v.as_str())
-                            {
-                                // Read kernel.json to get display name
-                                let kernel_json_path = format!("{}/kernel.json", resource_dir);
-                                if let Ok(kernel_json) = std::fs::read_to_string(&kernel_json_path) {
-                                    if let Ok(kernel_data) = serde_json::from_str::<serde_json::Value>(&kernel_json) {
-                                        let display_name = kernel_data.get("display_name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or(name)
-                                            .to_string();
-
-                                        kernels.push(KernelInfo {
-                                            name: name.clone(),
-                                            display_name: format!("{} (Jupyter)", display_name),
-                                            python_path: resource_dir.to_string(),
-                                            kernel_type: KernelType::Jupyter,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    kernels
-}

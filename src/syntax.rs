@@ -14,7 +14,6 @@ pub enum SyntaxState {
     Number,             // Numeric literals
     Operator,           // Operators (+, -, *, etc.)
     Punctuation,        // Punctuation (brackets, parens, etc.)
-    MacroOrDecorator,   // Rust macros or Python decorators
     SqlKeyword,         // SQL keywords within strings (SELECT, FROM, etc.)
     SqlFunction,        // SQL functions within strings (COUNT, SUM, etc.)
     SqlNumber,          // SQL numeric literals within strings
@@ -227,13 +226,6 @@ impl SyntaxHighlighter {
         !self.dirty_lines.is_empty()
     }
     
-    /// Mark a range of lines as dirty
-    pub fn mark_range_dirty(&mut self, start: usize, end: usize) {
-        for line in start..=end {
-            self.mark_dirty(line);
-        }
-    }
-
     /// Check if a word is a keyword for the current language
     fn is_keyword(&self, word: &str) -> bool {
         match self.language {
@@ -346,16 +338,6 @@ impl SyntaxHighlighter {
             Language::Json => false, // JSON doesn't have type keywords
             _ => false,
         }
-    }
-
-    /// Check if a character can be part of an identifier
-    fn is_ident_char(&self, ch: char) -> bool {
-        ch.is_alphanumeric() || ch == '_' || (self.language == Language::Python && ch == '@')
-    }
-
-    /// Check if a character can start an identifier
-    fn is_ident_start(&self, ch: char) -> bool {
-        ch.is_alphabetic() || ch == '_' || (self.language == Language::Python && ch == '@')
     }
 
     /// Check if a SQL word is a function (not a structural keyword)

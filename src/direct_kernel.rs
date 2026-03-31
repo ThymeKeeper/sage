@@ -1,4 +1,4 @@
-use crate::kernel::{ExecutionOutput, ExecutionResult, Kernel, KernelInfo, KernelType};
+use crate::kernel::{ExecutionOutput, ExecutionResult, Kernel, KernelInfo};
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -19,7 +19,6 @@ impl DirectKernel {
                 name,
                 display_name,
                 python_path,
-                kernel_type: KernelType::Direct,
             },
             process: None,
             stdin: None,

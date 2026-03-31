@@ -1,7 +1,7 @@
 use crossterm::{
     cursor,
     execute,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Color, Print, SetBackgroundColor, SetForegroundColor},
     terminal,
 };
 use std::io::{self, Write};

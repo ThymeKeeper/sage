@@ -1,8 +1,8 @@
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyModifiers},
+    cursor::{MoveTo, Show},
+    event::{KeyCode, KeyModifiers},
     execute,
-    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor, ResetColor},
+    style::{Color, Print, SetBackgroundColor, SetForegroundColor, ResetColor},
     terminal,
 };
 use arboard::Clipboard;
@@ -81,11 +81,6 @@ impl FindReplace {
         } else {
             None
         }
-    }
-    
-    /// Reset match index (call after replace operations)
-    pub fn reset_current_match(&mut self) {
-        self.current_match = 0;
     }
     
     /// Get the find text

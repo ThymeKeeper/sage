@@ -81,40 +81,6 @@ impl Editor {
         }
     }
 
-    /// Skip forward over spaces from a given position to exclude them from selection
-    /// Exception: preserve leading indentation spaces at the start of lines
-    fn skip_forward_spaces(&self, position: usize) -> usize {
-        // Check if we're at the start of a line (including indentation)
-        let line = self.buffer.byte_to_line(position);
-        let line_start = self.buffer.line_to_byte(line);
-        let line_text = self.buffer.line(line);
-
-        // Find where the actual content (non-space) begins on this line
-        let mut first_non_space = 0;
-        for ch in line_text.chars() {
-            if ch != ' ' && ch != '\t' {
-                break;
-            }
-            first_non_space += ch.len_utf8();
-        }
-
-        // If position is within the leading indentation, don't skip spaces
-        if position >= line_start && position <= line_start + first_non_space {
-            return position;
-        }
-
-        // Otherwise, skip forward over spaces
-        let content = self.buffer.to_string();
-        let bytes = content.as_bytes();
-        let mut pos = position;
-
-        while pos < bytes.len() && bytes[pos] == b' ' {
-            pos += 1;
-        }
-
-        pos
-    }
-
     /// Get the word boundaries at the given position (returns start and end byte positions)
     fn get_word_boundaries_at(&self, position: usize) -> (usize, usize) {
         let content = self.buffer.to_string();
@@ -159,15 +125,6 @@ impl Editor {
         (start_byte, end_byte)
     }
 
-    /// Select the word at the given position
-    fn select_word_at(&mut self, position: usize) {
-        let (start_byte, end_byte) = self.get_word_boundaries_at(position);
-        if start_byte < end_byte {
-            self.set_selection_start(start_byte);
-            self.cursor = end_byte;
-        }
-    }
-
     /// Get the line boundaries at the given position (returns start and end byte positions)
     fn get_line_boundaries_at(&self, position: usize) -> (usize, usize) {
         let line = self.buffer.byte_to_line(position);
@@ -178,13 +135,6 @@ impl Editor {
         let line_end = line_start + line_text.len();
 
         (line_start, line_end)
-    }
-
-    /// Select the line at the given position
-    fn select_line_at(&mut self, position: usize) {
-        let (line_start, line_end) = self.get_line_boundaries_at(position);
-        self.set_selection_start(line_start);
-        self.cursor = line_end;
     }
 
     /// Update mouse selection while dragging

@@ -1,24 +1,22 @@
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{MoveTo, Show},
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor, ResetColor},
-    terminal::{self, Clear, ClearType},
+    terminal,
 };
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct Prompt {
     title: String,
     input: String,
     cursor_pos: usize,
-    initial_path: String,
     // Cache window dimensions
     prompt_x: u16,
     prompt_y: u16,
     prompt_width: usize,
     prompt_height: usize,
-    needs_full_redraw: bool,
 }
 
 impl Prompt {
@@ -27,12 +25,10 @@ impl Prompt {
             title: title.to_string(),
             input: initial_path.to_string(),
             cursor_pos: initial_path.len(),
-            initial_path: initial_path.to_string(),
             prompt_x: 0,
             prompt_y: 0,
             prompt_width: 0,
             prompt_height: 7,
-            needs_full_redraw: true,
         }
     }
     

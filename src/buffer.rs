@@ -22,6 +22,9 @@ struct UndoGroup {
     cursor_after: usize,
 }
 
+/// Maximum number of undo groups to retain
+const MAX_UNDO_GROUPS: usize = 500;
+
 /// Text buffer with undo/redo support
 pub struct Buffer {
     rope: Rope,
@@ -190,6 +193,10 @@ impl Buffer {
         if let Some(group) = self.current_group.take() {
             if !group.ops.is_empty() {
                 self.undo_stack.push(group);
+                // Drop oldest undo groups to bound memory usage
+                if self.undo_stack.len() > MAX_UNDO_GROUPS {
+                    self.undo_stack.drain(..self.undo_stack.len() - MAX_UNDO_GROUPS);
+                }
             }
         }
     }
@@ -261,9 +268,5 @@ impl Buffer {
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty() || self.current_group.is_some()
     }
-    
-    /// Check if there are redo operations available
-    pub fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
-    }
+
 }

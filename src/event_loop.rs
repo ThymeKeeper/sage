@@ -3,8 +3,8 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
     execute,
 };
-use std::io::{self, Write};
-use std::time::Duration;
+use std::io;
+
 
 pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
@@ -37,9 +37,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     let elapsed = execution_start_time.take().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
 
                     // Add outputs to pane
-                    for (count, line, output, is_error, cell_elapsed) in results {
+                    for (_count, line, output, is_error, cell_elapsed) in results {
                         output_pane.add_output(output_pane::OutputEntry {
-                            execution_count: count,
                             cell_line: line,
                             output,
                             is_error,
@@ -724,25 +723,16 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                             // Recreate a fresh kernel using stored info
                             if let Some(kernel_info) = executing_kernel_info.take() {
-                                match kernel_info.kernel_type {
-                                    kernel::KernelType::Direct => {
-                                        let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
-                                            kernel_info.python_path.clone(),
-                                            kernel_info.name.clone(),
-                                            kernel_info.display_name.clone(),
-                                        ));
-                                        // Connect the new kernel
-                                        if new_kernel.connect().is_ok() {
-                                            editor.set_kernel(new_kernel);
-                                            editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
-                                        } else {
-                                            editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
-                                        }
-                                    }
-                                    _ => {
-                                        // For Jupyter or other kernel types, just report cancellation
-                                        editor.status_message = Some(("Execution cancelled - please reconnect kernel".to_string(), true));
-                                    }
+                                let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
+                                    kernel_info.python_path.clone(),
+                                    kernel_info.name.clone(),
+                                    kernel_info.display_name.clone(),
+                                ));
+                                if new_kernel.connect().is_ok() {
+                                    editor.set_kernel(new_kernel);
+                                    editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
+                                } else {
+                                    editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
                                 }
                             } else {
                                 editor.status_message = Some(("Execution cancelled".to_string(), true));
@@ -879,31 +869,16 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         execute!(io::stdout(), crossterm::cursor::Hide)?;
 
                         renderer.force_redraw();
-                        needs_redraw = true;
 
                         if let Some(kernel_info) = result {
                             use crate::direct_kernel::DirectKernel;
 
-                            // Create kernel based on type
-                            let mut kernel: Box<dyn kernel::Kernel> = match kernel_info.kernel_type {
-                                kernel::KernelType::Direct => {
-                                    Box::new(DirectKernel::new(
-                                        kernel_info.python_path.clone(),
-                                        kernel_info.name.clone(),
-                                        kernel_info.display_name.clone()
-                                    ))
-                                }
-                                kernel::KernelType::Jupyter => {
-                                    // For now, fall back to direct kernel
-                                    // TODO: Implement Jupyter kernel
-                                    editor.status_message = Some(("Jupyter kernels not yet supported, using direct kernel".to_string(), false));
-                                    Box::new(DirectKernel::new(
-                                        kernel_info.python_path.clone(),
-                                        kernel_info.name.clone(),
-                                        kernel_info.display_name.clone()
-                                    ))
-                                }
-                            };
+                            // Create kernel
+                            let mut kernel: Box<dyn kernel::Kernel> = Box::new(DirectKernel::new(
+                                kernel_info.python_path.clone(),
+                                kernel_info.name.clone(),
+                                kernel_info.display_name.clone()
+                            ));
 
                             // Disconnect old kernel first if exists
                             if editor.is_kernel_connected() {
@@ -958,7 +933,6 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         execute!(io::stdout(), crossterm::cursor::Hide)?;
 
                         renderer.force_redraw();
-                        needs_redraw = true;
 
                         if let Ok(Some(language)) = result {
                             // Set the new language
@@ -1240,23 +1214,16 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             execution_start_time = None;
 
                             if let Some(kernel_info) = executing_kernel_info.take() {
-                                match kernel_info.kernel_type {
-                                    kernel::KernelType::Direct => {
-                                        let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
-                                            kernel_info.python_path.clone(),
-                                            kernel_info.name.clone(),
-                                            kernel_info.display_name.clone(),
-                                        ));
-                                        if new_kernel.connect().is_ok() {
-                                            editor.set_kernel(new_kernel);
-                                            editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
-                                        } else {
-                                            editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
-                                        }
-                                    }
-                                    _ => {
-                                        editor.status_message = Some(("Execution cancelled - please reconnect kernel".to_string(), true));
-                                    }
+                                let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
+                                    kernel_info.python_path.clone(),
+                                    kernel_info.name.clone(),
+                                    kernel_info.display_name.clone(),
+                                ));
+                                if new_kernel.connect().is_ok() {
+                                    editor.set_kernel(new_kernel);
+                                    editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
+                                } else {
+                                    editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
                                 }
                             } else {
                                 editor.status_message = Some(("Execution cancelled".to_string(), true));

@@ -8,21 +8,6 @@ pub struct Cell {
     pub start: usize,
     /// End byte position in the buffer (exclusive)
     pub end: usize,
-    /// Type of cell
-    pub cell_type: CellType,
-    /// Execution output (if executed)
-    pub output: Option<ExecutionResult>,
-    /// Execution count
-    pub execution_count: Option<usize>,
-}
-
-/// Type of cell
-#[derive(Debug, Clone, PartialEq)]
-pub enum CellType {
-    /// Python code cell
-    Code,
-    /// Markdown/text cell
-    Markdown,
 }
 
 /// Cell delimiter marker
@@ -31,7 +16,6 @@ pub const CELL_DELIMITER: &str = "##$$";
 /// Parse buffer into cells
 pub fn parse_cells(buffer: &Rope) -> Vec<Cell> {
     let mut cells = Vec::new();
-    let mut current_start = 0;
     let text = buffer.to_string();
 
     // Find all cell delimiters
@@ -49,9 +33,6 @@ pub fn parse_cells(buffer: &Rope) -> Vec<Cell> {
         cells.push(Cell {
             start: 0,
             end: buffer.len_bytes(),
-            cell_type: CellType::Code,
-            output: None,
-            execution_count: None,
         });
         return cells;
     }
@@ -61,9 +42,6 @@ pub fn parse_cells(buffer: &Rope) -> Vec<Cell> {
         cells.push(Cell {
             start: 0,
             end: delimiter_positions[0],
-            cell_type: CellType::Code,
-            output: None,
-            execution_count: None,
         });
     }
 
@@ -76,35 +54,9 @@ pub fn parse_cells(buffer: &Rope) -> Vec<Cell> {
             buffer.len_bytes()
         };
 
-        // Determine cell type from delimiter line
-        let delimiter_line_idx = buffer.byte_to_line(delimiter_pos);
-        let line_start = buffer.line_to_byte(delimiter_line_idx);
-        let line_end = if delimiter_line_idx + 1 < buffer.len_lines() {
-            buffer.line_to_byte(delimiter_line_idx + 1)
-        } else {
-            buffer.len_bytes()
-        };
-
-        let line_text = buffer.slice(line_start..line_end).to_string();
-        let cell_type = if line_text.to_lowercase().contains("markdown") {
-            CellType::Markdown
-        } else {
-            CellType::Code
-        };
-
-        // Cell starts after the delimiter line
-        let cell_start = if delimiter_line_idx + 1 < buffer.len_lines() {
-            buffer.line_to_byte(delimiter_line_idx + 1)
-        } else {
-            buffer.len_bytes()
-        };
-
         cells.push(Cell {
             start: delimiter_pos,
             end: end_pos,
-            cell_type,
-            output: None,
-            execution_count: None,
         });
     }
 
@@ -149,7 +101,7 @@ pub fn get_cell_content(buffer: &Rope, cell: &Cell) -> String {
 /// Format output for display (Jupyter-style)
 pub fn format_output(result: &ExecutionResult) -> String {
     let mut output = String::new();
-    let exec_count = result.execution_count.unwrap_or(0);
+    let _exec_count = result.execution_count.unwrap_or(0);
 
     for exec_output in &result.outputs {
         match exec_output {

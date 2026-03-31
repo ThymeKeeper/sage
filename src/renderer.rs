@@ -478,9 +478,6 @@ impl Renderer {
                                             SyntaxState::Punctuation => {
                                                 formatted_line.push_str(syntax_colors::COMMENT);
                                             }
-                                            SyntaxState::MacroOrDecorator => {
-                                                formatted_line.push_str(syntax_colors::KEYWORD);
-                                            }
                                             SyntaxState::SqlKeyword => {
                                                 let sql_colors = get_sql_colors();
                                                 formatted_line.push_str(&sql_colors.keyword);
@@ -571,9 +568,6 @@ impl Renderer {
                                             }
                                             SyntaxState::Punctuation => {
                                                 formatted_line.push_str(syntax_colors::COMMENT);
-                                            }
-                                            SyntaxState::MacroOrDecorator => {
-                                                formatted_line.push_str(syntax_colors::KEYWORD);
                                             }
                                             SyntaxState::SqlKeyword => {
                                                 let sql_colors = get_sql_colors();

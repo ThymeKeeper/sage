@@ -103,11 +103,6 @@ impl Autocomplete {
         ]
     }
 
-    /// Update suggestions based on current word prefix
-    pub fn update(&mut self, prefix: &str) {
-        self.update_with_context(None, prefix, false);
-    }
-
     /// Update suggestions with method chain context
     /// base_callable: Optional base function/method (e.g., "duckdb.sql" from "duckdb.sql(...).p")
     /// prefix: The prefix to filter by (e.g., "p" from "duckdb.sql(...).p")
@@ -243,11 +238,6 @@ impl Autocomplete {
                 let _ = writeln!(f, "DEBUG autocomplete: suggestions={:?}", &self.suggestions[..self.suggestions.len().min(5)]);
             }
         }
-    }
-
-    /// Show autocomplete at cursor position
-    pub fn show(&mut self, prefix: &str) {
-        self.update(prefix);
     }
 
     /// Hide autocomplete

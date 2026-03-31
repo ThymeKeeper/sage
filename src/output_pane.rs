@@ -159,7 +159,6 @@ fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub struct OutputEntry {
-    pub execution_count: usize,
     pub cell_line: usize,
     pub output: String,
     pub is_error: bool,
@@ -904,10 +903,6 @@ impl OutputPane {
         total
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.outputs.is_empty()
-    }
-
     pub fn draw<W: Write>(&mut self, writer: &mut W, start_row: u16, height: usize, width: u16) -> io::Result<()> {
         // Save start row for mouse position calculations
         self.output_start_row = start_row;
@@ -915,7 +910,7 @@ impl OutputPane {
         // Calculate the effective scroll offset for rendering
         let total_lines = self.count_total_lines();
         let display_lines = height;
-        let effective_scroll = if self.auto_scroll {
+        let _effective_scroll = if self.auto_scroll {
             total_lines.saturating_sub(display_lines)
         } else {
             self.scroll_offset.min(total_lines.saturating_sub(1))

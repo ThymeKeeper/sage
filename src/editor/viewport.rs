@@ -83,13 +83,11 @@ impl Editor {
 
         // Horizontal scrolling - consider both cursor and selection start
         let mut left_col = cursor_col;
-        let mut right_col = cursor_col;
 
         // If there's a selection, we need to consider both ends
         if let Some(sel_start) = self.selection_start {
             let (_, sel_col) = self.byte_position_to_display(sel_start);
             left_col = left_col.min(sel_col);
-            right_col = right_col.max(sel_col);
         }
 
         // Ensure the leftmost position is visible with scrolloff
@@ -222,10 +220,6 @@ impl Editor {
 
     pub fn viewport_offset(&self) -> (usize, usize) {
         self.viewport_offset
-    }
-
-    pub fn set_viewport_offset(&mut self, offset: (usize, usize)) {
-        self.viewport_offset = offset;
     }
 
     /// Get cursor screen position (for drawing overlays like autocomplete)

@@ -110,17 +110,4 @@ impl ClipboardProvider {
         Ok(())
     }
 
-    /// Check if this clipboard provider is available
-    pub fn is_available(&self) -> bool {
-        !matches!(self, ClipboardProvider::None)
-    }
-
-    /// Get a description of the clipboard provider
-    pub fn description(&self) -> &str {
-        match self {
-            ClipboardProvider::Native(_) => "native (X11/Wayland)",
-            ClipboardProvider::Osc52 => "OSC 52 (terminal)",
-            ClipboardProvider::None => "none",
-        }
-    }
 }
