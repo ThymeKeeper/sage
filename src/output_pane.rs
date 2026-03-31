@@ -1170,11 +1170,13 @@ impl OutputPane {
 
         #[cfg(not(target_os = "windows"))]
         {
-            // Clear all rows in the output pane area first (to handle resizing)
+            // Clear all rows in the output pane area with output bg (one shade brighter than editor)
+            let output_bg = Color::Rgb { r: 33, g: 33, b: 33 };
             for row in start_row..(start_row + height as u16) {
                 execute!(
                     writer,
                     cursor::MoveTo(0, row),
+                    crossterm::style::SetBackgroundColor(output_bg),
                     Clear(ClearType::CurrentLine)
                 )?;
             }
@@ -1184,7 +1186,7 @@ impl OutputPane {
             // On Windows: Clear all content rows when empty (to handle clear() properly)
             #[cfg(target_os = "windows")]
             {
-                let empty_line = " ".repeat(width as usize);
+                let empty_line = format!("\x1b[48;2;33;33;33m{}", " ".repeat(width as usize));
                 for row_idx in 0..height {
                     let screen_row = start_row + row_idx as u16;
                     // Check cache to avoid unnecessary writes
@@ -1203,7 +1205,7 @@ impl OutputPane {
             #[cfg(target_os = "windows")]
             {
                 // Build hint with padding
-                let hint_line = format!("\x1b[90m  {}\x1b[0m{}", hint, " ".repeat(width as usize - 2 - hint.len()));
+                let hint_line = format!("\x1b[48;2;33;33;33m\x1b[90m  {}\x1b[39m{}", hint, " ".repeat(width as usize - 2 - hint.len()));
                 if self.last_screen.get(0) != Some(&hint_line) {
                     write!(writer, "\x1b[{};1H{}", start_row + 1, hint_line)?;
                     if !self.last_screen.is_empty() {
@@ -1329,7 +1331,7 @@ impl OutputPane {
             // On Windows: Build complete line string with ANSI codes and use caching
             #[cfg(target_os = "windows")]
             {
-                let mut line_content = String::new();
+                let mut line_content = String::from("\x1b[48;2;33;33;33m"); // Output pane bg (one shade brighter than editor 234)
 
                 // Calculate selection info for this line
                 let selection_info = if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection_range {
@@ -1357,6 +1359,7 @@ impl OutputPane {
                 };
 
                 // Build line content with colors
+                // Use \x1b[39m (reset fg only) instead of \x1b[0m to preserve output pane bg
                 if let Some((vis_sel_from, vis_sel_to)) = selection_info {
                     // Line has selection - build in parts
                     if vis_sel_from > 0 {
@@ -1365,11 +1368,11 @@ impl OutputPane {
                         if *is_header {
                             line_content.push_str("\x1b[32m"); // Green
                             line_content.push_str(&before_plain);
-                            line_content.push_str("\x1b[0m");
+                            line_content.push_str("\x1b[39m");
                         } else if *is_error {
                             line_content.push_str("\x1b[31m"); // Red
                             line_content.push_str(&before_plain);
-                            line_content.push_str("\x1b[0m");
+                            line_content.push_str("\x1b[39m");
                         } else {
                             line_content.push_str(&before_plain);
                         }
@@ -1377,11 +1380,10 @@ impl OutputPane {
                     if vis_sel_to > vis_sel_from {
                         let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
                         let selected_plain = strip_ansi(&selected);
-                        // Selection: RGB(55, 110, 112) background, black foreground
                         // Selection: ANSI 256 teal background with black text
                         line_content.push_str("\x1b[48;5;30m\x1b[30m");
                         line_content.push_str(&selected_plain);
-                        line_content.push_str("\x1b[0m");
+                        line_content.push_str("\x1b[39m\x1b[48;2;33;33;33m"); // Restore fg default + output bg
                     }
                     if vis_sel_to < visible_line_display_len {
                         let after = slice_with_ansi(visible_line, vis_sel_to, visible_line_display_len - vis_sel_to);
@@ -1389,11 +1391,11 @@ impl OutputPane {
                         if *is_header {
                             line_content.push_str("\x1b[32m");
                             line_content.push_str(&after_plain);
-                            line_content.push_str("\x1b[0m");
+                            line_content.push_str("\x1b[39m");
                         } else if *is_error {
                             line_content.push_str("\x1b[31m");
                             line_content.push_str(&after_plain);
-                            line_content.push_str("\x1b[0m");
+                            line_content.push_str("\x1b[39m");
                         } else {
                             line_content.push_str(&after_plain);
                         }
@@ -1403,11 +1405,11 @@ impl OutputPane {
                     if *is_header {
                         line_content.push_str("\x1b[32m"); // Green
                         line_content.push_str(visible_line);
-                        line_content.push_str("\x1b[0m");
+                        line_content.push_str("\x1b[39m");
                     } else if *is_error {
                         line_content.push_str("\x1b[31m"); // Red
                         line_content.push_str(visible_line);
-                        line_content.push_str("\x1b[0m");
+                        line_content.push_str("\x1b[39m");
                     } else {
                         line_content.push_str(visible_line);
                     }
@@ -1547,7 +1549,7 @@ impl OutputPane {
         #[cfg(target_os = "windows")]
         {
             while screen_row_idx < self.last_screen.len() && current_row < max_row {
-                let empty_line = " ".repeat(width as usize);
+                let empty_line = format!("\x1b[48;2;33;33;33m{}", " ".repeat(width as usize));
                 if self.last_screen.get(screen_row_idx) != Some(&empty_line) {
                     write!(writer, "\x1b[{};1H{}", current_row + 1, empty_line)?;
                     if screen_row_idx < self.last_screen.len() {

@@ -28,8 +28,8 @@ impl HelpScreen {
     pub fn draw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let (width, height) = terminal::size()?;
 
-        // Define consistent background color
-        let bg_color = Color::Rgb { r: 40, g: 40, b: 40 };
+        // Match output pane background: ANSI 256 color 235, one shade brighter than editor bg (234)
+        let bg_color = Color::Rgb { r: 33, g: 33, b: 33 };
 
         // Clear the screen and set background color
         execute!(
