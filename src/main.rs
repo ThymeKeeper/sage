@@ -19,6 +19,7 @@ mod help_screen;
 mod clipboard;
 mod config;
 mod snippet_picker;
+mod spreadsheet;
 
 use kernel::Kernel;
 
@@ -425,7 +426,9 @@ fn main() -> io::Result<()> {
     }
 
     // Set initial help message based on mode
-    if editor.is_repl_mode() {
+    if editor.is_spreadsheet_mode() {
+        // Spreadsheet has its own metrics in the status bar; skip the generic hint
+    } else if editor.is_repl_mode() {
         editor.status_message = Some(("Press Ctrl+Y to select language, Ctrl+K to select kernel, Ctrl+E to execute".to_string(), false));
     } else {
         editor.status_message = Some(("Press Ctrl+Y to select language".to_string(), false));

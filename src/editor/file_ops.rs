@@ -2,11 +2,20 @@ use crate::buffer::Buffer;
 use crate::syntax::SyntaxHighlighter;
 use crate::kernel::{self, Kernel};
 use crate::direct_kernel::DirectKernel;
+use crate::spreadsheet::Spreadsheet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::Editor;
+
+fn is_spreadsheet_ext(path: &Path) -> Option<u8> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("csv") => Some(b','),
+        Some(ext) if ext.eq_ignore_ascii_case("tsv") => Some(b'\t'),
+        _ => None,
+    }
+}
 
 impl Editor {
     /// Normalize text by removing invisible characters and converting line endings/tabs
@@ -68,6 +77,26 @@ impl Editor {
     }
 
     pub fn load_file(&mut self, path: &str) -> io::Result<()> {
+        let path_obj = Path::new(path);
+
+        // Spreadsheet mode for CSV/TSV files
+        if is_spreadsheet_ext(path_obj).is_some() {
+            let ss = Spreadsheet::from_file(path_obj)?;
+            self.spreadsheet = Some(ss);
+            self.buffer = Buffer::new();
+            self.file_path = Some(PathBuf::from(path));
+            self.cursor = 0;
+            self.selection_start = None;
+            self.modified = false;
+            self.viewport_offset = (0, 0);
+            self.last_saved_undo_len = 0;
+            self.read_only = self.is_file_read_only(path);
+            self.syntax = SyntaxHighlighter::new();
+            self.syntax.set_language_from_path(path);
+            return Ok(());
+        }
+
+        self.spreadsheet = None;
         let content = fs::read_to_string(path)?;
         // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
         let content = Self::normalize_text(content);
@@ -322,25 +351,39 @@ impl Editor {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "File is read-only"));
         }
 
-        if let Some(ref path) = self.file_path {
-            // Create parent directories if they don't exist
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            match fs::write(path, self.buffer.to_string()) {
-                Ok(_) => {
-                    self.modified = false;
-                    self.last_saved_undo_len = 0; // Reset save point
-                    self.status_message = None; // Clear any error messages
+        let path = match self.file_path.clone() {
+            Some(p) => p,
+            None => return Err(io::Error::new(io::ErrorKind::Other, "No file path set")),
+        };
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        if let Some(ss) = self.spreadsheet.as_mut() {
+            return match ss.save(&path) {
+                Ok(()) => {
+                    self.status_message = None;
                     Ok(())
                 }
                 Err(e) => {
                     self.status_message = Some((format!("Save failed: {}", e), true));
                     Err(e)
                 }
+            };
+        }
+
+        match fs::write(&path, self.buffer.to_string()) {
+            Ok(_) => {
+                self.modified = false;
+                self.last_saved_undo_len = 0; // Reset save point
+                self.status_message = None; // Clear any error messages
+                Ok(())
             }
-        } else {
-            Err(io::Error::new(io::ErrorKind::Other, "No file path set"))
+            Err(e) => {
+                self.status_message = Some((format!("Save failed: {}", e), true));
+                Err(e)
+            }
         }
     }
 
@@ -355,6 +398,24 @@ impl Editor {
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+
+        if let Some(ss) = self.spreadsheet.as_mut() {
+            return match ss.save(&path) {
+                Ok(()) => {
+                    self.file_path = Some(path.clone());
+                    self.read_only = new_read_only;
+                    if let Some(path_str) = path.to_str() {
+                        self.syntax.set_language_from_path(path_str);
+                    }
+                    self.status_message = None;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Save as failed: {}", e), true));
+                    Err(e)
+                }
+            };
         }
 
         match fs::write(&path, self.buffer.to_string()) {
@@ -386,6 +447,12 @@ impl Editor {
     }
 
     pub fn set_file_path(&mut self, path: &str) {
+        let path_obj = Path::new(path);
+        if let Some(delim) = is_spreadsheet_ext(path_obj) {
+            self.spreadsheet = Some(Spreadsheet::new_empty(delim));
+        } else {
+            self.spreadsheet = None;
+        }
         self.file_path = Some(PathBuf::from(path));
         self.syntax.set_language_from_path(path);
     }

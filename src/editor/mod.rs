@@ -4,6 +4,7 @@ use crate::syntax::SyntaxHighlighter;
 use crate::cell::Cell;
 use crate::kernel::Kernel;
 use crate::clipboard::ClipboardProvider;
+use crate::spreadsheet::Spreadsheet;
 use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -48,6 +49,7 @@ pub struct Editor {
     kernel: Option<Box<dyn Kernel>>,   // Active Python kernel
     repl_mode: bool,                   // Whether we're in REPL mode
     executing_kernel_name: Option<String>, // Kernel name while executing (kernel is temporarily taken)
+    spreadsheet: Option<Spreadsheet>,   // Active spreadsheet (CSV/TSV) grid, replaces buffer editing
 }
 
 impl Editor {
@@ -83,8 +85,22 @@ impl Editor {
             repl_mode: false,
             status_message_persistent: false,
             executing_kernel_name: None,
+            spreadsheet: None,
         }
     }
+
+    pub fn spreadsheet(&self) -> Option<&Spreadsheet> {
+        self.spreadsheet.as_ref()
+    }
+
+    pub fn spreadsheet_mut(&mut self) -> Option<&mut Spreadsheet> {
+        self.spreadsheet.as_mut()
+    }
+
+    pub fn is_spreadsheet_mode(&self) -> bool {
+        self.spreadsheet.is_some()
+    }
+
 
     pub fn execute(&mut self, cmd: Command) -> io::Result<()> {
         // Clear non-persistent status messages on user action
@@ -1393,6 +1409,9 @@ impl Editor {
     }
     
     pub fn is_modified(&self) -> bool {
+        if let Some(ss) = self.spreadsheet.as_ref() {
+            return ss.is_modified();
+        }
         self.modified
     }
     

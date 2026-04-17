@@ -235,6 +235,9 @@ impl Renderer {
     }
 
     pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize, bottom_window_focused: bool) -> io::Result<()> {
+        if editor.is_spreadsheet_mode() {
+            return self.draw_spreadsheet(editor);
+        }
         // Update cursor style based on selection
         // Note: Output pane handles its own cursor style when focused
         let desired_style = if editor.selection().is_some() {
@@ -735,6 +738,8 @@ impl Renderer {
             crate::syntax::Language::Json => "JSON",
             crate::syntax::Language::Shell => "Shell",
             crate::syntax::Language::Toml => "TOML",
+            crate::syntax::Language::Csv => "CSV",
+            crate::syntax::Language::Tsv => "TSV",
         };
         let language_info = format!(" [{}] ", language_name);
 
@@ -885,6 +890,472 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn draw_spreadsheet(&mut self, editor: &mut Editor) -> io::Result<()> {
+        use crate::spreadsheet::{col_letter, render_cell_text, FORMULA_BAR_HEIGHT, MIN_COL_WIDTH, ROW_NUM_WIDTH};
+        use unicode_width::UnicodeWidthChar;
+
+        // Update title
+        let file_name = editor.file_name().to_string();
+        let modified = editor.is_modified();
+        let title = if file_name == "[No Name]" {
+            format!("No Name{}", if modified { " *" } else { "" })
+        } else {
+            format!("{}{}", file_name, if modified { " *" } else { "" })
+        };
+        if title != self.last_title {
+            execute!(self.stdout, SetTitle(&title))?;
+            self.last_title = title;
+        }
+
+        let (width, height) = terminal::size()?;
+        if (width, height) != self.last_size {
+            self.last_size = (width, height);
+            self.last_screen = vec![String::new(); height as usize];
+            self.last_status.clear();
+            write!(self.stdout, "\x1b[48;5;234m")?;
+            execute!(self.stdout, Clear(ClearType::All))?;
+            write!(self.stdout, "\x1b[0m")?;
+            #[cfg(target_os = "windows")]
+            {
+                self.needs_full_redraw = true;
+            }
+        }
+
+        // Hide text cursor while painting
+        #[cfg(target_os = "windows")]
+        write!(self.stdout, "\x1b[?25l")?;
+        #[cfg(not(target_os = "windows"))]
+        execute!(self.stdout, Hide)?;
+
+        let total_rows = height as usize;
+        if total_rows < 6 {
+            self.stdout.flush()?;
+            return Ok(());
+        }
+        let status_row = total_rows - 1;
+        let formula_bar_rows = FORMULA_BAR_HEIGHT;
+        let divider_row = formula_bar_rows;
+        let header_row = divider_row + 1;
+        let data_start = header_row + 1;
+        let data_end_exclusive = status_row;
+        let visible_data_rows = data_end_exclusive.saturating_sub(data_start);
+
+        let _ = visible_data_rows; // cursor visibility is managed by the event loop now
+        let ss = editor.spreadsheet().expect("spreadsheet mode");
+        let editing = ss.is_editing();
+        let (cur_row, cur_col) = ss.cursor;
+        let ((sel_r0, sel_c0), (sel_r1, sel_c1)) = ss.selected_range();
+        let has_multi_selection = ss.has_selection();
+
+        // --- Formula bar ---
+        let label = if editing {
+            format!(" {} (editing) ", ss.cursor_label())
+        } else {
+            format!(" {} ", ss.cursor_label())
+        };
+        let label_width = label.chars().count();
+
+        let detail_source: String = if let Some(edit) = ss.editing.as_ref() {
+            edit.text.clone()
+        } else {
+            ss.focused_cell_text().to_string()
+        };
+
+        let edit_selection: Option<(usize, usize)> = ss.editing.as_ref().and_then(|edit| {
+            let start = edit.selection_start?;
+            if start == edit.cursor {
+                None
+            } else if start < edit.cursor {
+                Some((start, edit.cursor))
+            } else {
+                Some((edit.cursor, start))
+            }
+        });
+
+        // Split detail into visual lines and track their byte offsets
+        let mut detail_lines: Vec<String> = detail_source.split('\n').map(|s| s.to_string()).collect();
+        let mut line_byte_starts: Vec<usize> = vec![0];
+        for (i, b) in detail_source.bytes().enumerate() {
+            if b == b'\n' {
+                line_byte_starts.push(i + 1);
+            }
+        }
+        while detail_lines.len() < formula_bar_rows {
+            detail_lines.push(String::new());
+        }
+
+        let fb_bg = "\x1b[48;5;236m";
+        let fb_fg = "\x1b[38;5;252m";
+        let sel_bg = "\x1b[48;5;24m";
+        let sel_fg = "\x1b[38;5;230m";
+
+        for fb_row in 0..formula_bar_rows {
+            let mut line = String::new();
+            line.push_str(fb_bg);
+            if fb_row == 0 {
+                line.push_str("\x1b[38;5;117m\x1b[1m");
+                line.push_str(&label);
+                line.push_str("\x1b[0m");
+                line.push_str(fb_bg);
+                line.push_str(fb_fg);
+            } else {
+                for _ in 0..label_width {
+                    line.push(' ');
+                }
+                line.push_str(fb_fg);
+            }
+
+            let text_width = (width as usize).saturating_sub(label_width);
+            let content = detail_lines.get(fb_row).map(|s| s.as_str()).unwrap_or("");
+            let line_start_byte = line_byte_starts.get(fb_row).copied().unwrap_or(detail_source.len());
+
+            let mut rendered_width = 0usize;
+            let mut byte_in_line = 0usize;
+            let mut in_selection = false;
+            for ch in content.chars() {
+                let cw = ch.width().unwrap_or(1);
+                if rendered_width + cw > text_width {
+                    break;
+                }
+                let abs_byte = line_start_byte + byte_in_line;
+                let char_selected = match edit_selection {
+                    Some((a, b)) => abs_byte >= a && abs_byte < b,
+                    None => false,
+                };
+                if char_selected && !in_selection {
+                    line.push_str(sel_bg);
+                    line.push_str(sel_fg);
+                    in_selection = true;
+                } else if !char_selected && in_selection {
+                    line.push_str("\x1b[0m");
+                    line.push_str(fb_bg);
+                    line.push_str(fb_fg);
+                    in_selection = false;
+                }
+                line.push(ch);
+                rendered_width += cw;
+                byte_in_line += ch.len_utf8();
+            }
+
+            // Extend selection highlight to newline marker if selection crosses this line boundary
+            if rendered_width < text_width {
+                let line_end_byte = line_start_byte + byte_in_line;
+                let newline_selected = match edit_selection {
+                    Some((a, b)) => line_end_byte >= a && line_end_byte < b,
+                    None => false,
+                };
+                if newline_selected && !in_selection {
+                    line.push_str(sel_bg);
+                    line.push_str(sel_fg);
+                    in_selection = true;
+                }
+                if newline_selected {
+                    line.push(' ');
+                    rendered_width += 1;
+                }
+            }
+
+            if in_selection {
+                line.push_str("\x1b[0m");
+                line.push_str(fb_bg);
+                line.push_str(fb_fg);
+            }
+
+            while rendered_width < text_width {
+                line.push(' ');
+                rendered_width += 1;
+            }
+            line.push_str("\x1b[0m");
+
+            self.write_spreadsheet_row(fb_row, &line)?;
+        }
+
+        // --- Divider ---
+        {
+            let mut line = String::new();
+            line.push_str("\x1b[48;5;234m\x1b[38;5;240m");
+            for _ in 0..width {
+                line.push('─');
+            }
+            line.push_str("\x1b[0m");
+            self.write_spreadsheet_row(divider_row, &line)?;
+        }
+
+        // --- Column header row ---
+        {
+            let mut line = String::new();
+            line.push_str("\x1b[48;5;238m\x1b[38;5;252m\x1b[1m");
+            for _ in 0..ROW_NUM_WIDTH {
+                line.push(' ');
+            }
+            line.push_str("\x1b[38;5;240m│\x1b[38;5;252m");
+
+            let mut used: usize = ROW_NUM_WIDTH + 1;
+            let num_cols = ss.num_cols();
+            let mut col_idx = ss.scroll_col;
+            while col_idx < num_cols {
+                let col_width = ss
+                    .column_widths
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(MIN_COL_WIDTH);
+                let remaining = (width as usize).saturating_sub(used);
+                if remaining == 0 {
+                    break;
+                }
+                let label = col_letter(col_idx);
+                let is_focused = col_idx == cur_col;
+                if is_focused {
+                    line.push_str("\x1b[48;5;24m\x1b[38;5;230m");
+                } else {
+                    line.push_str("\x1b[48;5;238m\x1b[38;5;252m");
+                }
+                if remaining >= col_width + 1 {
+                    line.push_str(&render_centered(&label, col_width));
+                    line.push_str("\x1b[48;5;238m\x1b[38;5;240m│\x1b[38;5;252m");
+                    used += col_width + 1;
+                    col_idx += 1;
+                } else {
+                    // Partial column at the right edge: fill remaining space with the cell
+                    // content, no trailing separator.
+                    line.push_str(&render_centered(&label, remaining));
+                    used += remaining;
+                    break;
+                }
+            }
+            line.push_str("\x1b[48;5;238m");
+            while used < width as usize {
+                line.push(' ');
+                used += 1;
+            }
+            line.push_str("\x1b[0m");
+            self.write_spreadsheet_row(header_row, &line)?;
+        }
+
+        // --- Data rows ---
+        for offset in 0..visible_data_rows {
+            let row_idx = ss.scroll_row + offset;
+            let screen_row = data_start + offset;
+            let mut line = String::new();
+
+            if row_idx >= ss.num_rows() {
+                line.push_str("\x1b[48;5;234m");
+                for _ in 0..width {
+                    line.push(' ');
+                }
+                line.push_str("\x1b[0m");
+                self.write_spreadsheet_row(screen_row, &line)?;
+                continue;
+            }
+
+            let is_current_row = row_idx == cur_row;
+            // Row-number column
+            if is_current_row {
+                line.push_str("\x1b[48;5;24m\x1b[38;5;230m\x1b[1m");
+            } else {
+                line.push_str("\x1b[48;5;238m\x1b[38;5;250m");
+            }
+            let row_label = format!("{:>width$} ", row_idx + 1, width = ROW_NUM_WIDTH - 1);
+            line.push_str(&row_label);
+            line.push_str("\x1b[0m\x1b[48;5;234m\x1b[38;5;240m│\x1b[0m");
+
+            let mut used: usize = ROW_NUM_WIDTH + 1;
+            let num_cols = ss.num_cols();
+            let mut col_idx = ss.scroll_col;
+            while col_idx < num_cols {
+                let col_width = ss
+                    .column_widths
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(MIN_COL_WIDTH);
+                let remaining = (width as usize).saturating_sub(used);
+                if remaining == 0 {
+                    break;
+                }
+                let is_focused_cell = row_idx == cur_row && col_idx == cur_col;
+                let in_selection = has_multi_selection
+                    && row_idx >= sel_r0
+                    && row_idx <= sel_r1
+                    && col_idx >= sel_c0
+                    && col_idx <= sel_c1;
+
+                if is_focused_cell {
+                    if editing {
+                        line.push_str("\x1b[48;5;22m\x1b[38;5;230m");
+                    } else {
+                        line.push_str("\x1b[48;5;30m\x1b[38;5;230m");
+                    }
+                } else if in_selection {
+                    line.push_str("\x1b[48;5;23m\x1b[38;5;252m");
+                } else if is_current_row {
+                    line.push_str("\x1b[48;5;237m\x1b[38;5;252m");
+                } else {
+                    line.push_str("\x1b[48;5;234m\x1b[38;5;252m");
+                }
+
+                let text = ss.cell(row_idx, col_idx);
+                if remaining >= col_width + 1 {
+                    let rendered = render_cell_text(text, col_width);
+                    line.push_str(&rendered);
+                    line.push_str("\x1b[0m\x1b[48;5;234m\x1b[38;5;240m│\x1b[0m");
+                    used += col_width + 1;
+                    col_idx += 1;
+                } else {
+                    // Partial column at the right edge: fill remaining space with truncated
+                    // cell content, no trailing separator.
+                    let rendered = render_cell_text(text, remaining);
+                    line.push_str(&rendered);
+                    line.push_str("\x1b[0m");
+                    used += remaining;
+                    break;
+                }
+            }
+
+            // Pad remaining width
+            if is_current_row {
+                line.push_str("\x1b[48;5;237m");
+            } else {
+                line.push_str("\x1b[48;5;234m");
+            }
+            while used < width as usize {
+                line.push(' ');
+                used += 1;
+            }
+            line.push_str("\x1b[0m");
+            self.write_spreadsheet_row(screen_row, &line)?;
+        }
+
+        // --- Status bar ---
+        let pos_label = ss.cursor_label();
+        let num_rows = ss.num_rows();
+        let num_cols = ss.num_cols();
+        let ro = editor.is_read_only();
+        let (status_msg, is_error) = if let Some((msg, is_err)) = &editor.status_message {
+            (msg.clone(), *is_err)
+        } else {
+            (String::new(), false)
+        };
+        let left_status = if !status_msg.is_empty() {
+            format!(" {} ", status_msg)
+        } else {
+            let mod_ind = if modified { "*" } else { "" };
+            let ro_ind = if ro { " [RO]" } else { "" };
+            format!(" {}{}{} ", file_name, mod_ind, ro_ind)
+        };
+        let lang_label = ss.delimiter_name();
+        let middle = format!(" [{}] ", lang_label);
+        let metrics = ss.selection_metrics().format();
+        let metrics_display = if metrics.is_empty() {
+            String::new()
+        } else {
+            format!(" {} ", metrics)
+        };
+        let right_status = format!(
+            " {:>10}  {:>4}×{:<4} ",
+            pos_label,
+            num_rows,
+            num_cols
+        );
+        let used = left_status.chars().count()
+            + middle.chars().count()
+            + metrics_display.chars().count()
+            + right_status.chars().count();
+        let mut status_line = String::new();
+        status_line.push_str(&left_status);
+        status_line.push_str(&middle);
+        status_line.push_str(&metrics_display);
+        if used < width as usize {
+            for _ in 0..(width as usize - used) {
+                status_line.push(' ');
+            }
+        }
+        status_line.push_str(&right_status);
+        let status_chars: Vec<char> = status_line.chars().collect();
+        if status_chars.len() > width as usize {
+            status_line = status_chars.iter().take(width as usize).collect();
+        }
+
+        if is_error {
+            write!(
+                self.stdout,
+                "\x1b[{};1H\x1b[48;5;196m\x1b[38;5;15m{}\x1b[0m",
+                status_row + 1,
+                status_line
+            )?;
+        } else {
+            write!(
+                self.stdout,
+                "\x1b[{};1H\x1b[48;5;238m\x1b[38;5;15m{}\x1b[0m",
+                status_row + 1,
+                status_line
+            )?;
+        }
+        self.last_status = status_line;
+
+        // --- Position text cursor in formula bar if editing ---
+        if editing {
+            if let Some(edit) = ss.editing.as_ref() {
+                let (edit_line, edit_col) = cursor_line_col_chars(&edit.text, edit.cursor);
+                let fb_row = edit_line.min(formula_bar_rows - 1);
+                let text_start_col = label_width;
+                let text_width = (width as usize).saturating_sub(text_start_col);
+                let visible_col = edit_col.min(text_width.saturating_sub(1));
+                let screen_row = fb_row;
+                let screen_col = text_start_col + visible_col;
+                #[cfg(target_os = "windows")]
+                write!(
+                    self.stdout,
+                    "\x1b[{};{}H\x1b[?25h",
+                    screen_row + 1,
+                    screen_col + 1
+                )?;
+                #[cfg(not(target_os = "windows"))]
+                execute!(
+                    self.stdout,
+                    MoveTo(screen_col as u16, screen_row as u16),
+                    Show
+                )?;
+                if self.last_cursor_style != CursorStyle::Underline {
+                    write!(self.stdout, "\x1b[6 q")?; // steady bar
+                    self.last_cursor_style = CursorStyle::Underline;
+                }
+            }
+        } else {
+            // Keep cursor hidden in navigation mode
+            #[cfg(target_os = "windows")]
+            write!(self.stdout, "\x1b[?25l")?;
+            #[cfg(not(target_os = "windows"))]
+            execute!(self.stdout, Hide)?;
+        }
+
+        self.stdout.flush()?;
+        #[cfg(target_os = "windows")]
+        {
+            self.needs_full_redraw = false;
+        }
+        Ok(())
+    }
+
+    fn write_spreadsheet_row(&mut self, screen_row: usize, line: &str) -> io::Result<()> {
+        let should_write = {
+            #[cfg(target_os = "windows")]
+            {
+                self.needs_full_redraw || self.last_screen.get(screen_row).map(|s| s.as_str()) != Some(line)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                self.last_screen.get(screen_row).map(|s| s.as_str()) != Some(line)
+            }
+        };
+        if should_write {
+            write!(self.stdout, "\x1b[{};1H{}", screen_row + 1, line)?;
+            if screen_row < self.last_screen.len() {
+                self.last_screen[screen_row] = line.to_string();
+            }
+        }
+        Ok(())
+    }
+
     /// Force a complete redraw by clearing cached state
     pub fn force_redraw(&mut self) {
         self.last_screen = vec![String::new(); self.last_size.1 as usize];
@@ -998,6 +1469,8 @@ impl Renderer {
             crate::syntax::Language::Json => "JSON",
             crate::syntax::Language::Shell => "Shell",
             crate::syntax::Language::Toml => "TOML",
+            crate::syntax::Language::Csv => "CSV",
+            crate::syntax::Language::Tsv => "TSV",
         };
         let language_info = format!(" [{}] ", language_name);
 
@@ -1072,4 +1545,48 @@ impl Renderer {
 
         Ok(())
     }
+}
+
+fn render_centered(label: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let label_width: usize = label.chars().map(|c| c.width().unwrap_or(1)).sum();
+    if label_width >= width {
+        let mut out = String::new();
+        let mut used = 0;
+        for ch in label.chars() {
+            let cw = ch.width().unwrap_or(1);
+            if used + cw > width {
+                break;
+            }
+            out.push(ch);
+            used += cw;
+        }
+        while used < width {
+            out.push(' ');
+            used += 1;
+        }
+        out
+    } else {
+        let pad = width - label_width;
+        let left_pad = pad / 2;
+        let right_pad = pad - left_pad;
+        let mut out = String::new();
+        for _ in 0..left_pad {
+            out.push(' ');
+        }
+        out.push_str(label);
+        for _ in 0..right_pad {
+            out.push(' ');
+        }
+        out
+    }
+}
+
+fn cursor_line_col_chars(text: &str, cursor_byte: usize) -> (usize, usize) {
+    let cursor_byte = cursor_byte.min(text.len());
+    let before = &text[..cursor_byte];
+    let line = before.bytes().filter(|&b| b == b'\n').count();
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col = text[line_start..cursor_byte].chars().count();
+    (line, col)
 }

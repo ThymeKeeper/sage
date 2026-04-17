@@ -25,6 +25,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut autocomplete = autocomplete::Autocomplete::new();
     let mut suppress_autocomplete_once = false; // Suppress after Tab completion
 
+    // Spreadsheet: track recent click for double-click detection
+    let mut ss_last_click: Option<(std::time::Instant, crate::spreadsheet::GridHit)> = None;
+
     loop {
         // Check if background execution is complete
         if let Some(ref rx) = execution_rx {
@@ -167,6 +170,46 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
             Event::Mouse(mouse_event) => {
                 // Check if shift is held for horizontal scrolling
                 let shift_held = mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+
+                // Spreadsheet mode handles mouse itself
+                if editor.is_spreadsheet_mode() {
+                    // Double-click detection for auto-sizing columns
+                    if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
+                        let (term_w, term_h) = crossterm::terminal::size()?;
+                        let hit_now = editor
+                            .spreadsheet()
+                            .map(|ss| ss.hit_test(mouse_event.column, mouse_event.row, term_w, term_h));
+                        if let Some(hit) = hit_now {
+                            let now = std::time::Instant::now();
+                            let is_double = ss_last_click
+                                .as_ref()
+                                .map(|(t, prev_hit)| {
+                                    now.duration_since(*t) < std::time::Duration::from_millis(500)
+                                        && *prev_hit == hit
+                                })
+                                .unwrap_or(false);
+                            ss_last_click = Some((now, hit));
+                            if is_double {
+                                if let crate::spreadsheet::GridHit::ColumnSeparator { col } = hit {
+                                    if let Some(ss) = editor.spreadsheet_mut() {
+                                        ss.end_mouse(); // Cancel any pending resize drag
+                                        ss.auto_size_column(col);
+                                    }
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    let cursor_before = editor.spreadsheet().map(|ss| ss.cursor);
+                    handle_spreadsheet_mouse(editor, &mouse_event, &mut needs_redraw)?;
+                    let cursor_after = editor.spreadsheet().map(|ss| ss.cursor);
+                    if cursor_before != cursor_after {
+                        ensure_ss_cursor_visible(editor)?;
+                    }
+                    continue;
+                }
 
                 // Handle mouse scrolling for help screen
                 if let Some(ref mut help) = help_screen {
@@ -397,7 +440,45 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 }
 
                 needs_redraw = true; // Key events usually need redraw
-                
+
+                // Spreadsheet mode: intercept most keys before any normal handling,
+                // except when the find pane is open — then input belongs to the find pane.
+                if editor.is_spreadsheet_mode() && find_replace.is_none() {
+                    let cursor_before = editor.spreadsheet().map(|ss| ss.cursor);
+                    if handle_spreadsheet_key(editor, &key, &mut needs_redraw) {
+                        let cursor_after = editor.spreadsheet().map(|ss| ss.cursor);
+                        if cursor_before != cursor_after {
+                            ensure_ss_cursor_visible(editor)?;
+                        }
+                        continue;
+                    }
+                    // fall-through for Ctrl+S, Ctrl+Shift+S, Ctrl+Q
+                }
+
+                // Spreadsheet-mode find: a separate, simpler input path. Matches are cells
+                // (row, col) and navigating them moves the cell cursor, not text ranges.
+                if editor.is_spreadsheet_mode() && find_replace.is_some() {
+                    let action = {
+                        let fr = find_replace.as_mut().unwrap();
+                        handle_spreadsheet_find_key(editor, fr, &key)
+                    };
+                    match action {
+                        SsFindAction::Close => {
+                            find_replace = None;
+                            execute!(io::stdout(),
+                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                                crossterm::cursor::Hide
+                            )?;
+                            renderer.force_redraw();
+                        }
+                        SsFindAction::Handled => {
+                            ensure_ss_cursor_visible_with_bottom(editor, 3)?;
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+
                 // If find/replace window is active, handle its input first
                 if let Some(ref mut fr) = find_replace {
                     // Special handling for find/replace shortcuts
@@ -1390,8 +1471,18 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         renderer.draw(editor)?;
                     }
                     commands::Command::FindReplace => {
-                        // Open find/replace window
-                        find_replace = Some(find_replace::FindReplace::new());
+                        // Open find/replace window. Spreadsheet mode uses a find-only pane
+                        // because replacing cell contents via this UI isn't supported.
+                        if editor.is_spreadsheet_mode() {
+                            let mut fr = find_replace::FindReplace::new_find_only();
+                            if let Some(ss) = editor.spreadsheet() {
+                                let matches = ss.find_cells(fr.find_text());
+                                fr.update_matches(matches);
+                            }
+                            find_replace = Some(fr);
+                        } else {
+                            find_replace = Some(find_replace::FindReplace::new());
+                        }
                     }
                     commands::Command::None => {
                         // No command - don't override needs_redraw flag
@@ -1561,4 +1652,507 @@ fn spawn_background_execution(
     });
 
     Some((rx, kernel_info))
+}
+
+fn ensure_ss_cursor_visible(editor: &mut editor::Editor) -> io::Result<()> {
+    ensure_ss_cursor_visible_with_bottom(editor, 0)
+}
+
+fn ensure_ss_cursor_visible_with_bottom(
+    editor: &mut editor::Editor,
+    bottom_pane_height: usize,
+) -> io::Result<()> {
+    use crate::spreadsheet::FORMULA_BAR_HEIGHT;
+    let (width, height) = crossterm::terminal::size()?;
+    let data_start = FORMULA_BAR_HEIGHT + 2;
+    let status_row = (height as usize).saturating_sub(1 + bottom_pane_height);
+    let visible_data_rows = status_row.saturating_sub(data_start);
+    if let Some(ss) = editor.spreadsheet_mut() {
+        ss.ensure_cursor_visible(visible_data_rows, width as usize);
+    }
+    Ok(())
+}
+
+enum SsFindAction {
+    Close,
+    Handled,
+}
+
+/// Handle a key event while the find pane is open in spreadsheet mode.
+/// Matches are cells identified by (row, col); moving to a match selects that cell.
+fn handle_spreadsheet_find_key(
+    editor: &mut editor::Editor,
+    fr: &mut find_replace::FindReplace,
+    key: &event::KeyEvent,
+) -> SsFindAction {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // Ctrl+F / Ctrl+Shift+F: cycle next/prev match without touching the find text.
+    if ctrl {
+        match key.code {
+            KeyCode::Char('f') | KeyCode::Char('F') if !shift => {
+                if let Some((r, c)) = fr.next_match() {
+                    if let Some(ss) = editor.spreadsheet_mut() {
+                        ss.move_to(r, c, false);
+                    }
+                }
+                return SsFindAction::Handled;
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') if shift => {
+                if let Some((r, c)) = fr.prev_match() {
+                    if let Some(ss) = editor.spreadsheet_mut() {
+                        ss.move_to(r, c, false);
+                    }
+                }
+                return SsFindAction::Handled;
+            }
+            _ => {}
+        }
+    }
+
+    let result = fr.handle_input(key.code, key.modifiers);
+    match result {
+        find_replace::InputResult::Close => SsFindAction::Close,
+        find_replace::InputResult::FindTextChanged => {
+            let matches = editor
+                .spreadsheet()
+                .map(|ss| ss.find_cells(fr.find_text()))
+                .unwrap_or_default();
+            fr.set_matches_from_start(matches);
+            if let Some((r, c)) = fr.current_match_position() {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    ss.move_to(r, c, false);
+                }
+            }
+            SsFindAction::Handled
+        }
+        find_replace::InputResult::FindNext => {
+            if let Some((r, c)) = fr.next_match() {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    ss.move_to(r, c, false);
+                }
+            }
+            SsFindAction::Handled
+        }
+        find_replace::InputResult::Continue => SsFindAction::Handled,
+    }
+}
+
+fn handle_spreadsheet_mouse(
+    editor: &mut editor::Editor,
+    me: &event::MouseEvent,
+    needs_redraw: &mut bool,
+) -> io::Result<()> {
+    use crate::spreadsheet::{GridHit, MouseMode};
+    let (width, height) = crossterm::terminal::size()?;
+    let shift = me.modifiers.contains(KeyModifiers::SHIFT);
+    let Some(ss) = editor.spreadsheet_mut() else { return Ok(()) };
+
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let hit = ss.hit_test(me.column, me.row, width, height);
+            match hit {
+                GridHit::ColumnSeparator { col } => {
+                    if ss.is_editing() {
+                        ss.commit_edit();
+                    }
+                    ss.begin_mouse_column_resize(col, me.column);
+                }
+                GridHit::DataCell { row, col } => {
+                    ss.begin_mouse_cell_select(row, col, shift);
+                }
+                GridHit::ColumnHeader { col } => {
+                    if ss.is_editing() {
+                        ss.commit_edit();
+                    }
+                    ss.select_column(col, shift);
+                    ss.mouse_mode = MouseMode::ColumnSelect;
+                }
+                GridHit::RowNumber { row } => {
+                    if ss.is_editing() {
+                        ss.commit_edit();
+                    }
+                    ss.select_row(row, shift);
+                    ss.mouse_mode = MouseMode::RowSelect;
+                }
+                GridHit::FormulaBar { row, text_col } => {
+                    ss.begin_mouse_formula_bar_select(row, text_col, shift);
+                }
+                GridHit::Divider | GridHit::Outside => {}
+            }
+            *needs_redraw = true;
+        }
+        MouseEventKind::Drag(MouseButton::Left) => match ss.mouse_mode {
+            MouseMode::ColumnResize {
+                col,
+                anchor_screen_col,
+                anchor_width,
+            } => {
+                let delta = me.column as i32 - anchor_screen_col as i32;
+                let new_width = (anchor_width as i32 + delta).max(1);
+                ss.set_column_width(col, new_width as usize);
+                *needs_redraw = true;
+            }
+            MouseMode::CellSelect => {
+                let hit = ss.hit_test(me.column, me.row, width, height);
+                match hit {
+                    GridHit::DataCell { row, col } => {
+                        ss.move_to(row, col, true);
+                        *needs_redraw = true;
+                    }
+                    GridHit::RowNumber { row } => {
+                        let cur_col = ss.cursor.1;
+                        ss.move_to(row, cur_col, true);
+                        *needs_redraw = true;
+                    }
+                    GridHit::ColumnHeader { col } => {
+                        let cur_row = ss.cursor.0;
+                        ss.move_to(cur_row, col, true);
+                        *needs_redraw = true;
+                    }
+                    _ => {}
+                }
+            }
+            MouseMode::ColumnSelect => {
+                let hit = ss.hit_test(me.column, me.row, width, height);
+                let target_col = match hit {
+                    GridHit::ColumnHeader { col } => Some(col),
+                    GridHit::DataCell { col, .. } => Some(col),
+                    GridHit::ColumnSeparator { col } => Some(col),
+                    _ => None,
+                };
+                if let Some(col) = target_col {
+                    ss.extend_column_selection(col);
+                    *needs_redraw = true;
+                }
+            }
+            MouseMode::RowSelect => {
+                let hit = ss.hit_test(me.column, me.row, width, height);
+                let target_row = match hit {
+                    GridHit::RowNumber { row } => Some(row),
+                    GridHit::DataCell { row, .. } => Some(row),
+                    _ => None,
+                };
+                if let Some(row) = target_row {
+                    ss.extend_row_selection(row);
+                    *needs_redraw = true;
+                }
+            }
+            MouseMode::FormulaBarSelect => {
+                let hit = ss.hit_test(me.column, me.row, width, height);
+                if let GridHit::FormulaBar { row, text_col } = hit {
+                    let byte = ss.formula_bar_text_to_byte(row, text_col);
+                    ss.edit_set_cursor(byte, true);
+                    *needs_redraw = true;
+                }
+            }
+            MouseMode::None => {}
+        },
+        MouseEventKind::Up(MouseButton::Left) => {
+            ss.end_mouse();
+            *needs_redraw = true;
+        }
+        MouseEventKind::ScrollDown => {
+            if shift {
+                ss.scroll_by(0, 3);
+            } else {
+                ss.scroll_by(3, 0);
+            }
+            *needs_redraw = true;
+        }
+        MouseEventKind::ScrollUp => {
+            if shift {
+                ss.scroll_by(0, -3);
+            } else {
+                ss.scroll_by(-3, 0);
+            }
+            *needs_redraw = true;
+        }
+        MouseEventKind::ScrollLeft => {
+            ss.scroll_by(0, -3);
+            *needs_redraw = true;
+        }
+        MouseEventKind::ScrollRight => {
+            ss.scroll_by(0, 3);
+            *needs_redraw = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Handle a key in spreadsheet mode. Returns true if consumed, false if it should fall through
+/// to the normal editor handling (used for Ctrl+S, Ctrl+Shift+S, Ctrl+Q which use the standard
+/// save/exit prompt flows).
+fn handle_spreadsheet_key(
+    editor: &mut editor::Editor,
+    key: &event::KeyEvent,
+    needs_redraw: &mut bool,
+) -> bool {
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Let save/quit go through the normal prompt dialogs
+    if ctrl && !alt {
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    if ss.is_editing() {
+                        ss.commit_edit();
+                    }
+                }
+                return false;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    if ss.is_editing() {
+                        ss.cancel_edit();
+                    }
+                }
+                return false;
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') if !shift => {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    if ss.is_editing() {
+                        ss.commit_edit();
+                    }
+                }
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    let editing = match editor.spreadsheet() {
+        Some(ss) => ss.is_editing(),
+        None => return false,
+    };
+
+    if editing {
+        let ss = editor.spreadsheet_mut().expect("spreadsheet");
+        match key.code {
+            KeyCode::Esc => {
+                ss.cancel_edit();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Enter if shift => {
+                ss.edit_insert_newline();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Enter => {
+                ss.commit_edit();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Tab => {
+                ss.commit_edit();
+                if shift {
+                    ss.move_left(false);
+                } else {
+                    ss.move_right(false);
+                }
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::BackTab => {
+                ss.commit_edit();
+                ss.move_left(false);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Backspace => {
+                ss.edit_backspace();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Delete => {
+                ss.edit_delete();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Left => {
+                ss.edit_move_left(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Right => {
+                ss.edit_move_right(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Up => {
+                ss.edit_move_up(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Down => {
+                ss.edit_move_down(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Home => {
+                ss.edit_move_home(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::End => {
+                ss.edit_move_end(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if ctrl && !alt => {
+                ss.edit_select_all();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') if ctrl && !alt => {
+                if let Some(text) = ss.edit_get_selected_text() {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(text);
+                    }
+                }
+                true
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') if ctrl && !alt => {
+                if let Some(text) = ss.edit_get_selected_text() {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(text);
+                    }
+                    ss.edit_paste("");
+                    *needs_redraw = true;
+                }
+                true
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') if ctrl && !alt => {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    if let Ok(text) = cb.get_text() {
+                        ss.edit_paste(&text);
+                        *needs_redraw = true;
+                    }
+                }
+                true
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                ss.edit_insert_char(c);
+                *needs_redraw = true;
+                true
+            }
+            _ => true,
+        }
+    } else {
+        // Navigation mode
+        let ss = editor.spreadsheet_mut().expect("spreadsheet");
+        match key.code {
+            KeyCode::Up => {
+                ss.move_up(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Down => {
+                ss.move_down(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Left => {
+                ss.move_left(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Right => {
+                ss.move_right(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Home if ctrl => {
+                ss.move_top_left(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Home => {
+                ss.move_home(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::End if ctrl => {
+                ss.move_bottom_right(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::End => {
+                ss.move_end(shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::PageUp => {
+                ss.page_up(20, shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::PageDown => {
+                ss.page_down(20, shift);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Enter | KeyCode::F(2) => {
+                ss.enter_edit_mode();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Tab => {
+                if shift {
+                    ss.move_left(false);
+                } else {
+                    ss.move_right(false);
+                }
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::BackTab => {
+                ss.move_left(false);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                ss.clear_selection_content();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Esc => {
+                ss.selection_anchor = None;
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if ctrl && !alt => {
+                ss.select_all();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') if ctrl && !alt => {
+                let text = ss.copy_selection_tsv();
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(text);
+                }
+                true
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') if ctrl && !alt => {
+                let text = ss.copy_selection_tsv();
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(text);
+                }
+                ss.clear_selection_content();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                ss.enter_edit_mode_replace(c);
+                *needs_redraw = true;
+                true
+            }
+            _ => true,
+        }
+    }
 }

@@ -18,6 +18,7 @@ pub struct FindReplace {
     total_matches: usize,
     matches: Vec<(usize, usize)>, // (start_byte, end_byte) positions
     clipboard: Clipboard,
+    find_only: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -38,7 +39,16 @@ impl FindReplace {
             total_matches: 0,
             matches: Vec::new(),
             clipboard: Clipboard::new().expect("Failed to access clipboard"),
+            find_only: false,
         }
+    }
+
+    /// Construct a find-only pane (no Replace field). Used in spreadsheet mode where
+    /// replacing cell contents through this UI isn't supported.
+    pub fn new_find_only() -> Self {
+        let mut fr = Self::new();
+        fr.find_only = true;
+        fr
     }
     
     /// Update the search results
@@ -48,6 +58,13 @@ impl FindReplace {
         if self.total_matches > 0 && self.current_match >= self.total_matches {
             self.current_match = self.total_matches - 1;
         }
+    }
+
+    /// Replace matches and reset the current match to the first (or none when empty).
+    pub fn set_matches_from_start(&mut self, matches: Vec<(usize, usize)>) {
+        self.matches = matches;
+        self.total_matches = self.matches.len();
+        self.current_match = 0;
     }
     
     /// Get the current match position
@@ -175,8 +192,13 @@ impl FindReplace {
         
         // Calculate field widths - split available space
         let total_width = width as usize - 4; // Subtract borders and padding
-        let available_for_fields = total_width.saturating_sub(6 + 9 + actual_counter_len + 4); // "Find: " + "Replace: " + counter + spacing
-        let field_width = available_for_fields / 2;
+        let field_width = if self.find_only {
+            // "│ " + "Find: " + field + counter + " " + "│" (plus some padding)
+            total_width.saturating_sub(6 + actual_counter_len)
+        } else {
+            let available_for_fields = total_width.saturating_sub(6 + 9 + actual_counter_len + 4); // "Find: " + "Replace: " + counter + spacing
+            available_for_fields / 2
+        };
         
         // Draw window background with border
         for y in 0..window_height as usize {
@@ -249,57 +271,61 @@ impl FindReplace {
                     )?;
                 }
                 
-                // Spacing between fields
-                write!(stdout, "  ")?;
-                
-                // Replace label and field
-                execute!(
-                    stdout,
-                    SetForegroundColor(if self.active_field == Field::Replace {
-                        Color::White
-                    } else {
-                        Color::Rgb { r: 150, g: 150, b: 155 }
-                    }),
-                    Print("Replace: "),
-                    SetForegroundColor(Color::Rgb { r: 200, g: 200, b: 205 }),
-                )?;
-                
-                // Replace input field
-                let visible_replace = self.get_visible_text_with_selection(
-                    &self.replace_text, 
-                    field_width,
-                    if self.active_field == Field::Replace { self.cursor_pos } else { 0 },
-                    if self.active_field == Field::Replace { self.get_selection() } else { None }
-                );
-                
-                execute!(
-                    stdout,
-                    SetBackgroundColor(if self.active_field == Field::Replace {
-                        Color::Rgb { r: 20, g: 20, b: 25 }
-                    } else {
-                        Color::Rgb { r: 30, g: 30, b: 35 }
-                    }),
-                    SetForegroundColor(Color::Rgb { r: 220, g: 220, b: 230 }),
-                )?;
-                
-                // Write the field content with selection highlighting
-                write!(stdout, "{}", visible_replace)?;
-                
-                // Pad to field width
-                let visible_len = self.visible_length(&visible_replace);
-                for _ in visible_len..field_width {
-                    write!(stdout, " ")?;
-                }
-                
-                execute!(
-                    stdout,
-                    SetBackgroundColor(Color::Rgb { r: 40, g: 40, b: 45 }),
-                    SetForegroundColor(Color::Rgb { r: 200, g: 200, b: 205 }),
-                )?;
-                
+                let used = if !self.find_only {
+                    // Spacing between fields
+                    write!(stdout, "  ")?;
+
+                    // Replace label and field
+                    execute!(
+                        stdout,
+                        SetForegroundColor(if self.active_field == Field::Replace {
+                            Color::White
+                        } else {
+                            Color::Rgb { r: 150, g: 150, b: 155 }
+                        }),
+                        Print("Replace: "),
+                        SetForegroundColor(Color::Rgb { r: 200, g: 200, b: 205 }),
+                    )?;
+
+                    // Replace input field
+                    let visible_replace = self.get_visible_text_with_selection(
+                        &self.replace_text,
+                        field_width,
+                        if self.active_field == Field::Replace { self.cursor_pos } else { 0 },
+                        if self.active_field == Field::Replace { self.get_selection() } else { None }
+                    );
+
+                    execute!(
+                        stdout,
+                        SetBackgroundColor(if self.active_field == Field::Replace {
+                            Color::Rgb { r: 20, g: 20, b: 25 }
+                        } else {
+                            Color::Rgb { r: 30, g: 30, b: 35 }
+                        }),
+                        SetForegroundColor(Color::Rgb { r: 220, g: 220, b: 230 }),
+                    )?;
+
+                    // Write the field content with selection highlighting
+                    write!(stdout, "{}", visible_replace)?;
+
+                    // Pad to field width
+                    let visible_len = self.visible_length(&visible_replace);
+                    for _ in visible_len..field_width {
+                        write!(stdout, " ")?;
+                    }
+
+                    execute!(
+                        stdout,
+                        SetBackgroundColor(Color::Rgb { r: 40, g: 40, b: 45 }),
+                        SetForegroundColor(Color::Rgb { r: 200, g: 200, b: 205 }),
+                    )?;
+
+                    2 + 6 + field_width + actual_counter_len + 2 + 9 + field_width
+                } else {
+                    2 + 6 + field_width + actual_counter_len
+                };
+
                 // Fill rest of line
-                let used = 2 + 6 + field_width + actual_counter_len + 2 + 9 + field_width;
-                // Make sure we don't overflow
                 if used < width as usize - 1 {
                     for _ in used..width as usize - 1 {
                         write!(stdout, " ")?;
@@ -474,6 +500,10 @@ impl FindReplace {
             }
             
             KeyCode::Tab => {
+                if self.find_only {
+                    // No Replace field to switch to — ignore Tab.
+                    return InputResult::Continue;
+                }
                 // Clear selection when switching fields
                 self.selection_start = None;
                 // Switch between fields

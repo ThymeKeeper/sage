@@ -35,6 +35,8 @@ pub enum Language {
     Json,
     Shell,
     Toml,
+    Csv,
+    Tsv,
 }
 
 /// Represents a highlighted span within a line
@@ -119,6 +121,8 @@ impl Language {
             "json" | "jsonl" | "jsonc" => Language::Json,
             "sh" | "bash" | "zsh" => Language::Shell,
             "toml" => Language::Toml,
+            "csv" => Language::Csv,
+            "tsv" => Language::Tsv,
             _ => Language::PlainText,
         }
     }
@@ -294,6 +298,7 @@ impl SyntaxHighlighter {
             ),
             Language::Markdown => false, // Markdown doesn't have traditional keywords
             Language::PlainText => false,
+            Language::Csv | Language::Tsv => false,
         }
     }
 
