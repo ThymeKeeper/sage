@@ -81,7 +81,7 @@ pub fn get_cell_content(buffer: &Rope, cell: &Cell) -> String {
     } else {
         buffer.len_bytes()
     };
-    let first_line = buffer.slice(line_start..line_end).to_string();
+    let first_line = buffer.byte_slice(line_start..line_end).to_string();
     let is_delimiter_line = first_line.trim_start().starts_with(CELL_DELIMITER);
 
     // Only skip the first line if it's a delimiter
@@ -95,7 +95,7 @@ pub fn get_cell_content(buffer: &Rope, cell: &Cell) -> String {
         return String::new();
     }
 
-    buffer.slice(content_start..cell.end).to_string()
+    buffer.byte_slice(content_start..cell.end).to_string()
 }
 
 /// Format output for display (Jupyter-style)
