@@ -11,6 +11,7 @@ unicode-width = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
 zmq = "0.10"
 uuid = { version = "1.0", features = ["v4"] }
 glob = "0.3"
@@ -18,3 +19,5 @@ base64 = "0.22"
 toml = "0.8"
 dirs = "5.0"
 csv = "1.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+keyring = "2"

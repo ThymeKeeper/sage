@@ -5,6 +5,25 @@ use crossterm::{
 };
 use std::io;
 
+/// Messages flowing from the background execution thread to the host.
+/// One `Cell` per executed statement (sent as soon as it finishes), then
+/// exactly one `Done` carrying the kernel back and the final autocomplete
+/// metadata snapshot.
+enum ExecMsg {
+    Cell {
+        cell_number: usize,
+        output: String,
+        is_error: bool,
+        elapsed: f64,
+    },
+    Done {
+        kernel: Box<dyn kernel::Kernel>,
+        completions: Vec<kernel::CompletionItem>,
+        type_relationships: kernel::TypeRelationships,
+        sql_metadata: kernel::SqlMetadata,
+    },
+}
+
 
 pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
@@ -17,9 +36,19 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut help_screen: Option<help_screen::HelpScreen> = None; // Help screen state
 
     // State for background execution with live timer
-    let mut execution_rx: Option<std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>, kernel::TypeRelationships, kernel::SqlMetadata)>> = None;
+    let mut execution_rx: Option<std::sync::mpsc::Receiver<ExecMsg>> = None;
     let mut execution_start_time: Option<std::time::Instant> = None;
     let mut executing_kernel_info: Option<kernel::KernelInfo> = None;
+    // Cancel handle for the kernel currently inside the background execution
+    // thread. Captured before the kernel is moved, so the host can still reach
+    // it during a long-running execute(). Polymorphic — DirectKernel returns
+    // one that kills its OS process, SnowflakeKernel returns one that POSTs
+    // an abort to the SQL API.
+    let mut executing_cancel: Option<std::sync::Arc<dyn kernel::CancelHandle>> = None;
+    // True when the executing kernel can survive cancellation (Snowflake).
+    // False when cancel destroys the kernel (DirectKernel) and we have to
+    // rebuild it. Captured at spawn time alongside the cancel handle.
+    let mut executing_preserves_session: bool = false;
 
     // Autocomplete
     let mut autocomplete = autocomplete::Autocomplete::new();
@@ -29,69 +58,102 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut ss_last_click: Option<(std::time::Instant, crate::spreadsheet::GridHit)> = None;
 
     loop {
-        // Check if background execution is complete
-        if let Some(ref rx) = execution_rx {
-            match rx.try_recv() {
-                Ok((kernel, results, completions, type_relationships, sql_metadata)) => {
-                    // Execution complete! Put kernel back and process results
-                    editor.set_kernel(kernel);
-                    execution_rx = None;
-                    executing_kernel_info = None;
-                    let elapsed = execution_start_time.take().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-
-                    // Add outputs to pane
-                    for (_count, line, output, is_error, cell_elapsed) in results {
+        // Drain any pending execution messages from the background thread.
+        // We loop until the channel is empty so that several cells finishing
+        // in quick succession all render in the same tick instead of one
+        // per main-loop iteration.
+        if execution_rx.is_some() {
+            let mut done = false;
+            let mut failed = false;
+            let mut any_cell_drawn = false;
+            loop {
+                let msg = match execution_rx.as_ref().unwrap().try_recv() {
+                    Ok(m) => m,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        failed = true;
+                        break;
+                    }
+                };
+                match msg {
+                    ExecMsg::Cell {
+                        cell_number,
+                        output,
+                        is_error,
+                        elapsed,
+                    } => {
                         output_pane.add_output(output_pane::OutputEntry {
-                            cell_line: line,
+                            cell_line: cell_number,
                             output,
                             is_error,
-                            elapsed_secs: cell_elapsed,
+                            elapsed_secs: elapsed,
                         });
+                        any_cell_drawn = true;
                     }
-
-                    // Update autocomplete with dynamic completions
-                    if !completions.is_empty() {
-                        let completion_names: Vec<String> = completions.iter()
-                            .map(|c| c.name.clone())
-                            .collect();
-                        autocomplete.add_dynamic_completions(completion_names);
-                    }
-
-                    // Update autocomplete with type relationships and SQL metadata
-                    autocomplete.set_type_relationships(type_relationships);
-                    autocomplete.set_sql_metadata(sql_metadata);
-
-                    // Update status message with final time
-                    editor.status_message = Some((format!("Executed ({:.3}s)", elapsed), false));
-
-                    // Show output pane if needed
-                    output_pane.set_focused(false);
-                    if !output_pane_visible {
-                        output_pane_visible = true;
-                        editor.update_viewport_for_cursor_with_bottom(output_pane_height);
-                    }
-
-                    renderer.force_redraw();
-                    needs_redraw = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Still executing - update status bar with elapsed time
-                    // Only update the status bar, not the entire screen (avoid output pane flicker)
-                    if let Some(start_time) = execution_start_time {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        editor.status_message = Some((format!("Executing... {:.1}s", elapsed), false));
-                        // Use status-bar-only update to avoid output pane flicker on Windows
-                        let bottom_window_height = if output_pane_visible { output_pane_height } else { 0 };
-                        renderer.update_status_bar_only(editor, bottom_window_height)?;
+                    ExecMsg::Done {
+                        kernel,
+                        completions,
+                        type_relationships,
+                        sql_metadata,
+                    } => {
+                        editor.set_kernel(kernel);
+                        if !completions.is_empty() {
+                            let completion_names: Vec<String> =
+                                completions.iter().map(|c| c.name.clone()).collect();
+                            autocomplete.add_dynamic_completions(completion_names);
+                        }
+                        autocomplete.set_type_relationships(type_relationships);
+                        autocomplete.set_sql_metadata(sql_metadata);
+                        done = true;
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Thread panicked or channel closed unexpectedly
-                    editor.status_message = Some(("Execution failed".to_string(), true));
-                    execution_rx = None;
-                    execution_start_time = None;
-                    executing_kernel_info = None;
-                    needs_redraw = true;
+            }
+
+            if any_cell_drawn {
+                // First cell of the batch — make sure the output pane is up
+                // so the user can see it. Subsequent ticks won't re-open it
+                // because output_pane_visible is already true.
+                if !output_pane_visible {
+                    output_pane_visible = true;
+                    editor.update_viewport_for_cursor_with_bottom(output_pane_height);
+                }
+                output_pane.set_focused(false);
+                renderer.force_redraw();
+                needs_redraw = true;
+            }
+
+            if done {
+                let elapsed = execution_start_time
+                    .take()
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                editor.status_message = Some((format!("Executed ({:.3}s)", elapsed), false));
+                execution_rx = None;
+                executing_kernel_info = None;
+                executing_cancel = None;
+                executing_preserves_session = false;
+                needs_redraw = true;
+            } else if failed {
+                editor.status_message = Some(("Execution failed".to_string(), true));
+                execution_rx = None;
+                execution_start_time = None;
+                executing_kernel_info = None;
+                executing_cancel = None;
+                executing_preserves_session = false;
+                needs_redraw = true;
+            } else if !any_cell_drawn {
+                // Channel still open, nothing new — update the running-timer
+                // status bar without a full redraw to avoid pane flicker.
+                if let Some(start_time) = execution_start_time {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    editor.status_message =
+                        Some((format!("Executing... {:.1}s", elapsed), false));
+                    let bottom_window_height = if output_pane_visible {
+                        output_pane_height
+                    } else {
+                        0
+                    };
+                    renderer.update_status_bar_only(editor, bottom_window_height)?;
                 }
             }
         }
@@ -792,35 +854,54 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
                     }
                     
-                    // Aggressive Cancellation (Ctrl+Backspace)
-                    // TODO: Implement graceful interruption (SIGINT) to preserve kernel state
-                    // Currently this does a hard reset which loses all Python variables/state
+                    // Cancellation (Ctrl+Backspace)
+                    // Soft-cancel kernels (Snowflake) get a graceful abort and keep
+                    // the session. Hard-cancel kernels (Python) get the process killed
+                    // and rebuilt from scratch (variables lost).
                     KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+Backspace = AGGRESSIVE CANCEL
                         if execution_rx.is_some() {
-                            // Drop the channel - abandons the background thread
-                            execution_rx = None;
-                            execution_start_time = None;
-
-                            // Recreate a fresh kernel using stored info
-                            if let Some(kernel_info) = executing_kernel_info.take() {
-                                let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
-                                    kernel_info.python_path.clone(),
-                                    kernel_info.name.clone(),
-                                    kernel_info.display_name.clone(),
-                                ));
-                                if new_kernel.connect().is_ok() {
-                                    editor.set_kernel(new_kernel);
-                                    editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
-                                } else {
-                                    editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
+                            if executing_preserves_session {
+                                // Soft cancel: signal the kernel and let the normal
+                                // channel-recv flow finish (execute() returns Err,
+                                // thread sends the kernel back, we reuse it).
+                                if let Some(handle) = executing_cancel.take() {
+                                    handle.cancel();
                                 }
+                                editor.status_message = Some(("Cancelling...".to_string(), false));
+                                needs_redraw = true;
                             } else {
-                                editor.status_message = Some(("Execution cancelled".to_string(), true));
-                            }
+                                // Hard cancel: drop the channel (abandon thread),
+                                // kill the process via the cancel handle, rebuild the
+                                // kernel from scratch.
+                                execution_rx = None;
+                                execution_start_time = None;
+                                executing_preserves_session = false;
 
-                            renderer.force_redraw();
-                            needs_redraw = true;
+                                if let Some(handle) = executing_cancel.take() {
+                                    handle.cancel();
+                                }
+
+                                if let Some(kernel_info) = executing_kernel_info.take() {
+                                    match kernel::build_from_info(&kernel_info) {
+                                        Ok(mut new_kernel) => {
+                                            if new_kernel.connect().is_ok() {
+                                                editor.set_kernel(new_kernel);
+                                                editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
+                                            } else {
+                                                editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            editor.status_message = Some((format!("CANCELLED - Kernel rebuild failed: {}", e), true));
+                                        }
+                                    }
+                                } else {
+                                    editor.status_message = Some(("Execution cancelled".to_string(), true));
+                                }
+
+                                renderer.force_redraw();
+                                needs_redraw = true;
+                            }
                         } else {
                             // Not executing - just show message to confirm Ctrl+Backspace was detected
                             editor.status_message = Some(("No execution to cancel".to_string(), false));
@@ -869,9 +950,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                     // Execute Cell (Ctrl+E as alternative)
                     KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Only allow execution in Python/REPL mode
+                        // Only allow execution in REPL-mode languages (Python or SQL).
                         if !editor.is_repl_mode() {
-                            editor.status_message = Some(("Cell execution only available in Python mode. Press Ctrl+Y to switch language.".to_string(), true));
+                            editor.status_message = Some(("Cell execution only available in REPL mode (Python/SQL). Press Ctrl+Y to switch language.".to_string(), true));
                             needs_redraw = true;
                         } else if execution_rx.is_some() {
                             // Check if already executing
@@ -879,10 +960,12 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             needs_redraw = true;
                         } else {
                             // Start background execution
-                            if let Some((rx, kernel_info)) = spawn_background_execution(editor) {
+                            if let Some((rx, kernel_info, cancel, preserves)) = spawn_background_execution(editor) {
                                 execution_rx = Some(rx);
                                 execution_start_time = Some(std::time::Instant::now());
                                 executing_kernel_info = Some(kernel_info);
+                                executing_cancel = cancel;
+                                executing_preserves_session = preserves;
                                 editor.status_message = Some(("Executing...".to_string(), false));
                                 needs_redraw = true;
                             } else {
@@ -916,13 +999,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                     // Kernel Selection (Ctrl+K)
                     KeyCode::Char('k') | KeyCode::Char('K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Only allow kernel selection in Python mode
-                        if *editor.get_language() != syntax::Language::Python {
-                            editor.status_message = Some(("Kernel selection only available in Python mode. Press Ctrl+Y to switch language.".to_string(), true));
+                        // Allow kernel selection in REPL-mode languages (Python or SQL).
+                        let lang = *editor.get_language();
+                        if lang != syntax::Language::Python && lang != syntax::Language::Sql {
+                            editor.status_message = Some(("Kernel selection only available in REPL mode (Python/SQL). Press Ctrl+Y to switch language.".to_string(), true));
                             commands::Command::None
                         } else {
                         // Show loading message
-                        editor.status_message = Some(("Discovering Python kernels...".to_string(), false));
+                        editor.status_message = Some(("Discovering kernels...".to_string(), false));
                         renderer.draw(editor)?;
                         use std::io::Write;
                         let mut stdout = io::stdout();
@@ -952,14 +1036,16 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         renderer.force_redraw();
 
                         if let Some(kernel_info) = result {
-                            use crate::direct_kernel::DirectKernel;
-
-                            // Create kernel
-                            let mut kernel: Box<dyn kernel::Kernel> = Box::new(DirectKernel::new(
-                                kernel_info.python_path.clone(),
-                                kernel_info.name.clone(),
-                                kernel_info.display_name.clone()
-                            ));
+                            // Polymorphic dispatch — DirectKernel for Python interpreters,
+                            // SnowflakeKernel when info.name is the Snowflake sentinel.
+                            let mut kernel = match kernel::build_from_info(&kernel_info) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    editor.status_message = Some((format!("Failed to build kernel: {}", e), true));
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                            };
 
                             // Disconnect old kernel first if exists
                             if editor.is_kernel_connected() {
@@ -1047,10 +1133,15 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             if language == syntax::Language::Python {
                                 // Enable REPL mode for Python
                                 if !editor.is_repl_mode() {
-                                    // If no kernel connected, auto-connect to first available kernel
+                                    // If no kernel connected, auto-connect to first available kernel.
+                                    // Filter out the Snowflake entry — this path is the explicit
+                                    // "switch to Python mode" toggle and shouldn't pick a SQL kernel.
                                     if !editor.is_kernel_connected() {
                                         let kernels = kernel::discover_kernels();
-                                        if let Some(kernel_info) = kernels.into_iter().next() {
+                                        if let Some(kernel_info) = kernels
+                                            .into_iter()
+                                            .find(|k| k.name != kernel::SNOWFLAKE_KERNEL_NAME)
+                                        {
                                             // Auto-connect to first kernel
                                             let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(
                                                 direct_kernel::DirectKernel::new(
@@ -1077,6 +1168,46 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                     }
                                 }
                                 // Show output pane for Python
+                                output_pane_visible = true;
+                            } else if language == syntax::Language::Sql {
+                                // Enable REPL mode for SQL and auto-connect Snowflake.
+                                // Mirrors the Python branch: only acts if not already in
+                                // REPL mode, so switching language between two REPL-mode
+                                // sessions doesn't swap a working kernel out from under
+                                // the user.
+                                if !editor.is_repl_mode() {
+                                    if !editor.is_kernel_connected() {
+                                        let info = kernel::KernelInfo {
+                                            name: kernel::SNOWFLAKE_KERNEL_NAME.to_string(),
+                                            display_name: "Snowflake".to_string(),
+                                            python_path: String::new(),
+                                        };
+                                        match kernel::build_from_info(&info) {
+                                            Ok(mut new_kernel) => {
+                                                match new_kernel.connect() {
+                                                    Ok(()) => {
+                                                        let display = new_kernel.info().display_name.clone();
+                                                        editor.set_kernel(new_kernel);
+                                                        editor.enable_repl_mode();
+                                                        editor.status_message = Some((format!("SQL mode enabled with {}", display), false));
+                                                    }
+                                                    Err(e) => {
+                                                        editor.enable_repl_mode();
+                                                        editor.status_message = Some((format!("SQL mode enabled. Snowflake connect failed: {} — press Ctrl+K to pick a kernel.", e), true));
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                editor.enable_repl_mode();
+                                                editor.status_message = Some((format!("SQL mode enabled. Snowflake config missing: {} (add C:\\.dotfile\\snowflake.toml)", e), true));
+                                            }
+                                        }
+                                    } else {
+                                        editor.enable_repl_mode();
+                                        editor.status_message = Some(("Switched to SQL mode with REPL enabled".to_string(), false));
+                                    }
+                                }
+                                // Show output pane for SQL
                                 output_pane_visible = true;
                             } else {
                                 // Disable REPL mode for other languages
@@ -1317,29 +1448,45 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     // Editing
                     // Ctrl+H is often sent by terminals for Ctrl+Backspace - handle cancellation
                     KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) && find_replace.is_none() => {
-                        // Same cancellation logic as Ctrl+Backspace
+                        // Same cancellation logic as Ctrl+Backspace — see that handler
+                        // for the soft-vs-hard cancel rationale.
                         if execution_rx.is_some() {
-                            execution_rx = None;
-                            execution_start_time = None;
-
-                            if let Some(kernel_info) = executing_kernel_info.take() {
-                                let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(direct_kernel::DirectKernel::new(
-                                    kernel_info.python_path.clone(),
-                                    kernel_info.name.clone(),
-                                    kernel_info.display_name.clone(),
-                                ));
-                                if new_kernel.connect().is_ok() {
-                                    editor.set_kernel(new_kernel);
-                                    editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
-                                } else {
-                                    editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
+                            if executing_preserves_session {
+                                if let Some(handle) = executing_cancel.take() {
+                                    handle.cancel();
                                 }
+                                editor.status_message = Some(("Cancelling...".to_string(), false));
+                                needs_redraw = true;
                             } else {
-                                editor.status_message = Some(("Execution cancelled".to_string(), true));
-                            }
+                                execution_rx = None;
+                                execution_start_time = None;
+                                executing_preserves_session = false;
 
-                            renderer.force_redraw();
-                            needs_redraw = true;
+                                if let Some(handle) = executing_cancel.take() {
+                                    handle.cancel();
+                                }
+
+                                if let Some(kernel_info) = executing_kernel_info.take() {
+                                    match kernel::build_from_info(&kernel_info) {
+                                        Ok(mut new_kernel) => {
+                                            if new_kernel.connect().is_ok() {
+                                                editor.set_kernel(new_kernel);
+                                                editor.status_message = Some(("CANCELLED - Kernel reset (all variables lost)".to_string(), true));
+                                            } else {
+                                                editor.status_message = Some(("CANCELLED - Kernel reconnection failed".to_string(), true));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            editor.status_message = Some((format!("CANCELLED - Kernel rebuild failed: {}", e), true));
+                                        }
+                                    }
+                                } else {
+                                    editor.status_message = Some(("Execution cancelled".to_string(), true));
+                                }
+
+                                renderer.force_redraw();
+                                needs_redraw = true;
+                            }
                         } else {
                             editor.status_message = Some(("No execution to cancel".to_string(), false));
                         }
@@ -1355,10 +1502,12 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 needs_redraw = true;
                             } else {
                                 // Start background execution
-                                if let Some((rx, kernel_info)) = spawn_background_execution(editor) {
+                                if let Some((rx, kernel_info, cancel, preserves)) = spawn_background_execution(editor) {
                                     execution_rx = Some(rx);
                                     execution_start_time = Some(std::time::Instant::now());
                                     executing_kernel_info = Some(kernel_info);
+                                    executing_cancel = cancel;
+                                    executing_preserves_session = preserves;
                                     editor.status_message = Some(("Executing...".to_string(), false));
                                     needs_redraw = true;
                                 }
@@ -1562,12 +1711,17 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
 fn spawn_background_execution(
     editor: &mut editor::Editor,
-) -> Option<(std::sync::mpsc::Receiver<(Box<dyn kernel::Kernel>, Vec<(usize, usize, String, bool, f64)>, Vec<kernel::CompletionItem>, kernel::TypeRelationships, kernel::SqlMetadata)>, kernel::KernelInfo)> {
+) -> Option<(std::sync::mpsc::Receiver<ExecMsg>, kernel::KernelInfo, Option<std::sync::Arc<dyn kernel::CancelHandle>>, bool)> {
     // Extract kernel from editor (temporarily)
     let mut kernel = editor.take_kernel()?;
 
-    // Store kernel info for potential recreation
+    // Store kernel info for potential recreation, grab a cancel handle so
+    // the host can abort execution from outside the background thread, and
+    // record whether the kernel survives cancellation so the cancel handlers
+    // know whether to wait for the channel or rebuild from scratch.
     let kernel_info = kernel.info().clone();
+    let cancel = kernel.cancel_handle();
+    let preserves_session = kernel.cancel_preserves_session();
 
     // Get selection or current cell position
     let selection = editor.selection();
@@ -1606,10 +1760,12 @@ fn spawn_background_execution(
         return None;
     }
 
-    // Spawn background thread
+    // Spawn background thread. Sends one ExecMsg::Cell per statement as it
+    // finishes — the host drains the channel and paints incrementally — then
+    // a single ExecMsg::Done hands the kernel back and carries the final
+    // autocomplete metadata snapshot.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut results = Vec::new();
         let mut all_completions = Vec::new();
         let mut type_relationships = crate::kernel::TypeRelationships::default();
         let mut sql_metadata = crate::kernel::SqlMetadata::default();
@@ -1620,38 +1776,46 @@ fn spawn_background_execution(
             match kernel.execute(&code) {
                 Ok(result) => {
                     let elapsed = start_time.elapsed().as_secs_f64();
-                    let execution_count = result.execution_count.unwrap_or(0);
                     let output_text = crate::cell::format_output(&result);
                     let is_error = !result.success;
 
-                    // Collect completions from this execution
                     all_completions.extend(result.completions);
-
-                    // Update type relationships and SQL metadata (keep the latest)
                     type_relationships = result.type_relationships;
                     sql_metadata = result.sql_metadata;
 
-                    results.push((execution_count, cell_number, output_text, is_error, elapsed));
+                    let _ = tx.send(ExecMsg::Cell {
+                        cell_number,
+                        output: output_text,
+                        is_error,
+                        elapsed,
+                    });
 
-                    // Stop execution if this cell had an error
                     if is_error {
                         break;
                     }
                 }
                 Err(e) => {
                     let elapsed = start_time.elapsed().as_secs_f64();
-                    results.push((0, cell_number, format!("Error: {}", e), true, elapsed));
-                    // Stop execution on kernel error
+                    let _ = tx.send(ExecMsg::Cell {
+                        cell_number,
+                        output: format!("Error: {}", e),
+                        is_error: true,
+                        elapsed,
+                    });
                     break;
                 }
             }
         }
 
-        // Send back kernel, results, completions, type relationships, and SQL metadata
-        let _ = tx.send((kernel, results, all_completions, type_relationships, sql_metadata));
+        let _ = tx.send(ExecMsg::Done {
+            kernel,
+            completions: all_completions,
+            type_relationships,
+            sql_metadata,
+        });
     });
 
-    Some((rx, kernel_info))
+    Some((rx, kernel_info, cancel, preserves_session))
 }
 
 fn ensure_ss_cursor_visible(editor: &mut editor::Editor) -> io::Result<()> {

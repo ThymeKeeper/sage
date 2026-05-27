@@ -199,9 +199,16 @@ impl Editor {
         (None, prefix, is_sql_context)
     }
 
-    /// Update cells by parsing the buffer
+    /// Update cells by parsing the buffer. Dispatch by language:
+    /// SQL uses statement-boundary (semicolon) splitting; everything else
+    /// uses the `##$$` delimiter convention from `cell::parse_cells`.
     pub fn update_cells(&mut self) {
-        self.cells = parse_cells(self.buffer.rope());
+        let rope = self.buffer.rope();
+        self.cells = if *self.syntax.get_language() == crate::syntax::Language::Sql {
+            crate::sql_split::parse_sql_cells(rope)
+        } else {
+            parse_cells(rope)
+        };
     }
 
     /// Check if kernel is connected

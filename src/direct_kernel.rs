@@ -1,7 +1,8 @@
-use crate::kernel::{ExecutionOutput, ExecutionResult, Kernel, KernelInfo};
+use crate::kernel::{CancelHandle, ExecutionOutput, ExecutionResult, Kernel, KernelInfo};
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 
 /// Direct Python kernel using subprocess communication
 pub struct DirectKernel {
@@ -629,7 +630,12 @@ impl Kernel for DirectKernel {
             // Wait for output start marker
             loop {
                 line.clear();
-                reader.read_line(&mut line)?;
+                // EOF (0 bytes) means the kernel process closed its stdout — either it died
+                // or was killed externally (e.g. cancellation). Bail out so the background
+                // thread doesn't spin on a closed pipe.
+                if reader.read_line(&mut line)? == 0 {
+                    return Err("Kernel process closed (EOF)".into());
+                }
                 if line.trim() == "SAGE_OUTPUT_START" {
                     break;
                 }
@@ -751,6 +757,42 @@ impl Kernel for DirectKernel {
 
     fn info(&self) -> KernelInfo {
         self.info.clone()
+    }
+
+    fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
+        self.process.as_ref().map(|c| {
+            let h: Arc<dyn CancelHandle> = Arc::new(ProcessKillHandle { pid: c.id() });
+            h
+        })
+    }
+}
+
+/// Cancels an execution by force-killing the kernel's OS process. The kernel
+/// itself lives inside the background execution thread once execute() has
+/// started, so the host can't reach `Child::kill` directly — we shell out by
+/// PID. Closing the process's stdout pipe unblocks the thread's blocked
+/// `read_line` and lets the kernel drop cleanly; closing its sockets is what
+/// the host actually cares about (e.g. so remote servers see the disconnect).
+struct ProcessKillHandle {
+    pid: u32,
+}
+
+impl CancelHandle for ProcessKillHandle {
+    fn cancel(&self) {
+        let pid_str = self.pid.to_string();
+        #[cfg(not(unix))]
+        let mut cmd = {
+            let mut c = Command::new("taskkill");
+            c.args(["/F", "/T", "/PID", &pid_str]);
+            c
+        };
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("kill");
+            c.args(["-9", &pid_str]);
+            c
+        };
+        let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 }
 

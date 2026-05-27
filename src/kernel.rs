@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::collections::HashSet;
@@ -95,7 +96,16 @@ pub struct KernelInfo {
     pub python_path: String,
 }
 
-/// Trait for Python kernel implementations
+/// Handle the host can call to cancel a currently-executing statement from
+/// a thread other than the one driving execute(). DirectKernel returns one
+/// that kills the OS process; SnowflakeKernel returns one that POSTs an
+/// abort to the SQL API. Captured once before the kernel is moved into the
+/// background execution thread, then dropped after the statement completes.
+pub trait CancelHandle: Send + Sync {
+    fn cancel(&self);
+}
+
+/// Trait for kernel implementations (Python subprocess, Snowflake HTTP, ...).
 pub trait Kernel: Send {
     /// Start/connect to the kernel
     fn connect(&mut self) -> Result<(), Box<dyn Error>>;
@@ -111,11 +121,51 @@ pub trait Kernel: Send {
 
     /// Get kernel information
     fn info(&self) -> KernelInfo;
+
+    /// Returns a handle that the host can use to cancel the currently
+    /// executing statement. Must be obtained before the kernel is moved into
+    /// the background execution thread — once moved, the kernel is unreachable.
+    fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> { None }
+
+    /// Whether cancellation preserves the kernel/session. Soft-cancel kernels
+    /// (e.g. SnowflakeKernel) return true: `cancel()` triggers a graceful
+    /// abort, `execute()` returns Err, and the host can reuse the kernel.
+    /// Hard-cancel kernels (e.g. DirectKernel) return false: `cancel()` kills
+    /// the process, so the host must rebuild from scratch and lose state.
+    fn cancel_preserves_session(&self) -> bool { false }
 }
 
-/// Discover available Python kernels on the system
+/// Sentinel value used in `KernelInfo::name` to mark a Snowflake kernel.
+/// Dispatch code in `build_from_info` matches on this. Doubles as the value
+/// `SnowflakeKernel::new` writes into its own `KernelInfo.name`.
+pub const SNOWFLAKE_KERNEL_NAME: &str = "snowflake";
+
+/// Construct a concrete Kernel from a discovered `KernelInfo`. Dispatch is by
+/// `info.name`: the SNOWFLAKE_KERNEL_NAME sentinel builds a SnowflakeKernel
+/// (reloading config + token), everything else is treated as a Python
+/// interpreter and builds a DirectKernel.
+pub fn build_from_info(info: &KernelInfo) -> Result<Box<dyn Kernel>, Box<dyn Error>> {
+    if info.name == SNOWFLAKE_KERNEL_NAME {
+        let config = crate::snowflake::SnowflakeConfig::load()?;
+        let k = crate::snowflake::SnowflakeKernel::new(config)?;
+        Ok(Box::new(k))
+    } else {
+        Ok(Box::new(crate::direct_kernel::DirectKernel::new(
+            info.python_path.clone(),
+            info.name.clone(),
+            info.display_name.clone(),
+        )))
+    }
+}
+
+/// Discover available kernels (Python interpreters + Snowflake if configured).
 pub fn discover_kernels() -> Vec<KernelInfo> {
     let mut kernels = Vec::new();
+
+    // Snowflake first so it surfaces at the top of the Ctrl+K menu when present.
+    if let Some(sf) = discover_snowflake_kernel() {
+        kernels.push(sf);
+    }
 
     // Add direct Python interpreters
     kernels.extend(discover_python_interpreters());
@@ -126,6 +176,19 @@ pub fn discover_kernels() -> Vec<KernelInfo> {
     // kernels.extend(discover_jupyter_kernels());
 
     kernels
+}
+
+/// Snowflake "kernel" entry shown in the picker when `~/.config/sage/snowflake.toml`
+/// exists. We don't try to validate the PAT at discovery time — that's a
+/// keyring round-trip on app startup and a friendlier error story is "fails at
+/// connect" than "fails to appear in the menu silently."
+fn discover_snowflake_kernel() -> Option<KernelInfo> {
+    let config = crate::snowflake::SnowflakeConfig::load().ok()?;
+    Some(KernelInfo {
+        name: SNOWFLAKE_KERNEL_NAME.to_string(),
+        display_name: format!("Snowflake [{}] {}", config.account, config.user),
+        python_path: String::new(),
+    })
 }
 
 // Type alias for deduplication tracking - platform-specific

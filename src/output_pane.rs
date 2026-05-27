@@ -154,6 +154,13 @@ fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
         }
     }
 
+    // Force a full SGR reset at the end so styles can't bleed into the next
+    // rendered line. The loop above drops ANSI codes whose display position
+    // falls outside the visible range, which means a line wider than the
+    // viewport can end with an unclosed color / dim / bold and stain
+    // subsequent draws. Reset is idempotent — appending one when state is
+    // already reset is a no-op.
+    result.push_str("\x1b[0m");
     result
 }
 

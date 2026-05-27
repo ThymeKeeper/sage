@@ -138,9 +138,15 @@ impl Editor {
         }
         // Large files will initialize viewport on first render
 
-        // Enable REPL mode for Python files and auto-connect a kernel
+        // Enable REPL mode and auto-connect a kernel based on the file extension.
+        // .sql -> Snowflake (if configured); .py/.pyw -> Python interpreter.
         if let Some(ext) = Path::new(path).extension() {
-            if ext == "py" || ext == "pyw" {
+            if ext == "sql" {
+                self.enable_repl_mode();
+                if !self.is_kernel_connected() {
+                    self.try_connect_snowflake_kernel();
+                }
+            } else if ext == "py" || ext == "pyw" {
                 self.enable_repl_mode();
                 // Try shebang-based kernel detection first, then fall back to discovery
                 if !self.is_kernel_connected() {
@@ -153,6 +159,39 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    /// Try to build and connect a SnowflakeKernel from the user's config
+    /// (`~/.config/sage/snowflake.toml`). Silently no-ops if no config exists
+    /// or if connect fails — the user can fix config and re-open, or pick a
+    /// different kernel via Ctrl+K.
+    fn try_connect_snowflake_kernel(&mut self) {
+        let info = crate::kernel::KernelInfo {
+            name: crate::kernel::SNOWFLAKE_KERNEL_NAME.to_string(),
+            display_name: "Snowflake".to_string(),
+            python_path: String::new(),
+        };
+        match crate::kernel::build_from_info(&info) {
+            Ok(mut kernel) => {
+                if let Err(e) = kernel.connect() {
+                    self.status_message = Some((
+                        format!("Snowflake auto-connect failed: {} (press Ctrl+K to pick another kernel)", e),
+                        true,
+                    ));
+                    return;
+                }
+                let display = kernel.info().display_name.clone();
+                self.set_kernel(kernel);
+                self.status_message =
+                    Some((format!("Auto-connected to {}", display), false));
+            }
+            Err(e) => {
+                self.status_message = Some((
+                    format!("Snowflake config not loaded: {} (add C:\\.dotfile\\snowflake.toml)", e),
+                    true,
+                ));
+            }
+        }
     }
 
     /// Detect shebang in the first few lines and automatically select an appropriate kernel
