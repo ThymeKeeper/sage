@@ -844,6 +844,49 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             commands::Command::Save
                         }
                     }
+
+                    // Save query Results (Ctrl+R) — copies the active kernel's
+                    // result spool (e.g. SnowflakeKernel's CSV tempfile) to a
+                    // user-chosen path. No-op for kernels that don't spool.
+                    KeyCode::Char('r') | KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match editor.kernel_latest_result_file() {
+                            Some(src) => {
+                                let initial = src
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|n| format!("results-{}", n))
+                                    .unwrap_or_else(|| "results.csv".to_string());
+                                let mut p = prompt::Prompt::new("Save results to", &initial);
+                                if let Some(dest) = p.run(&mut io::stdout())? {
+                                    let dest_display = format!("{}", std::path::Path::new(&dest).display());
+                                    match std::fs::copy(&src, &dest) {
+                                        Ok(bytes) => {
+                                            editor.status_message = Some((
+                                                format!("Saved {} bytes to {}", bytes, dest_display),
+                                                false,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            editor.status_message = Some((
+                                                format!("Failed to save results: {}", e),
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                }
+                                renderer.force_redraw();
+                                needs_redraw = true;
+                            }
+                            None => {
+                                editor.status_message = Some((
+                                    "No query results to save.".to_string(),
+                                    true,
+                                ));
+                                needs_redraw = true;
+                            }
+                        }
+                        commands::Command::None
+                    }
                     
                     // Undo/Redo
                     KeyCode::Char('z') | KeyCode::Char('Z') if key.modifiers.contains(KeyModifiers::CONTROL) => {

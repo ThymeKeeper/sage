@@ -74,6 +74,19 @@ pub struct ResultSetMetaData {
     pub num_rows: Option<u64>,
     #[serde(rename = "rowType", default)]
     pub row_type: Vec<ColumnMeta>,
+    /// One entry per partition (including partition 0). Snowflake returns
+    /// partition 0 inline with the initial poll response; later partitions
+    /// must be fetched with `?partition=N` to assemble the full result.
+    #[serde(rename = "partitionInfo", default)]
+    pub partition_info: Vec<PartitionInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartitionInfo {
+    #[serde(rename = "rowCount", default)]
+    pub row_count: Option<u64>,
+    #[serde(rename = "uncompressedSize", default)]
+    pub uncompressed_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +167,34 @@ impl SnowflakeClient {
             )
             .into()),
         }
+    }
+
+    /// Fetch one additional partition of a completed statement's result set.
+    /// Partition 0 already comes back inline with `poll`, so this is called
+    /// for partitions 1..N. Returns the row data as parsed JSON values.
+    pub async fn fetch_partition(
+        &self,
+        handle: &str,
+        partition: usize,
+    ) -> Result<Vec<Vec<serde_json::Value>>, Box<dyn Error + Send + Sync>> {
+        let url = format!(
+            "{}/api/v2/statements/{}?partition={}",
+            self.base_url, handle, partition
+        );
+        let resp = self.auth(self.http.get(&url)).send().await?;
+        let status = resp.status();
+        let parsed: StatusResponse = resp.json().await?;
+        if status != StatusCode::OK {
+            return Err(format!(
+                "fetch partition {} failed (HTTP {}): {} {}",
+                partition,
+                status,
+                parsed.code.as_deref().unwrap_or(""),
+                parsed.message.as_deref().unwrap_or("")
+            )
+            .into());
+        }
+        Ok(parsed.data.unwrap_or_default())
     }
 
     /// Tell Snowflake to cancel a running statement. Idempotent: cancelling a

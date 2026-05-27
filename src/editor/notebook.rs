@@ -32,6 +32,12 @@ impl Editor {
             .or_else(|| self.executing_kernel_name.clone())
     }
 
+    /// Path to the current kernel's most recent result spool (if any).
+    /// Used by the save-results command.
+    pub fn kernel_latest_result_file(&self) -> Option<std::path::PathBuf> {
+        self.kernel.as_ref().and_then(|k| k.latest_result_file())
+    }
+
     /// Take ownership of the kernel (for background execution)
     /// Stores the kernel name so get_kernel_info() still works during execution
     pub fn take_kernel(&mut self) -> Option<Box<dyn Kernel>> {

@@ -133,6 +133,12 @@ pub trait Kernel: Send {
     /// Hard-cancel kernels (e.g. DirectKernel) return false: `cancel()` kills
     /// the process, so the host must rebuild from scratch and lose state.
     fn cancel_preserves_session(&self) -> bool { false }
+
+    /// Path to the most recent execution's full result spool (typically a
+    /// CSV file in `temp_dir()`). `None` if the kernel doesn't spool results
+    /// or no execution has happened yet. The file is owned by the kernel and
+    /// rotated each execute() — the host should copy promptly if persisting.
+    fn latest_result_file(&self) -> Option<std::path::PathBuf> { None }
 }
 
 /// Sentinel value used in `KernelInfo::name` to mark a Snowflake kernel.

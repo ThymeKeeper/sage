@@ -1,7 +1,9 @@
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
@@ -12,6 +14,12 @@ use crate::kernel::{
 
 use super::client::{SnowflakeClient, StatusResponse};
 use super::config::SnowflakeConfig;
+
+/// Maximum rows rendered inline in the output pane. Anything beyond this is
+/// only on disk in the spool tempfile — accessible via the save-results
+/// keybinding. Keeps the in-memory output `String` bounded regardless of
+/// result size.
+const PREVIEW_ROW_LIMIT: usize = 100;
 
 /// Per-execution state shared between the executing thread and the cancel
 /// handle. Wrapped in `Arc<Mutex<...>>` so the host can read the current
@@ -36,6 +44,11 @@ pub struct SnowflakeKernel {
     /// Sequence counter shown in cell prompts; mirrors DirectKernel's counter
     /// so output_pane numbering is consistent across kernels.
     execution_count: usize,
+    /// CSV tempfile holding the full row set of the most recent successful
+    /// execution. Wrapped in NamedTempFile so the file is RAII-cleaned when
+    /// rotated or when the kernel drops. Exposed via `latest_result_file()`
+    /// for the save-results command.
+    last_result_file: Option<NamedTempFile>,
 }
 
 impl SnowflakeKernel {
@@ -66,8 +79,44 @@ impl SnowflakeKernel {
                 cancel_token: CancellationToken::new(),
             })),
             execution_count: 0,
+            last_result_file: None,
         })
     }
+
+}
+
+/// Result of one streamed execute(): the preview rows kept in memory for the
+/// output pane, the metadata, the row count, the spool tempfile (if any),
+/// and the server's message line (used as fallback display for DDL/DML).
+struct ExecuteOutcome {
+    preview: Vec<Vec<serde_json::Value>>,
+    meta: Option<super::client::ResultSetMetaData>,
+    total_rows: u64,
+    spool: Option<NamedTempFile>,
+    message: Option<String>,
+}
+
+/// Append a partition's rows to the spool CSV and capture the first
+/// `preview_limit` total rows in `preview`. The partition's row Vec is
+/// borrowed; the caller drops it after this call so memory doesn't grow.
+fn write_partition_and_capture_preview(
+    file: &mut std::fs::File,
+    rows: &[Vec<serde_json::Value>],
+    preview: &mut Vec<Vec<serde_json::Value>>,
+    preview_limit: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut wtr = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(file);
+    for row in rows {
+        if preview.len() < preview_limit {
+            preview.push(row.clone());
+        }
+        let strs: Vec<String> = row.iter().map(cell_to_string).collect();
+        wtr.write_record(&strs)?;
+    }
+    wtr.flush()?;
+    Ok(())
 }
 
 impl Kernel for SnowflakeKernel {
@@ -95,38 +144,123 @@ impl Kernel for SnowflakeKernel {
             st.cancel_token.clone()
         };
 
+        // Drop any previous spool eagerly so we don't briefly hold two on disk.
+        self.last_result_file = None;
+
         self.execution_count += 1;
         let state = self.state.clone();
         let code = code.to_string();
 
-        let outcome = self.rt.block_on(async move {
+        // Streamed execution: each partition is fetched, written to the spool
+        // tempfile, and dropped before fetching the next. Memory usage peaks
+        // at one partition + the preview rows (PREVIEW_ROW_LIMIT max),
+        // independent of total result size.
+        let outcome: Result<
+            ExecuteOutcome,
+            Box<dyn Error + Send + Sync>,
+        > = self.rt.block_on(async move {
             let qid = client.submit_async(&code).await?;
             state.lock().unwrap().current_qid = Some(qid.clone());
 
             // Poll loop: respect the cancel token, otherwise wait 250ms between
             // status checks. The 250ms cadence keeps "Executing... 1.2s" timer
             // updates feeling live without hammering Snowflake.
-            loop {
+            let mut resp = loop {
                 tokio::select! {
                     _ = token.cancelled() => {
-                        return Err::<StatusResponse, Box<dyn Error + Send + Sync>>(
-                            "cancelled by user".into(),
-                        );
+                        return Err("cancelled by user".into());
                     }
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                 }
-                let (done, resp) = client.poll(&qid).await?;
+                let (done, r) = client.poll(&qid).await?;
                 if done {
-                    return Ok(resp);
+                    break r;
                 }
+            };
+
+            let meta = match resp.result_set_meta_data.take() {
+                Some(m) => m,
+                None => {
+                    // DDL/DML success with no result set.
+                    return Ok(ExecuteOutcome {
+                        preview: Vec::new(),
+                        meta: None,
+                        total_rows: 0,
+                        spool: None,
+                        message: resp.message.clone(),
+                    });
+                }
+            };
+            let total_rows = meta.num_rows.unwrap_or(0);
+            let partition_count = meta.partition_info.len().max(1);
+
+            // No columns -> still treat as DDL/DML.
+            if meta.row_type.is_empty() {
+                return Ok(ExecuteOutcome {
+                    preview: Vec::new(),
+                    meta: Some(meta),
+                    total_rows,
+                    spool: None,
+                    message: resp.message.clone(),
+                });
             }
+
+            // Open the spool tempfile and write the header up front.
+            let mut tmp = tempfile::Builder::new()
+                .prefix("sage-snowflake-")
+                .suffix(".csv")
+                .tempfile()?;
+            {
+                let mut wtr = csv::Writer::from_writer(tmp.as_file_mut());
+                wtr.write_record(meta.row_type.iter().map(|c| &c.name))?;
+                wtr.flush()?;
+            }
+
+            // Process partition 0 (came back inline with the poll).
+            let mut preview: Vec<Vec<serde_json::Value>> = Vec::new();
+            let part0 = resp.data.take().unwrap_or_default();
+            write_partition_and_capture_preview(
+                tmp.as_file_mut(),
+                &part0,
+                &mut preview,
+                PREVIEW_ROW_LIMIT,
+            )?;
+            drop(part0);
+
+            // Fetch remaining partitions one at a time, write, drop.
+            for partition in 1..partition_count {
+                if token.is_cancelled() {
+                    return Err("cancelled by user".into());
+                }
+                let part = client.fetch_partition(&qid, partition).await?;
+                write_partition_and_capture_preview(
+                    tmp.as_file_mut(),
+                    &part,
+                    &mut preview,
+                    PREVIEW_ROW_LIMIT,
+                )?;
+                drop(part);
+            }
+
+            Ok(ExecuteOutcome {
+                preview,
+                meta: Some(meta),
+                total_rows,
+                spool: Some(tmp),
+                message: resp.message.clone(),
+            })
         });
 
         // Clear qid regardless of outcome — the query is no longer "current".
         self.state.lock().unwrap().current_qid = None;
 
         let outputs = match outcome {
-            Ok(resp) => format_response(&resp),
+            Ok(out) => {
+                if let Some(tmp) = out.spool {
+                    self.last_result_file = Some(tmp);
+                }
+                format_outcome(out.meta.as_ref(), &out.preview, out.total_rows, &out.message)
+            }
             Err(e) => vec![ExecutionOutput::Error {
                 ename: "SnowflakeError".to_string(),
                 evalue: e.to_string(),
@@ -178,6 +312,10 @@ impl Kernel for SnowflakeKernel {
         // the HTTP client (PAT, base URL) and tokio runtime stay alive.
         true
     }
+
+    fn latest_result_file(&self) -> Option<PathBuf> {
+        self.last_result_file.as_ref().map(|t| t.path().to_path_buf())
+    }
 }
 
 /// Cancels an in-flight Snowflake statement by POSTing to the abort endpoint.
@@ -209,33 +347,35 @@ impl CancelHandle for SnowflakeCancelHandle {
     }
 }
 
-/// Render a successful response as ExecutionOutput entries. For results with
-/// rows, builds an ASCII table; for "no rows" responses (DDL, DML without
-/// RETURNING), shows the Snowflake success message.
-fn format_response(resp: &StatusResponse) -> Vec<ExecutionOutput> {
-    let meta = match &resp.result_set_meta_data {
-        Some(m) => m,
-        None => {
-            let msg = resp
-                .message
+/// Render an ExecuteOutcome as ExecutionOutput entries. For row results,
+/// builds a DuckDB-style table from the in-memory preview and notes how
+/// many additional rows are on disk. For DDL/DML, shows the server message.
+fn format_outcome(
+    meta: Option<&super::client::ResultSetMetaData>,
+    preview: &[Vec<serde_json::Value>],
+    total_rows: u64,
+    message: &Option<String>,
+) -> Vec<ExecutionOutput> {
+    let meta = match meta {
+        Some(m) if !m.row_type.is_empty() => m,
+        _ => {
+            let msg = message
                 .clone()
                 .unwrap_or_else(|| "Statement executed.".to_string());
             return vec![ExecutionOutput::Stdout(msg + "\n")];
         }
     };
 
-    let data = resp.data.as_deref().unwrap_or(&[]);
-    if meta.row_type.is_empty() {
-        let msg = resp
-            .message
-            .clone()
-            .unwrap_or_else(|| "Statement executed.".to_string());
-        return vec![ExecutionOutput::Stdout(msg + "\n")];
-    }
-
-    let table = render_table(&meta.row_type, data);
-    let total = meta.num_rows.unwrap_or(data.len() as u64);
-    let footer = format!("\n({} row{})\n", total, if total == 1 { "" } else { "s" });
+    let table = render_table(&meta.row_type, preview);
+    let shown = preview.len() as u64;
+    let footer = if shown < total_rows {
+        format!(
+            "\n(showing first {} of {} rows — Ctrl+R to save full result)\n",
+            shown, total_rows
+        )
+    } else {
+        format!("\n({} row{})\n", total_rows, if total_rows == 1 { "" } else { "s" })
+    };
     vec![ExecutionOutput::Result(table + &footer)]
 }
 
