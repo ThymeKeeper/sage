@@ -393,6 +393,7 @@ impl OutputPane {
         let line_len = self.get_line_length(self.cursor_line);
         self.cursor_col = target_col.min(line_len);
 
+        self.snap_header_to_start();
         self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
@@ -423,6 +424,7 @@ impl OutputPane {
         let line_len = self.get_line_length(self.cursor_line);
         self.cursor_col = target_col.min(line_len);
 
+        self.snap_header_to_start();
         self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
@@ -504,6 +506,7 @@ impl OutputPane {
             }
         }
 
+        self.snap_header_to_start();
         self.ensure_cursor_visible();
     }
 
@@ -575,6 +578,7 @@ impl OutputPane {
             }
         }
 
+        self.snap_header_to_start();
         self.ensure_cursor_visible();
     }
 
@@ -852,7 +856,12 @@ impl OutputPane {
             self.cursor_col = 0;
         }
 
-        self.preferred_column = None;
+        // Only forget the preferred column if we landed on a normal line.
+        // On OutputEntry header rows ("Cell N (X.XXXs):"), keep the
+        // preferred column so the next vertical move resumes there.
+        if !self.is_header_line(self.cursor_line) {
+            self.preferred_column = None;
+        }
         self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
@@ -899,7 +908,12 @@ impl OutputPane {
             }
         }
 
-        self.preferred_column = None;
+        // Only forget the preferred column if we landed on a normal line.
+        // On OutputEntry header rows ("Cell N (X.XXXs):"), keep the
+        // preferred column so the next vertical move resumes there.
+        if !self.is_header_line(self.cursor_line) {
+            self.preferred_column = None;
+        }
         self.disable_auto_scroll();
         self.ensure_cursor_visible();
     }
@@ -1102,6 +1116,24 @@ impl OutputPane {
         let (content_start, content_end) = Self::cell_content_range(stripped, bounds, cell_idx);
         self.selection_start = Some((self.cursor_line, content_start));
         self.cursor_col = content_end;
+    }
+
+    /// True if `line_idx` is an OutputEntry header (the "Cell N (X.XXXs):"
+    /// line between cell outputs). Identified via the `is_header` flag in
+    /// the flattened all_lines list, not by pattern-matching the text.
+    fn is_header_line(&self, line_idx: usize) -> bool {
+        let lines = self.get_all_lines();
+        line_idx < lines.len() && lines[line_idx].1
+    }
+
+    /// If the cursor just landed on an OutputEntry header line, snap to
+    /// column 0 without resetting `preferred_column`. The next vertical
+    /// move continues from the preferred column on the first non-header
+    /// row, so traversing past a header doesn't lose the user's intent.
+    fn snap_header_to_start(&mut self) {
+        if self.is_header_line(self.cursor_line) {
+            self.cursor_col = 0;
+        }
     }
 
     /// Compute the raw (pre-offset) selection ranges to highlight on a given
