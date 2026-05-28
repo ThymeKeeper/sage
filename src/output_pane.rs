@@ -180,7 +180,12 @@ pub struct OutputPane {
     auto_scroll: bool, // When true, always show the most recent output
     cursor_line: usize, // Cursor position (line number in flattened output)
     cursor_col: usize, // Cursor column
-    selection_start: Option<(usize, usize)>, // Selection start (line, col)
+    selection_start: Option<(usize, usize)>, // Text-mode selection start (line, col)
+    /// Rectangular cell selection. When `Some`, takes precedence over
+    /// text-mode selection for rendering and clipboard. Each tuple is
+    /// `(line, cell_idx)` — anchor is where the drag began, cursor is the
+    /// current drag position. Both are inclusive.
+    cell_rect: Option<((usize, usize), (usize, usize))>,
     viewport_height: usize, // Height of visible area for scrolling
     viewport_width: usize, // Width of visible area for horizontal scrolling
     mouse_selecting: bool, // True while dragging a selection
@@ -222,6 +227,7 @@ impl OutputPane {
             cursor_line: 0,
             cursor_col: 0,
             selection_start: None,
+            cell_rect: None,
             viewport_height: 10, // Default, will be updated in draw
             viewport_width: 80, // Default, will be updated in draw
             mouse_selecting: false,
@@ -239,6 +245,10 @@ impl OutputPane {
     pub fn set_focused(&mut self, focused: bool) {
         let was_focused = self.focused;
         self.focused = focused;
+
+        // Focus transitions clear any rectangular cell selection so the
+        // overlay doesn't ghost across mode changes.
+        self.cell_rect = None;
 
         // When gaining focus, position cursor at a visible location and clear selection
         if self.focused && !was_focused {
@@ -293,6 +303,8 @@ impl OutputPane {
         self.outputs.push(entry);
         // Auto-scroll to bottom to show newest output
         self.scroll_to_bottom();
+        // Stale selections become meaningless once new content arrives.
+        self.cell_rect = None;
         // Invalidate render cache so next draw will update
         self.last_render_state = None;
     }
@@ -328,6 +340,7 @@ impl OutputPane {
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.selection_start = None;
+        self.cell_rect = None;
         self.auto_scroll = true;
         // Invalidate render caches so next draw will update
         self.last_render_state = None;
@@ -358,6 +371,8 @@ impl OutputPane {
 
     /// Move cursor up by one page (viewport height)
     pub fn page_up(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -384,6 +399,8 @@ impl OutputPane {
 
     /// Move cursor down by one page (viewport height)
     pub fn page_down(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -421,6 +438,8 @@ impl OutputPane {
 
     /// Move cursor up one line
     pub fn move_cursor_up(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if self.cursor_line == 0 {
             return;
         }
@@ -490,6 +509,8 @@ impl OutputPane {
 
     /// Move cursor down one line
     pub fn move_cursor_down(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         let total_lines = self.count_total_lines();
         if self.cursor_line + 1 >= total_lines {
             return;
@@ -559,6 +580,8 @@ impl OutputPane {
 
     /// Move cursor left one character (or one table cell if on a table row)
     pub fn move_cursor_left(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if let Some(stripped) = self.get_stripped_line(self.cursor_line) {
             if Self::is_table_data_row(&stripped) {
                 let bounds = Self::find_cell_boundaries(&stripped);
@@ -607,6 +630,8 @@ impl OutputPane {
 
     /// Move cursor right one character (or one table cell if on a table row)
     pub fn move_cursor_right(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if let Some(stripped) = self.get_stripped_line(self.cursor_line) {
             if Self::is_table_data_row(&stripped) {
                 let bounds = Self::find_cell_boundaries(&stripped);
@@ -659,6 +684,8 @@ impl OutputPane {
 
     /// Move cursor to start of line
     pub fn move_cursor_home(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -672,6 +699,8 @@ impl OutputPane {
 
     /// Move cursor to end of line
     pub fn move_cursor_end(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -685,6 +714,8 @@ impl OutputPane {
 
     /// Move cursor to previous word boundary (stops at line start, doesn't cross lines)
     pub fn move_cursor_word_left(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -733,6 +764,8 @@ impl OutputPane {
 
     /// Move cursor to next word boundary (stops at line end, doesn't cross lines)
     pub fn move_cursor_word_right(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -785,6 +818,8 @@ impl OutputPane {
 
     /// Move cursor to previous paragraph (empty line boundary)
     pub fn move_cursor_paragraph_up(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -824,6 +859,8 @@ impl OutputPane {
 
     /// Move cursor to next paragraph (empty line boundary)
     pub fn move_cursor_paragraph_down(&mut self, with_selection: bool) {
+        // Keyboard nav exits rectangular cell selection mode.
+        self.cell_rect = None;
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -1067,6 +1104,185 @@ impl OutputPane {
         self.cursor_col = content_end;
     }
 
+    /// Compute the raw (pre-offset) selection ranges to highlight on a given
+    /// line. Returns an empty Vec if nothing is selected on this line. For
+    /// text-mode selection the Vec has at most one entry; for rectangular
+    /// cell selection there is one entry per selected cell that lies on
+    /// this line.
+    fn line_highlight_ranges_raw(
+        &self,
+        line_idx: usize,
+        line_text: &str,
+    ) -> Vec<(usize, usize)> {
+        // Cell rectangle takes priority when active.
+        if let Some(((al, ac), (cl, cc))) = self.cell_rect {
+            let (lmin, lmax) = if al <= cl { (al, cl) } else { (cl, al) };
+            if line_idx < lmin || line_idx > lmax {
+                return Vec::new();
+            }
+            let stripped = strip_ansi(line_text);
+            if !Self::is_table_data_row(&stripped) {
+                return Vec::new();
+            }
+            let bounds = Self::find_cell_boundaries(&stripped);
+            if bounds.is_empty() {
+                return Vec::new();
+            }
+            let (cmin, cmax) = if ac <= cc { (ac, cc) } else { (cc, ac) };
+            let mut ranges = Vec::new();
+            for cell_idx in cmin..=cmax.min(bounds.len().saturating_sub(1)) {
+                let (s, e) = Self::cell_content_range(&stripped, &bounds, cell_idx);
+                if e > s {
+                    ranges.push((s, e));
+                }
+            }
+            return ranges;
+        }
+
+        // Text-mode selection: derive (sl, sc, el, ec) by normalizing
+        // selection_start vs cursor like the existing rendering does.
+        let (sel_start_line, sel_start_col, sel_end_line, sel_end_col) =
+            if let Some((ss_line, ss_col)) = self.selection_start {
+                let (cur_line, cur_col) = (self.cursor_line, self.cursor_col);
+                if (ss_line, ss_col) <= (cur_line, cur_col) {
+                    (ss_line, ss_col, cur_line, cur_col)
+                } else {
+                    (cur_line, cur_col, ss_line, ss_col)
+                }
+            } else {
+                return Vec::new();
+            };
+
+        if line_idx < sel_start_line || line_idx > sel_end_line {
+            return Vec::new();
+        }
+        let raw_line_len = display_width(line_text);
+        let (s, e) = if line_idx == sel_start_line && line_idx == sel_end_line {
+            (sel_start_col, sel_end_col)
+        } else if line_idx == sel_start_line {
+            (sel_start_col, raw_line_len)
+        } else if line_idx == sel_end_line {
+            (0, sel_end_col)
+        } else {
+            (0, raw_line_len)
+        };
+        if e > s { vec![(s, e)] } else { Vec::new() }
+    }
+
+    /// Extract the rectangular cell selection as a TSV-formatted string.
+    /// Cells joined by `\t` per row; rows joined by `\n`. Empty / missing
+    /// cells become empty strings. When more than one cell is selected,
+    /// the column-header row is prepended so a paste into a spreadsheet
+    /// carries column labels. Called by `get_selected_text` when
+    /// `cell_rect` is active.
+    fn cell_rect_as_tsv(&self) -> Option<String> {
+        let ((al, ac), (cl, cc)) = self.cell_rect?;
+        let (lmin, lmax) = if al <= cl { (al, cl) } else { (cl, al) };
+        let (cmin, cmax) = if ac <= cc { (ac, cc) } else { (cc, ac) };
+        let lines = self.get_all_lines();
+
+        let include_header = cmin != cmax || lmin != lmax;
+        let header_line_idx = if include_header {
+            Self::find_table_header_line(&lines, lmin)
+        } else {
+            None
+        };
+
+        let mut out = String::new();
+        let mut wrote_any = false;
+
+        if let Some(hi) = header_line_idx {
+            Self::push_tsv_row(&mut out, &lines, hi, cmin, cmax);
+            wrote_any = true;
+        }
+
+        for line_idx in lmin..=lmax {
+            if line_idx >= lines.len() {
+                break;
+            }
+            let stripped = strip_ansi(&lines[line_idx].0);
+            if !Self::is_table_data_row(&stripped) {
+                continue;
+            }
+            // Skip the header row if we already emitted it above — the
+            // user's selection rectangle may span the header itself, in
+            // which case we don't want it duplicated.
+            if Some(line_idx) == header_line_idx {
+                continue;
+            }
+            if wrote_any {
+                out.push('\n');
+            }
+            Self::push_tsv_row(&mut out, &lines, line_idx, cmin, cmax);
+            wrote_any = true;
+        }
+        if wrote_any { Some(out) } else { None }
+    }
+
+    /// Append one tab-separated row of cells from line `line_idx` covering
+    /// cells `cmin..=cmax` to `out`. Skips lines that aren't table data rows
+    /// (no-op).
+    fn push_tsv_row(
+        out: &mut String,
+        lines: &[(String, bool, bool)],
+        line_idx: usize,
+        cmin: usize,
+        cmax: usize,
+    ) {
+        if line_idx >= lines.len() {
+            return;
+        }
+        let stripped = strip_ansi(&lines[line_idx].0);
+        if !Self::is_table_data_row(&stripped) {
+            return;
+        }
+        let bounds = Self::find_cell_boundaries(&stripped);
+        if bounds.is_empty() {
+            return;
+        }
+        let line_chars: Vec<char> = stripped.chars().collect();
+        let mut wrote_cell = false;
+        for cell_idx in cmin..=cmax {
+            if wrote_cell {
+                out.push('\t');
+            }
+            let (s, e) = Self::cell_content_range(&stripped, &bounds, cell_idx);
+            if e > s && e <= line_chars.len() {
+                let cell_text: String = line_chars[s..e].iter().collect();
+                out.push_str(cell_text.trim());
+            }
+            wrote_cell = true;
+        }
+    }
+
+    /// Walk up from `from_idx` looking for the column-header row of the
+    /// surrounding table. The header is the first table data row that sits
+    /// directly below a top-border line (one whose first character is `┌`).
+    /// Returns `None` if no such row is found (selection isn't inside a
+    /// rendered table, or we ran out of lines).
+    fn find_table_header_line(
+        lines: &[(String, bool, bool)],
+        from_idx: usize,
+    ) -> Option<usize> {
+        let mut i = from_idx;
+        while i > 0 {
+            i -= 1;
+            let stripped = strip_ansi(&lines[i].0);
+            let trimmed = stripped.trim_start();
+            if trimmed.starts_with('┌') {
+                let header_idx = i + 1;
+                if header_idx < lines.len() {
+                    let header_stripped = strip_ansi(&lines[header_idx].0);
+                    if Self::is_table_data_row(&header_stripped) {
+                        return Some(header_idx);
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     /// Get the stripped text for a given line index, or None if out of range.
     fn get_stripped_line(&self, line_idx: usize) -> Option<String> {
         let lines = self.get_all_lines();
@@ -1102,6 +1318,12 @@ impl OutputPane {
 
     /// Get selected text (returns only visible text, stripping ANSI escape sequences)
     pub fn get_selected_text(&self) -> Option<String> {
+        // Rectangular cell selection wins over text-mode selection — produce
+        // tab-separated values so pasting into a spreadsheet preserves the
+        // grid shape.
+        if self.cell_rect.is_some() {
+            return self.cell_rect_as_tsv();
+        }
         if let Some((start_line, start_col)) = self.selection_start {
             let lines = self.get_all_lines();
             let (end_line, end_col) = (self.cursor_line, self.cursor_col);
@@ -1395,85 +1617,67 @@ impl OutputPane {
             {
                 let mut line_content = String::from("\x1b[48;2;33;33;33m"); // Output pane bg (one shade brighter than editor 234)
 
-                // Calculate selection info for this line
-                let selection_info = if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection_range {
-                    if absolute_line_idx >= sel_start_line && absolute_line_idx <= sel_end_line {
-                        let raw_line_len = display_width(line_text);
-                        let (raw_sel_from, raw_sel_to) = if absolute_line_idx == sel_start_line && absolute_line_idx == sel_end_line {
-                            (sel_start_col, sel_end_col)
-                        } else if absolute_line_idx == sel_start_line {
-                            (sel_start_col, raw_line_len)
-                        } else if absolute_line_idx == sel_end_line {
-                            (0, sel_end_col)
+                // Compute the per-line highlight ranges in visible coords.
+                // Handles both text selection and rectangular cell selection.
+                // Cell selection can produce multiple ranges per line (one per
+                // cell), so the rendering below iterates in segments.
+                let _ = &selection_range;
+                let ranges_vis: Vec<(usize, usize)> = self
+                    .line_highlight_ranges_raw(absolute_line_idx, line_text)
+                    .into_iter()
+                    .filter_map(|(raw_from, raw_to)| {
+                        let full_from = indent_len + raw_from;
+                        let full_to = indent_len + raw_to;
+                        let vis_from = if full_from > h_offset { full_from - h_offset } else { 0 };
+                        let vis_to = if full_to > h_offset {
+                            (full_to - h_offset).min(visible_line_display_len)
                         } else {
-                            (0, raw_line_len)
+                            0
                         };
-                        let full_sel_from = indent_len + raw_sel_from;
-                        let full_sel_to = indent_len + raw_sel_to;
-                        let vis_sel_from = if full_sel_from > h_offset { full_sel_from - h_offset } else { 0 };
-                        let vis_sel_to = if full_sel_to > h_offset { (full_sel_to - h_offset).min(visible_line_display_len) } else { 0 };
-                        Some((vis_sel_from.min(visible_line_display_len), vis_sel_to.min(visible_line_display_len)))
+                        let vis_from = vis_from.min(visible_line_display_len);
+                        let vis_to = vis_to.min(visible_line_display_len);
+                        if vis_to > vis_from { Some((vis_from, vis_to)) } else { None }
+                    })
+                    .collect();
+
+                let push_plain = |out: &mut String, text: &str| {
+                    if *is_header {
+                        out.push_str("\x1b[32m");
+                        out.push_str(text);
+                        out.push_str("\x1b[39m");
+                    } else if *is_error {
+                        out.push_str("\x1b[31m");
+                        out.push_str(text);
+                        out.push_str("\x1b[39m");
                     } else {
-                        None
+                        out.push_str(text);
                     }
-                } else {
-                    None
+                };
+                let push_selected = |out: &mut String, text: &str| {
+                    // Selection: ANSI 256 teal background with black text.
+                    // Restore output-pane bg after so subsequent segments
+                    // don't pick up default terminal bg.
+                    out.push_str("\x1b[48;5;30m\x1b[30m");
+                    out.push_str(text);
+                    out.push_str("\x1b[39m\x1b[48;2;33;33;33m");
                 };
 
-                // Build line content with colors
-                // Use \x1b[39m (reset fg only) instead of \x1b[0m to preserve output pane bg
-                if let Some((vis_sel_from, vis_sel_to)) = selection_info {
-                    // Line has selection - build in parts
-                    if vis_sel_from > 0 {
-                        let before = slice_with_ansi(visible_line, 0, vis_sel_from);
-                        let before_plain = strip_ansi(&before);
-                        if *is_header {
-                            line_content.push_str("\x1b[32m"); // Green
-                            line_content.push_str(&before_plain);
-                            line_content.push_str("\x1b[39m");
-                        } else if *is_error {
-                            line_content.push_str("\x1b[31m"); // Red
-                            line_content.push_str(&before_plain);
-                            line_content.push_str("\x1b[39m");
-                        } else {
-                            line_content.push_str(&before_plain);
-                        }
-                    }
-                    if vis_sel_to > vis_sel_from {
-                        let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
-                        let selected_plain = strip_ansi(&selected);
-                        // Selection: ANSI 256 teal background with black text
-                        line_content.push_str("\x1b[48;5;30m\x1b[30m");
-                        line_content.push_str(&selected_plain);
-                        line_content.push_str("\x1b[39m\x1b[48;2;33;33;33m"); // Restore fg default + output bg
-                    }
-                    if vis_sel_to < visible_line_display_len {
-                        let after = slice_with_ansi(visible_line, vis_sel_to, visible_line_display_len - vis_sel_to);
-                        let after_plain = strip_ansi(&after);
-                        if *is_header {
-                            line_content.push_str("\x1b[32m");
-                            line_content.push_str(&after_plain);
-                            line_content.push_str("\x1b[39m");
-                        } else if *is_error {
-                            line_content.push_str("\x1b[31m");
-                            line_content.push_str(&after_plain);
-                            line_content.push_str("\x1b[39m");
-                        } else {
-                            line_content.push_str(&after_plain);
-                        }
-                    }
+                if ranges_vis.is_empty() {
+                    push_plain(&mut line_content, visible_line);
                 } else {
-                    // No selection - simple colored line
-                    if *is_header {
-                        line_content.push_str("\x1b[32m"); // Green
-                        line_content.push_str(visible_line);
-                        line_content.push_str("\x1b[39m");
-                    } else if *is_error {
-                        line_content.push_str("\x1b[31m"); // Red
-                        line_content.push_str(visible_line);
-                        line_content.push_str("\x1b[39m");
-                    } else {
-                        line_content.push_str(visible_line);
+                    let mut pos: usize = 0;
+                    for &(vis_from, vis_to) in &ranges_vis {
+                        if vis_from > pos {
+                            let plain = strip_ansi(&slice_with_ansi(visible_line, pos, vis_from - pos));
+                            push_plain(&mut line_content, &plain);
+                        }
+                        let sel = strip_ansi(&slice_with_ansi(visible_line, vis_from, vis_to - vis_from));
+                        push_selected(&mut line_content, &sel);
+                        pos = vis_to;
+                    }
+                    if pos < visible_line_display_len {
+                        let tail = strip_ansi(&slice_with_ansi(visible_line, pos, visible_line_display_len - pos));
+                        push_plain(&mut line_content, &tail);
                     }
                 }
 
@@ -1536,48 +1740,56 @@ impl OutputPane {
 
                         execute!(writer, cursor::MoveTo(0, current_row))?;
 
-                        // Use ANSI-aware slicing to properly handle colored text
-                        let vis_line_display_len = visible_line_display_len;
-                        let vis_sel_from = vis_sel_from.min(vis_line_display_len);
-                        let vis_sel_to = vis_sel_to.min(vis_line_display_len);
+                        // See the Windows path for the same logic. Here we
+                        // emit via execute! rather than building a string.
+                        let ranges_vis: Vec<(usize, usize)> = self
+                            .line_highlight_ranges_raw(absolute_line_idx, line_text)
+                            .into_iter()
+                            .filter_map(|(raw_from, raw_to)| {
+                                let full_from = indent_len + raw_from;
+                                let full_to = indent_len + raw_to;
+                                let vf = if full_from > h_offset { full_from - h_offset } else { 0 };
+                                let vt = if full_to > h_offset {
+                                    (full_to - h_offset).min(visible_line_display_len)
+                                } else {
+                                    0
+                                };
+                                let vf = vf.min(visible_line_display_len);
+                                let vt = vt.min(visible_line_display_len);
+                                if vt > vf { Some((vf, vt)) } else { None }
+                            })
+                            .collect();
 
-                        // Draw before selection (using display-position-aware slicing)
-                        if vis_sel_from > 0 {
-                            let before = slice_with_ansi(visible_line, 0, vis_sel_from);
-                            // Strip ANSI codes for selection rendering - we apply our own colors
-                            let before_plain = strip_ansi(&before);
-                            if *is_header {
-                                execute!(writer, SetForegroundColor(Color::Green), Print(before_plain), ResetColor)?;
-                            } else if *is_error {
-                                execute!(writer, SetForegroundColor(Color::Red), Print(before_plain), ResetColor)?;
-                            } else {
-                                execute!(writer, Print(before_plain))?;
+                        let mut pos: usize = 0;
+                        for &(vf, vt) in &ranges_vis {
+                            if vf > pos {
+                                let plain = strip_ansi(&slice_with_ansi(visible_line, pos, vf - pos));
+                                if *is_header {
+                                    execute!(writer, SetForegroundColor(Color::Green), Print(plain), ResetColor)?;
+                                } else if *is_error {
+                                    execute!(writer, SetForegroundColor(Color::Red), Print(plain), ResetColor)?;
+                                } else {
+                                    execute!(writer, Print(plain))?;
+                                }
                             }
+                            let sel = strip_ansi(&slice_with_ansi(visible_line, vf, vt - vf));
+                            execute!(
+                                writer,
+                                crossterm::style::SetBackgroundColor(crossterm::style::Color::AnsiValue(30)),
+                                crossterm::style::SetForegroundColor(crossterm::style::Color::Black),
+                                Print(sel),
+                                crossterm::style::ResetColor
+                            )?;
+                            pos = vt;
                         }
-
-                        // Draw selection (teal background matching editor selection color)
-                        if vis_sel_to > vis_sel_from {
-                            let selected = slice_with_ansi(visible_line, vis_sel_from, vis_sel_to - vis_sel_from);
-                            // Strip ANSI codes - selection has its own styling
-                            let selected_plain = strip_ansi(&selected);
-                            // Use ANSI 256 teal background (30) with black foreground
-                            execute!(writer, crossterm::style::SetBackgroundColor(crossterm::style::Color::AnsiValue(30)),
-                                     crossterm::style::SetForegroundColor(crossterm::style::Color::Black),
-                                     Print(selected_plain),
-                                     crossterm::style::ResetColor)?;
-                        }
-
-                        // Draw after selection
-                        if vis_sel_to < vis_line_display_len {
-                            let after = slice_with_ansi(visible_line, vis_sel_to, vis_line_display_len - vis_sel_to);
-                            // Strip ANSI codes for selection rendering - we apply our own colors
-                            let after_plain = strip_ansi(&after);
+                        if pos < visible_line_display_len {
+                            let tail = strip_ansi(&slice_with_ansi(visible_line, pos, visible_line_display_len - pos));
                             if *is_header {
-                                execute!(writer, SetForegroundColor(Color::Green), Print(after_plain), ResetColor)?;
+                                execute!(writer, SetForegroundColor(Color::Green), Print(tail), ResetColor)?;
                             } else if *is_error {
-                                execute!(writer, SetForegroundColor(Color::Red), Print(after_plain), ResetColor)?;
+                                execute!(writer, SetForegroundColor(Color::Red), Print(tail), ResetColor)?;
                             } else {
-                                execute!(writer, Print(after_plain))?;
+                                execute!(writer, Print(tail))?;
                             }
                         }
                     } else {
@@ -1769,6 +1981,23 @@ impl OutputPane {
                     if cursor_display_col < self.horizontal_offset {
                         self.horizontal_offset = cursor_display_col;
                     }
+
+                    // If the click landed on a table data row, snap the
+                    // selection to that cell and prime cell_rect so a
+                    // subsequent drag becomes a rectangular cell selection.
+                    // Clicking off-table clears any previous cell_rect.
+                    self.cell_rect = None;
+                    if let Some(stripped) = self.get_stripped_line(line) {
+                        if Self::is_table_data_row(&stripped) {
+                            let bounds = Self::find_cell_boundaries(&stripped);
+                            if !bounds.is_empty() {
+                                let cell_idx = Self::cursor_to_cell_index(&bounds, col);
+                                self.select_table_cell(&stripped, &bounds, cell_idx);
+                                self.cell_rect =
+                                    Some(((line, cell_idx), (line, cell_idx)));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1819,6 +2048,24 @@ impl OutputPane {
                 self.cursor_col = col;
                 self.disable_auto_scroll();
                 self.ensure_cursor_visible_with_scrolloff();
+
+                // If we're dragging a cell-rectangle (anchored on a table
+                // row at click time), extend the rectangle to the table cell
+                // under the cursor. Drags that wander off a table row clamp
+                // to the last valid cell — feels natural without needing to
+                // pre-validate every motion.
+                if let Some((anchor, _)) = self.cell_rect {
+                    if let Some(stripped) = self.get_stripped_line(line) {
+                        if Self::is_table_data_row(&stripped) {
+                            let bounds = Self::find_cell_boundaries(&stripped);
+                            if !bounds.is_empty() {
+                                let cell_idx =
+                                    Self::cursor_to_cell_index(&bounds, col);
+                                self.cell_rect = Some((anchor, (line, cell_idx)));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
