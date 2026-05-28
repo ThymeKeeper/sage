@@ -1,4 +1,4 @@
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::time::Duration;
@@ -109,6 +109,38 @@ impl SnowflakeClient {
         Ok(Self { config, token, http, base_url })
     }
 
+    /// Read the response body and deserialize as `StatusResponse`. On failure,
+    /// include HTTP status, Content-Encoding, and a body excerpt so the user
+    /// sees what Snowflake actually sent instead of just "error decoding
+    /// response body". Replaces `resp.json()` at every call site.
+    async fn parse_status(
+        resp: Response,
+    ) -> Result<(StatusCode, StatusResponse), Box<dyn Error + Send + Sync>> {
+        let status = resp.status();
+        let encoding = resp
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("identity")
+            .to_string();
+        let bytes = resp.bytes().await?;
+        match serde_json::from_slice::<StatusResponse>(&bytes) {
+            Ok(parsed) => Ok((status, parsed)),
+            Err(e) => {
+                let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(400)]);
+                Err(format!(
+                    "decoding response body failed (HTTP {}, encoding={}, {} bytes): {} — body starts: {:?}",
+                    status,
+                    encoding,
+                    bytes.len(),
+                    e,
+                    preview
+                )
+                .into())
+            }
+        }
+    }
+
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         req.header("Authorization", format!("Bearer {}", self.token))
             .header(
@@ -130,8 +162,7 @@ impl SnowflakeClient {
             role: self.config.role.as_deref().map(fold_identifier),
         };
         let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let status = resp.status();
-        let parsed: StatusResponse = resp.json().await?;
+        let (status, parsed) = Self::parse_status(resp).await?;
         // 202 is the expected async-submit response; 200 happens if Snowflake
         // chose to execute synchronously despite the async hint (small queries).
         if status != StatusCode::ACCEPTED && status != StatusCode::OK {
@@ -154,8 +185,7 @@ impl SnowflakeClient {
     pub async fn poll(&self, handle: &str) -> Result<(bool, StatusResponse), Box<dyn Error + Send + Sync>> {
         let url = format!("{}/api/v2/statements/{}", self.base_url, handle);
         let resp = self.auth(self.http.get(&url)).send().await?;
-        let status = resp.status();
-        let parsed: StatusResponse = resp.json().await?;
+        let (status, parsed) = Self::parse_status(resp).await?;
         match status {
             StatusCode::OK => Ok((true, parsed)),
             StatusCode::ACCEPTED => Ok((false, parsed)),
@@ -182,8 +212,7 @@ impl SnowflakeClient {
             self.base_url, handle, partition
         );
         let resp = self.auth(self.http.get(&url)).send().await?;
-        let status = resp.status();
-        let parsed: StatusResponse = resp.json().await?;
+        let (status, parsed) = Self::parse_status(resp).await?;
         if status != StatusCode::OK {
             return Err(format!(
                 "fetch partition {} failed (HTTP {}): {} {}",
