@@ -11,20 +11,52 @@ use std::io::{self, Write};
 pub struct KernelSelector {
     pub kernels: Vec<KernelInfo>,
     selected_index: usize,
+    empty_message: String,
 }
 
 impl KernelSelector {
+    /// Discover all available kernels (no filter). Kept for callers that
+    /// don't care about the active language.
     pub fn new() -> Self {
-        let kernels = discover_kernels();
+        KernelSelector {
+            kernels: discover_kernels(),
+            selected_index: 0,
+            empty_message: "No kernels found.".to_string(),
+        }
+    }
+
+    /// Build a selector showing only the kernels appropriate for the active
+    /// language: Snowflake-only when editing SQL, Python-only otherwise.
+    /// The empty-list message is tailored so the user knows what to install
+    /// or configure.
+    pub fn for_language(language: crate::syntax::Language) -> Self {
+        let all = discover_kernels();
+        let (kernels, empty_message) = match language {
+            crate::syntax::Language::Sql => (
+                all.into_iter()
+                    .filter(|k| k.name == crate::kernel::SNOWFLAKE_KERNEL_NAME)
+                    .collect::<Vec<_>>(),
+                "Snowflake kernel not configured. Add C:\\.dotfile\\snowflake.toml."
+                    .to_string(),
+            ),
+            _ => (
+                all.into_iter()
+                    .filter(|k| k.name != crate::kernel::SNOWFLAKE_KERNEL_NAME)
+                    .collect::<Vec<_>>(),
+                "No Python kernels found! Install Python first.".to_string(),
+            ),
+        };
         KernelSelector {
             kernels,
             selected_index: 0,
+            empty_message,
         }
     }
 
     pub fn run<W: Write>(&mut self, writer: &mut W) -> io::Result<Option<KernelInfo>> {
         if self.kernels.is_empty() {
-            self.show_error(writer, "No Python kernels found! Install Python first.")?;
+            let msg = self.empty_message.clone();
+            self.show_error(writer, &msg)?;
             return Ok(None);
         }
 
@@ -115,7 +147,7 @@ impl KernelSelector {
             SetForegroundColor(Color::Cyan),
             Print("│"),
             ResetColor,
-            Print(" Select Python Kernel"),
+            Print(" Select Kernel"),
             cursor::MoveTo(start_col + box_width - 1, start_row + 1),
             SetForegroundColor(Color::Cyan),
             Print("│"),

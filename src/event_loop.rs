@@ -1065,7 +1065,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         stdout.flush()?;
 
                         // Create selector (this does the discovery)
-                        let mut selector = kernel_selector::KernelSelector::new();
+                        let mut selector =
+                            kernel_selector::KernelSelector::for_language(*editor.get_language());
 
                         execute!(io::stdout(), crossterm::cursor::Hide)?;
 

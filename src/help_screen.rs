@@ -76,11 +76,27 @@ impl HelpScreen {
             ("PYTHON REPL MODE", vec![
                 ("Ctrl+E / Ctrl+Enter", "Execute cell/code"),
                 ("Ctrl+Backspace", "Cancel execution (resets kernel)"),
-                ("Ctrl+K", "Select Python kernel"),
+                ("Ctrl+K", "Select kernel"),
                 ("Ctrl+L", "Clear output pane"),
                 ("Ctrl+O", "Toggle output pane visibility"),
                 ("Esc", "Toggle output pane focus"),
                 ("Alt+Up / Alt+Down", "Resize output pane"),
+            ]),
+            ("SNOWFLAKE REPL MODE", vec![
+                ("Ctrl+E / Ctrl+Enter", "Execute statement (cells split on semicolons)"),
+                ("Ctrl+Backspace", "Cancel query (server-side abort, session preserved)"),
+                ("Ctrl+K", "Select kernel"),
+                ("F9", "Export full result to CSV (Downloads folder)"),
+                ("Ctrl+L", "Clear output pane"),
+                ("Ctrl+O", "Toggle output pane visibility"),
+                ("Esc", "Toggle output pane focus"),
+                ("Alt+Up / Alt+Down", "Resize output pane"),
+            ]),
+            ("TABLE OUTPUT (mouse)", vec![
+                ("Click on cell", "Select that cell"),
+                ("Click + drag in table", "Select a rectangular cell range"),
+                ("Ctrl+C (multi-cell)", "Copy as TSV with column headers"),
+                ("Ctrl+Up / Ctrl+Down", "Jump between cell outputs (pane focused)"),
             ]),
             ("LANGUAGE", vec![
                 ("Ctrl+Y", "Select language"),
