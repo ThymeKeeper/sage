@@ -99,21 +99,35 @@ struct ExecuteOutcome {
 /// Append a partition's rows to the spool CSV and capture the first
 /// `preview_limit` total rows in `preview`. The partition's row Vec is
 /// borrowed; the caller drops it after this call so memory doesn't grow.
+///
+/// `kinds` carries each column's temporal classification so DATE/TIME/TIMESTAMP
+/// cells — which Snowflake encodes as raw epoch numbers — are decoded to ISO
+/// 8601 once here, feeding both the CSV spool and the in-memory preview so the
+/// exported file and the output-pane table always agree.
 fn write_partition_and_capture_preview(
     file: &mut std::fs::File,
     rows: &[Vec<serde_json::Value>],
+    kinds: &[TemporalKind],
     preview: &mut Vec<Vec<serde_json::Value>>,
     preview_limit: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut wtr = csv::WriterBuilder::new()
         .has_headers(false)
         .from_writer(file);
+    let mut record: Vec<String> = Vec::new();
     for row in rows {
-        if preview.len() < preview_limit {
-            preview.push(row.clone());
+        record.clear();
+        for (i, cell) in row.iter().enumerate() {
+            let kind = kinds.get(i).copied().unwrap_or(TemporalKind::None);
+            record.push(cell_to_display_string(cell, kind));
         }
-        let strs: Vec<String> = row.iter().map(cell_to_string).collect();
-        wtr.write_record(&strs)?;
+        if preview.len() < preview_limit {
+            // Re-wrap the decoded strings as JSON values for the preview the
+            // table renderer consumes. Bounded to preview_limit rows, so the
+            // clone here is cheap regardless of total result size.
+            preview.push(record.iter().cloned().map(serde_json::Value::String).collect());
+        }
+        wtr.write_record(&record)?;
     }
     wtr.flush()?;
     Ok(())
@@ -216,12 +230,18 @@ impl Kernel for SnowflakeKernel {
                 wtr.flush()?;
             }
 
+            // Classify each column once so temporal cells decode to ISO 8601
+            // as partitions stream through (shared by the spool and preview).
+            let kinds: Vec<TemporalKind> =
+                meta.row_type.iter().map(|c| temporal_kind(&c.type_name)).collect();
+
             // Process partition 0 (came back inline with the poll).
             let mut preview: Vec<Vec<serde_json::Value>> = Vec::new();
             let part0 = resp.data.take().unwrap_or_default();
             write_partition_and_capture_preview(
                 tmp.as_file_mut(),
                 &part0,
+                &kinds,
                 &mut preview,
                 PREVIEW_ROW_LIMIT,
             )?;
@@ -236,6 +256,7 @@ impl Kernel for SnowflakeKernel {
                 write_partition_and_capture_preview(
                     tmp.as_file_mut(),
                     &part,
+                    &kinds,
                     &mut preview,
                     PREVIEW_ROW_LIMIT,
                 )?;
@@ -571,6 +592,170 @@ fn cell_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// A column's temporal category, derived once from its Snowflake type name so
+/// per-cell decoding doesn't re-parse the type string. `None` means "render as
+/// usual" — the vast majority of columns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TemporalKind {
+    None,
+    Date,
+    Time,
+    TimestampNtz,
+    TimestampLtz,
+    TimestampTz,
+}
+
+/// Map a Snowflake column type (case-insensitive) to its `TemporalKind`.
+fn temporal_kind(type_name: &str) -> TemporalKind {
+    match type_name.to_ascii_lowercase().as_str() {
+        "date" => TemporalKind::Date,
+        "time" => TemporalKind::Time,
+        "timestamp_ntz" => TemporalKind::TimestampNtz,
+        "timestamp_ltz" => TemporalKind::TimestampLtz,
+        "timestamp_tz" => TemporalKind::TimestampTz,
+        _ => TemporalKind::None,
+    }
+}
+
+/// Display string for one result cell. Temporal cells (per `kind`) are decoded
+/// from Snowflake's raw epoch encoding to ISO 8601; everything else — and any
+/// temporal value that fails to parse — falls back to the plain rendering.
+fn cell_to_display_string(cell: &serde_json::Value, kind: TemporalKind) -> String {
+    if kind == TemporalKind::None {
+        return cell_to_string(cell);
+    }
+    decode_temporal(cell, kind).unwrap_or_else(|| cell_to_string(cell))
+}
+
+/// Decode a Snowflake temporal cell into an ISO 8601 string. Snowflake's JSON
+/// result format encodes these as numeric strings: DATE as days since the Unix
+/// epoch, TIME as fractional seconds since midnight, and the TIMESTAMP family
+/// as fractional seconds since the epoch (TIMESTAMP_TZ additionally carries a
+/// trailing minute offset). Returns `None` for NULLs, non-numeric payloads, or
+/// values that don't parse, letting the caller fall back to plain rendering.
+fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<String> {
+    use chrono::{Duration, FixedOffset, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
+
+    // Normally a JSON string ("1761177600.000"); accept a bare number too.
+    let raw: String = match cell {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    if raw.is_empty() {
+        return None;
+    }
+
+    match kind {
+        TemporalKind::None => None,
+        TemporalKind::Date => raw
+            .parse::<i64>()
+            .ok()
+            .and_then(|days| {
+                NaiveDate::from_ymd_opt(1970, 1, 1)
+                    .and_then(|epoch| epoch.checked_add_signed(Duration::days(days)))
+            })
+            .map(|d| d.format("%Y-%m-%d").to_string()),
+        TemporalKind::Time => parse_fractional_seconds(&raw)
+            .and_then(|(secs, nanos)| {
+                let secs = secs.rem_euclid(86_400) as u32;
+                NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+            })
+            .map(|t| {
+                format!(
+                    "{}{}",
+                    t.format("%H:%M:%S"),
+                    format_fractional_nanos(t.nanosecond())
+                )
+            }),
+        TemporalKind::TimestampTz => {
+            // "<fractional seconds since epoch> <offset>", where the offset is
+            // the timezone offset in minutes biased by +1440 (so 1440 == UTC).
+            let mut parts = raw.split_whitespace();
+            let ts = parts.next().unwrap_or("");
+            let offset_minutes = parts
+                .next()
+                .and_then(|o| o.parse::<i64>().ok())
+                .map(|o| o - 1440)
+                .unwrap_or(0);
+            parse_fractional_seconds(ts).and_then(|(secs, nanos)| {
+                FixedOffset::east_opt((offset_minutes * 60) as i32).and_then(|off| {
+                    Utc.timestamp_opt(secs, nanos).single().map(|dt| {
+                        let dt = dt.with_timezone(&off);
+                        format!(
+                            "{}{}{}",
+                            dt.format("%Y-%m-%dT%H:%M:%S"),
+                            format_fractional_nanos(dt.nanosecond()),
+                            dt.format("%:z")
+                        )
+                    })
+                })
+            })
+        }
+        // Both are fractional seconds since the epoch and render as a zoneless
+        // date-time with no designator. (TIMESTAMP_LTZ is technically an
+        // absolute instant, but the session timezone it should display in isn't
+        // carried in the result metadata, so we render its UTC wall clock the
+        // same way as TIMESTAMP_NTZ rather than mislabel the offset.)
+        TemporalKind::TimestampNtz | TemporalKind::TimestampLtz => {
+            parse_fractional_seconds(&raw)
+                .and_then(|(secs, nanos)| Utc.timestamp_opt(secs, nanos).single())
+                .map(|dt| {
+                    let naive = dt.naive_utc();
+                    format!(
+                        "{}{}",
+                        naive.format("%Y-%m-%dT%H:%M:%S"),
+                        format_fractional_nanos(naive.nanosecond())
+                    )
+                })
+        }
+    }
+}
+
+/// Parse a decimal "seconds[.fraction]" string into whole seconds plus a
+/// nanosecond remainder in [0, 1_000_000_000), handling negative (pre-epoch)
+/// values correctly.
+fn parse_fractional_seconds(raw: &str) -> Option<(i64, u32)> {
+    let raw = raw.trim();
+    let negative = raw.starts_with('-');
+    let body = raw.strip_prefix('-').unwrap_or(raw);
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let mut secs: i64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let mut frac = frac_part.to_string();
+    if frac.len() > 9 {
+        frac.truncate(9);
+    }
+    while frac.len() < 9 {
+        frac.push('0');
+    }
+    let mut nanos: i64 = frac.parse().ok()?;
+    if negative {
+        if nanos > 0 {
+            secs += 1;
+            nanos = 1_000_000_000 - nanos;
+        }
+        secs = -secs;
+    }
+    Some((secs, nanos as u32))
+}
+
+/// Render a nanosecond remainder as a trimmed fractional-seconds suffix (e.g.
+/// ".5", ".123"), or an empty string when there's no sub-second component.
+fn format_fractional_nanos(nanos: u32) -> String {
+    if nanos == 0 {
+        return String::new();
+    }
+    let mut s = format!("{:09}", nanos);
+    while s.ends_with('0') {
+        s.pop();
+    }
+    format!(".{}", s)
+}
+
 /// Truncate a string to fit in `max` display columns. Appends `…` when
 /// truncated. Operates on character boundaries (not bytes) so UTF-8 stays
 /// valid.
@@ -586,4 +771,89 @@ fn truncate(s: &str, max: usize) -> String {
     let mut t: String = s.chars().take(take).collect();
     t.push('…');
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn disp(raw: &str, kind: TemporalKind) -> String {
+        cell_to_display_string(&Value::String(raw.to_string()), kind)
+    }
+
+    #[test]
+    fn classifies_types_case_insensitively() {
+        assert!(matches!(temporal_kind("date"), TemporalKind::Date));
+        assert!(matches!(temporal_kind("TIMESTAMP_NTZ"), TemporalKind::TimestampNtz));
+        assert!(matches!(temporal_kind("Timestamp_Tz"), TemporalKind::TimestampTz));
+        assert!(matches!(temporal_kind("TEXT"), TemporalKind::None));
+        assert!(matches!(temporal_kind("NUMBER(38,0)"), TemporalKind::None));
+    }
+
+    #[test]
+    fn decodes_date_from_epoch_days() {
+        assert_eq!(disp("20384", TemporalKind::Date), "2025-10-23");
+        assert_eq!(disp("0", TemporalKind::Date), "1970-01-01");
+        assert_eq!(disp("-1", TemporalKind::Date), "1969-12-31");
+    }
+
+    #[test]
+    fn decodes_time_with_fractional_seconds() {
+        assert_eq!(disp("0", TemporalKind::Time), "00:00:00");
+        assert_eq!(disp("3661", TemporalKind::Time), "01:01:01");
+        assert_eq!(disp("3661.5", TemporalKind::Time), "01:01:01.5");
+    }
+
+    #[test]
+    fn decodes_timestamp_ntz_and_ltz() {
+        // The exact epoch value from the bug report.
+        assert_eq!(
+            disp("1761177600.000", TemporalKind::TimestampNtz),
+            "2025-10-23T00:00:00"
+        );
+        assert_eq!(
+            disp("1761177600.500000000", TemporalKind::TimestampNtz),
+            "2025-10-23T00:00:00.5"
+        );
+        // LTZ renders the same as NTZ (zoneless wall clock, no designator).
+        assert_eq!(
+            disp("1761177600.000", TemporalKind::TimestampLtz),
+            "2025-10-23T00:00:00"
+        );
+    }
+
+    #[test]
+    fn decodes_timestamp_tz_with_offset() {
+        // 1770 == +05:30 (1440 bias + 330 minutes).
+        assert_eq!(
+            disp("1761177600.000 1770", TemporalKind::TimestampTz),
+            "2025-10-23T05:30:00+05:30"
+        );
+        // 1440 == UTC.
+        assert_eq!(
+            disp("1761177600.000 1440", TemporalKind::TimestampTz),
+            "2025-10-23T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn decodes_pre_epoch_timestamp() {
+        assert_eq!(
+            disp("-1.5", TemporalKind::TimestampNtz),
+            "1969-12-31T23:59:58.5"
+        );
+    }
+
+    #[test]
+    fn non_temporal_and_unparseable_pass_through() {
+        assert_eq!(disp("hello", TemporalKind::None), "hello");
+        // A temporal column whose cell can't be parsed keeps its raw text.
+        assert_eq!(disp("not-a-number", TemporalKind::Date), "not-a-number");
+        // NULL cells fall back to the plain NULL rendering.
+        assert_eq!(
+            cell_to_display_string(&Value::Null, TemporalKind::TimestampNtz),
+            "NULL"
+        );
+    }
 }
