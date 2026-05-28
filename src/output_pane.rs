@@ -101,6 +101,9 @@ fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
     let mut display_pos = 0;
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
+    // Track whether we emitted any escape sequence, so plain text isn't
+    // saddled with a spurious trailing reset (see the reset note below).
+    let mut wrote_escape = false;
 
     while i < chars.len() {
         if chars[i] == '\x1b' && i + 1 < chars.len() {
@@ -119,6 +122,7 @@ fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
                     for j in seq_start..i {
                         result.push(chars[j]);
                     }
+                    wrote_escape = true;
                 }
             } else if chars[i + 1] == ']' {
                 // OSC sequence: \x1b]...ST (ST is \x1b\\ or \x07)
@@ -139,6 +143,7 @@ fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
                     for j in seq_start..i {
                         result.push(chars[j]);
                     }
+                    wrote_escape = true;
                 }
             } else {
                 // Unknown escape, skip just the ESC
@@ -158,9 +163,12 @@ fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
     // rendered line. The loop above drops ANSI codes whose display position
     // falls outside the visible range, which means a line wider than the
     // viewport can end with an unclosed color / dim / bold and stain
-    // subsequent draws. Reset is idempotent — appending one when state is
-    // already reset is a no-op.
-    result.push_str("\x1b[0m");
+    // subsequent draws. Only do this when we actually emitted an escape —
+    // plain text carries no style to close, and tacking a reset onto it just
+    // bloats the output (and breaks round-trip expectations).
+    if wrote_escape {
+        result.push_str("\x1b[0m");
+    }
     result
 }
 
