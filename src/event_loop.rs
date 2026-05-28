@@ -845,30 +845,39 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
                     }
 
-                    // Save query Results (Ctrl+R) — copies the active kernel's
+                    // Export query results (F9) — copies the active kernel's
                     // result spool (e.g. SnowflakeKernel's CSV tempfile) to a
-                    // user-chosen path. No-op for kernels that don't spool.
-                    KeyCode::Char('r') | KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // user-chosen path, prepopulated with the OS Downloads
+                    // folder and a timestamped filename. No-op for kernels
+                    // that don't spool (e.g. DirectKernel).
+                    KeyCode::F(9) => {
                         match editor.kernel_latest_result_file() {
                             Some(src) => {
-                                let initial = src
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|n| format!("results-{}", n))
-                                    .unwrap_or_else(|| "results.csv".to_string());
-                                let mut p = prompt::Prompt::new("Save results to", &initial);
+                                let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                                let filename = format!("export-{}.csv", stamp);
+                                // dirs::download_dir() resolves to the OS
+                                // Downloads folder (USERPROFILE\Downloads on
+                                // Windows, ~/Downloads on Linux/macOS via
+                                // XDG_DOWNLOAD_DIR with sane fallback). If
+                                // neither downloads nor home is available we
+                                // fall back to a bare filename (CWD-relative).
+                                let initial = dirs::download_dir()
+                                    .or_else(dirs::home_dir)
+                                    .map(|d| d.join(&filename).to_string_lossy().into_owned())
+                                    .unwrap_or(filename);
+                                let mut p = prompt::Prompt::new("Export results to", &initial);
                                 if let Some(dest) = p.run(&mut io::stdout())? {
                                     let dest_display = format!("{}", std::path::Path::new(&dest).display());
                                     match std::fs::copy(&src, &dest) {
                                         Ok(bytes) => {
                                             editor.status_message = Some((
-                                                format!("Saved {} bytes to {}", bytes, dest_display),
+                                                format!("Exported {} bytes to {}", bytes, dest_display),
                                                 false,
                                             ));
                                         }
                                         Err(e) => {
                                             editor.status_message = Some((
-                                                format!("Failed to save results: {}", e),
+                                                format!("Failed to export results: {}", e),
                                                 true,
                                             ));
                                         }
@@ -879,7 +888,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             }
                             None => {
                                 editor.status_message = Some((
-                                    "No query results to save.".to_string(),
+                                    "No query results to export.".to_string(),
                                     true,
                                 ));
                                 needs_redraw = true;

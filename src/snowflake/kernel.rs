@@ -370,7 +370,7 @@ fn format_outcome(
     let shown = preview.len() as u64;
     let footer = if shown < total_rows {
         format!(
-            "\n(showing first {} of {} rows — Ctrl+R to save full result)\n",
+            "\n(showing first {} of {} rows — F9 to export full result)\n",
             shown, total_rows
         )
     } else {
