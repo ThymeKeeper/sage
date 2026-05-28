@@ -627,12 +627,15 @@ fn cell_to_display_string(cell: &serde_json::Value, kind: TemporalKind) -> Strin
     decode_temporal(cell, kind).unwrap_or_else(|| cell_to_string(cell))
 }
 
-/// Decode a Snowflake temporal cell into an ISO 8601 string. Snowflake's JSON
-/// result format encodes these as numeric strings: DATE as days since the Unix
-/// epoch, TIME as fractional seconds since midnight, and the TIMESTAMP family
-/// as fractional seconds since the epoch (TIMESTAMP_TZ additionally carries a
-/// trailing minute offset). Returns `None` for NULLs, non-numeric payloads, or
-/// values that don't parse, letting the caller fall back to plain rendering.
+/// Decode a Snowflake temporal cell into an ISO 8601-style string. Snowflake's
+/// JSON result format encodes these as numeric strings: DATE as days since the
+/// Unix epoch, TIME as fractional seconds since midnight, and the TIMESTAMP
+/// family as fractional seconds since the epoch (TIMESTAMP_TZ additionally
+/// carries a trailing minute offset). Timestamps separate the date and time
+/// with a space rather than the canonical `T`: RFC 3339 permits it, and Excel
+/// only recognizes the value as a datetime (not text) without the `T`. Returns
+/// `None` for NULLs, non-numeric payloads, or values that don't parse, letting
+/// the caller fall back to plain rendering.
 fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<String> {
     use chrono::{Duration, FixedOffset, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 
@@ -684,7 +687,7 @@ fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<Strin
                         let dt = dt.with_timezone(&off);
                         format!(
                             "{}{}{}",
-                            dt.format("%Y-%m-%dT%H:%M:%S"),
+                            dt.format("%Y-%m-%d %H:%M:%S"),
                             format_fractional_nanos(dt.nanosecond()),
                             dt.format("%:z")
                         )
@@ -704,7 +707,7 @@ fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<Strin
                     let naive = dt.naive_utc();
                     format!(
                         "{}{}",
-                        naive.format("%Y-%m-%dT%H:%M:%S"),
+                        naive.format("%Y-%m-%d %H:%M:%S"),
                         format_fractional_nanos(naive.nanosecond())
                     )
                 })
@@ -810,16 +813,16 @@ mod tests {
         // The exact epoch value from the bug report.
         assert_eq!(
             disp("1761177600.000", TemporalKind::TimestampNtz),
-            "2025-10-23T00:00:00"
+            "2025-10-23 00:00:00"
         );
         assert_eq!(
             disp("1761177600.500000000", TemporalKind::TimestampNtz),
-            "2025-10-23T00:00:00.5"
+            "2025-10-23 00:00:00.5"
         );
         // LTZ renders the same as NTZ (zoneless wall clock, no designator).
         assert_eq!(
             disp("1761177600.000", TemporalKind::TimestampLtz),
-            "2025-10-23T00:00:00"
+            "2025-10-23 00:00:00"
         );
     }
 
@@ -828,12 +831,12 @@ mod tests {
         // 1770 == +05:30 (1440 bias + 330 minutes).
         assert_eq!(
             disp("1761177600.000 1770", TemporalKind::TimestampTz),
-            "2025-10-23T05:30:00+05:30"
+            "2025-10-23 05:30:00+05:30"
         );
         // 1440 == UTC.
         assert_eq!(
             disp("1761177600.000 1440", TemporalKind::TimestampTz),
-            "2025-10-23T00:00:00+00:00"
+            "2025-10-23 00:00:00+00:00"
         );
     }
 
@@ -841,7 +844,7 @@ mod tests {
     fn decodes_pre_epoch_timestamp() {
         assert_eq!(
             disp("-1.5", TemporalKind::TimestampNtz),
-            "1969-12-31T23:59:58.5"
+            "1969-12-31 23:59:58.5"
         );
     }
 
