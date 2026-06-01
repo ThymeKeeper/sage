@@ -225,7 +225,14 @@ impl Editor {
     /// Auto-discover and connect to the first available Python kernel
     pub fn auto_connect_kernel(&mut self) {
         let kernels = crate::kernel::discover_kernels();
-        if let Some(kernel_info) = kernels.into_iter().next() {
+        // Skip the Snowflake entry — discovery lists it first when a Snowflake
+        // config exists, but this path auto-connects a Python interpreter (and
+        // forcing the Snowflake sentinel into a DirectKernel just fails to
+        // connect, leaving a .py file with no kernel).
+        if let Some(kernel_info) = kernels
+            .into_iter()
+            .find(|k| k.name != crate::kernel::SNOWFLAKE_KERNEL_NAME)
+        {
             let mut new_kernel: Box<dyn Kernel> = Box::new(
                 crate::direct_kernel::DirectKernel::new(
                     kernel_info.python_path.clone(),
