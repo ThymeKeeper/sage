@@ -34,12 +34,33 @@ pub enum GridHit {
     RowNumber { row: usize },
 }
 
+/// Accumulated timezone state across the date/datetime cells in a selection,
+/// used to decide how aggregates are displayed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TzAgg {
+    /// No timezone-aware value seen (naive times, or date-only).
+    #[default]
+    None,
+    /// Every timezone-aware value shares this offset (seconds); shown as-is.
+    Uniform(i64),
+    /// Timezone-aware values with differing offsets; aggregates shown in UTC.
+    Mixed,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SelectionMetrics {
     pub total_cells: usize,
     pub non_empty: usize,
     pub numbers: Vec<f64>,
-    pub dates: Vec<i64>, // days since 1970-01-01
+    /// Epoch seconds (UTC) for each date/datetime cell. Date-only cells land at
+    /// midnight; `dates_have_time` records whether any carried a time-of-day.
+    pub dates: Vec<i64>,
+    /// True if any value in `dates` included a time, so min/max/avg render as
+    /// `YYYY-MM-DD HH:MM:SS` rather than date-only.
+    pub dates_have_time: bool,
+    /// Timezone offset shared by the tz-aware values (for display), or whether
+    /// they were naive / mixed.
+    tz: TzAgg,
 }
 
 impl SelectionMetrics {
@@ -76,13 +97,35 @@ impl SelectionMetrics {
             parts.push(format!("min {}", fmt_num(min)));
             parts.push(format!("max {}", fmt_num(max)));
         } else if all_date {
-            let min = *self.dates.iter().min().unwrap();
-            let max = *self.dates.iter().max().unwrap();
-            let sum: i64 = self.dates.iter().sum();
-            let avg = (sum as f64 / self.dates.len() as f64).round() as i64;
-            parts.push(format!("min {}", format_iso_date(min)));
-            parts.push(format!("max {}", format_iso_date(max)));
-            parts.push(format!("avg {}", format_iso_date(avg)));
+            if self.dates_have_time {
+                // Aggregate in UTC seconds, then render in the selection's
+                // shared offset (or UTC, labelled +00:00, if they differ).
+                let min = *self.dates.iter().min().unwrap();
+                let max = *self.dates.iter().max().unwrap();
+                let sum: i64 = self.dates.iter().sum();
+                let avg = (sum as f64 / self.dates.len() as f64).round() as i64;
+                let fmt = |utc: i64| match self.tz {
+                    TzAgg::Uniform(off) => {
+                        format!("{}{}", format_iso_datetime(utc + off), format_tz_offset(off))
+                    }
+                    TzAgg::Mixed => format!("{}+00:00", format_iso_datetime(utc)),
+                    TzAgg::None => format_iso_datetime(utc),
+                };
+                parts.push(format!("min {}", fmt(min)));
+                parts.push(format!("max {}", fmt(max)));
+                parts.push(format!("avg {}", fmt(avg)));
+            } else {
+                // All date-only: aggregate in whole days so the average rounds
+                // to a calendar day rather than flooring to the previous one.
+                let days: Vec<i64> = self.dates.iter().map(|s| s.div_euclid(86_400)).collect();
+                let min = *days.iter().min().unwrap();
+                let max = *days.iter().max().unwrap();
+                let sum: i64 = days.iter().sum();
+                let avg = (sum as f64 / days.len() as f64).round() as i64;
+                parts.push(format!("min {}", format_iso_date(min)));
+                parts.push(format!("max {}", format_iso_date(max)));
+                parts.push(format!("avg {}", format_iso_date(avg)));
+            }
         }
 
         parts.join("  ")
@@ -773,8 +816,17 @@ impl Spreadsheet {
                 m.non_empty += 1;
                 if let Some(n) = parse_number(cell) {
                     m.numbers.push(n);
-                } else if let Some(days) = parse_iso_date(cell) {
-                    m.dates.push(days);
+                } else if let Some((secs, has_time, tz_offset)) = parse_iso_datetime(cell) {
+                    m.dates.push(secs);
+                    m.dates_have_time |= has_time;
+                    if let Some(off) = tz_offset {
+                        // Track whether all tz-aware values share one offset.
+                        m.tz = match m.tz {
+                            TzAgg::None => TzAgg::Uniform(off),
+                            TzAgg::Uniform(prev) if prev == off => TzAgg::Uniform(off),
+                            _ => TzAgg::Mixed,
+                        };
+                    }
                 }
             }
         }
@@ -1151,6 +1203,74 @@ pub fn parse_iso_date(raw: &str) -> Option<i64> {
     Some(ymd_to_epoch_days(y, m, d))
 }
 
+/// Parse an ISO-style date or datetime into `(epoch_seconds_utc, has_time,
+/// tz_offset)`. Accepts a `YYYY-MM-DD` date, optionally followed by a ` ` or
+/// `T` separator and a `HH:MM`, `HH:MM:SS`, or `HH:MM:SS.fff` time (fractional
+/// seconds are truncated), optionally followed by a `Z` or `±HH:MM` timezone.
+/// The returned seconds are normalized to UTC; `tz_offset` is the offset in
+/// seconds when one was present (`None` for a naive time). Recognizes the
+/// `YYYY-MM-DD HH:MM:SS` and `YYYY-MM-DD HH:MM:SS±HH:MM` forms Snowflake renders
+/// for TIMESTAMP / TIMESTAMP_TZ columns. Returns `None` for anything else.
+pub fn parse_iso_datetime(raw: &str) -> Option<(i64, bool, Option<i64>)> {
+    let s = raw.trim();
+    // The leading 10 chars must be a valid YYYY-MM-DD date.
+    let days = parse_iso_date(s.get(0..10)?)?;
+    let mut secs = days * 86_400;
+    let rest = &s[10..];
+    if rest.is_empty() {
+        return Some((secs, false, None));
+    }
+    // A separator (space or 'T') must follow, then HH:MM[:SS[.fff]][tz].
+    match rest.as_bytes()[0] {
+        b' ' | b'T' => {}
+        _ => return None,
+    }
+    // Peel off a trailing timezone before splitting the time on ':'.
+    let (time, tz_offset) = split_timezone(&rest[1..])?;
+    let mut fields = time.split(':');
+    let hh: i64 = fields.next()?.parse().ok()?;
+    let mm: i64 = fields.next()?.parse().ok()?;
+    let ss: i64 = match fields.next() {
+        // Drop any fractional-second suffix before parsing.
+        Some(sec) => sec.split('.').next().unwrap_or("").parse().ok()?,
+        None => 0,
+    };
+    if !(0..24).contains(&hh) || !(0..60).contains(&mm) || !(0..60).contains(&ss) {
+        return None;
+    }
+    secs += hh * 3600 + mm * 60 + ss;
+    // Normalize to UTC: a +HH:MM offset means local time runs ahead of UTC.
+    secs -= tz_offset.unwrap_or(0);
+    Some((secs, true, tz_offset))
+}
+
+/// Split a `HH:MM[:SS[.fff]]` time from an optional trailing timezone. Returns
+/// `(time, offset_seconds)`: offset is `None` for a naive time, `Some(0)` for
+/// `Z`, and `Some(±seconds)` for a `±HH:MM` / `±HHMM` / `±HH` offset. The time
+/// itself never contains `+`/`-`, so the first such char marks the offset.
+fn split_timezone(s: &str) -> Option<(&str, Option<i64>)> {
+    if let Some(time) = s.strip_suffix(|c| c == 'Z' || c == 'z') {
+        return Some((time, Some(0)));
+    }
+    let Some(pos) = s.find(|c| c == '+' || c == '-') else {
+        return Some((s, None));
+    };
+    let (time, tz) = s.split_at(pos);
+    let sign = if tz.starts_with('-') { -1 } else { 1 };
+    let body = &tz[1..];
+    let (h, m) = match body.split_once(':') {
+        Some((h, m)) => (h, m),
+        None if body.len() == 4 => (&body[0..2], &body[2..4]),
+        None => (body, "0"),
+    };
+    let oh: i64 = h.parse().ok()?;
+    let om: i64 = m.parse().ok()?;
+    if !(0..24).contains(&oh) || !(0..60).contains(&om) {
+        return None;
+    }
+    Some((time, Some(sign * (oh * 3600 + om * 60))))
+}
+
 /// Convert Y/M/D (proleptic Gregorian) to days since 1970-01-01.
 /// Uses Howard Hinnant's algorithm.
 pub fn ymd_to_epoch_days(y: i32, m: u32, d: u32) -> i64 {
@@ -1183,6 +1303,25 @@ pub fn epoch_days_to_ymd(z: i64) -> (i32, u32, u32) {
 pub fn format_iso_date(days: i64) -> String {
     let (y, m, d) = epoch_days_to_ymd(days);
     format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Format epoch seconds (UTC) as `YYYY-MM-DD HH:MM:SS`.
+pub fn format_iso_datetime(secs: i64) -> String {
+    let tod = secs.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02}:{:02}",
+        format_iso_date(secs.div_euclid(86_400)),
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60,
+    )
+}
+
+/// Format a timezone offset (seconds) as `±HH:MM` (e.g. `+05:30`, `-08:00`).
+pub fn format_tz_offset(secs: i64) -> String {
+    let sign = if secs < 0 { '-' } else { '+' };
+    let a = secs.abs();
+    format!("{}{:02}:{:02}", sign, a / 3600, (a % 3600) / 60)
 }
 
 fn fmt_num(n: f64) -> String {
@@ -1580,6 +1719,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_datetime_accepts_timestamp_forms() {
+        let midnight = ymd_to_epoch_days(2025, 10, 23) * 86_400;
+        // Date only → midnight, has_time = false, no offset.
+        assert_eq!(parse_iso_datetime("2025-10-23"), Some((midnight, false, None)));
+        // Trailing whitespace is trimmed back to date-only.
+        assert_eq!(parse_iso_datetime("  2025-10-23  "), Some((midnight, false, None)));
+        // Space-separated datetime (the Snowflake NTZ rendering).
+        let dt = midnight + 14 * 3600 + 30 * 60 + 15;
+        assert_eq!(parse_iso_datetime("2025-10-23 14:30:15"), Some((dt, true, None)));
+        // 'T' separator and fractional seconds (truncated to the second).
+        assert_eq!(parse_iso_datetime("2025-10-23T14:30:15.500"), Some((dt, true, None)));
+        // HH:MM with no seconds.
+        assert_eq!(
+            parse_iso_datetime("2025-10-23 14:30"),
+            Some((midnight + 14 * 3600 + 30 * 60, true, None))
+        );
+        // Timezone offsets normalize to UTC and report the offset.
+        // 05:30 at +05:30 == 00:00 UTC.
+        assert_eq!(
+            parse_iso_datetime("2025-10-23 05:30:00+05:30"),
+            Some((midnight, true, Some(19_800)))
+        );
+        // 00:00 at -08:00 == 08:00 UTC the same day.
+        assert_eq!(
+            parse_iso_datetime("2025-10-23 00:00:00-08:00"),
+            Some((midnight + 8 * 3600, true, Some(-28_800)))
+        );
+        // 'Z' == UTC.
+        assert_eq!(parse_iso_datetime("2025-10-23T00:00:00Z"), Some((midnight, true, Some(0))));
+        // Rejections.
+        assert_eq!(parse_iso_datetime("2025-10-23 25:00:00"), None); // bad hour
+        assert_eq!(parse_iso_datetime("2025-10-23 14:60"), None); // bad minute
+        assert_eq!(parse_iso_datetime("2025-10-23x14:30"), None); // bad separator
+        assert_eq!(parse_iso_datetime("not a date"), None);
+    }
+
+    #[test]
+    fn format_datetime_renders_time() {
+        assert_eq!(format_iso_datetime(0), "1970-01-01 00:00:00");
+        let dt = ymd_to_epoch_days(2025, 10, 23) * 86_400 + 14 * 3600 + 30 * 60 + 15;
+        assert_eq!(format_iso_datetime(dt), "2025-10-23 14:30:15");
+    }
+
+    #[test]
     fn metrics_numbers_sum_and_avg() {
         let mut ss = Spreadsheet::new_empty(b',');
         ss.rows = vec![
@@ -1613,10 +1796,65 @@ mod tests {
         ss.selection_anchor = Some((2, 0));
         let m = ss.selection_metrics();
         assert_eq!(m.dates.len(), 3);
+        assert!(!m.dates_have_time);
         let s = m.format();
         assert!(s.contains("min 2020-01-01"));
         assert!(s.contains("max 2024-01-01"));
         assert!(s.contains("avg 2022-01-01"));
+    }
+
+    #[test]
+    fn metrics_datetimes_min_max_avg() {
+        let mut ss = Spreadsheet::new_empty(b',');
+        ss.rows = vec![
+            vec!["2025-01-01 00:00:00".into()],
+            vec!["2025-01-01 12:00:00".into()],
+            vec!["2025-01-02 00:00:00".into()],
+        ];
+        ss.column_widths = vec![20];
+        ss.cursor = (0, 0);
+        ss.selection_anchor = Some((2, 0));
+        let m = ss.selection_metrics();
+        assert_eq!(m.dates.len(), 3);
+        assert!(m.dates_have_time);
+        let s = m.format();
+        // Min/max/avg keep the time component (avg of 00:00, 12:00, +1d 00:00).
+        assert!(s.contains("min 2025-01-01 00:00:00"), "got: {s}");
+        assert!(s.contains("max 2025-01-02 00:00:00"), "got: {s}");
+        assert!(s.contains("avg 2025-01-01 12:00:00"), "got: {s}");
+    }
+
+    #[test]
+    fn metrics_tz_datetimes_keep_common_offset() {
+        let mut ss = Spreadsheet::new_empty(b',');
+        ss.rows = vec![
+            vec!["2025-01-01 00:00:00+05:30".into()],
+            vec!["2025-01-01 12:00:00+05:30".into()],
+        ];
+        ss.column_widths = vec![30];
+        ss.cursor = (0, 0);
+        ss.selection_anchor = Some((1, 0));
+        let s = ss.selection_metrics().format();
+        // A shared offset is preserved in the rendered aggregates.
+        assert!(s.contains("min 2025-01-01 00:00:00+05:30"), "got: {s}");
+        assert!(s.contains("max 2025-01-01 12:00:00+05:30"), "got: {s}");
+        assert!(s.contains("avg 2025-01-01 06:00:00+05:30"), "got: {s}");
+    }
+
+    #[test]
+    fn metrics_mixed_tz_offsets_fall_back_to_utc() {
+        let mut ss = Spreadsheet::new_empty(b',');
+        ss.rows = vec![
+            vec!["2025-01-01 00:00:00+00:00".into()],
+            vec!["2025-01-01 00:00:00+05:00".into()], // == 2024-12-31 19:00 UTC
+        ];
+        ss.column_widths = vec![30];
+        ss.cursor = (0, 0);
+        ss.selection_anchor = Some((1, 0));
+        let s = ss.selection_metrics().format();
+        // Differing offsets → aggregates rendered in UTC.
+        assert!(s.contains("min 2024-12-31 19:00:00+00:00"), "got: {s}");
+        assert!(s.contains("max 2025-01-01 00:00:00+00:00"), "got: {s}");
     }
 
     #[test]
