@@ -1193,7 +1193,18 @@ impl Renderer {
                     line.push_str("\x1b[48;5;234m\x1b[38;5;252m");
                 }
 
-                let text = ss.cell(row_idx, col_idx);
+                // Null cells render as the ∅ sentinel; empty strings stay blank.
+                let is_null_cell = ss.is_null(row_idx, col_idx);
+                let text = if is_null_cell {
+                    crate::spreadsheet::NULL_SENTINEL
+                } else {
+                    ss.cell(row_idx, col_idx)
+                };
+                // Dim the sentinel's foreground (a muted grey) while keeping the
+                // cell's background; reset by the separator/row reset that follows.
+                if is_null_cell {
+                    line.push_str("\x1b[38;5;244m");
+                }
                 if remaining >= col_width + 1 {
                     let rendered = render_cell_text(text, col_width);
                     line.push_str(&rendered);

@@ -91,6 +91,11 @@ impl SelectionMetrics {
 
 pub struct Spreadsheet {
     pub rows: Vec<Vec<String>>,
+    /// Parallel to `rows`: true where the source had an unquoted-empty field
+    /// (a SQL null, per the [`crate::dsv`] convention) rather than an empty
+    /// string. Null cells hold `""` in `rows` but render as `∅`. Same shape as
+    /// `rows`; kept in sync wherever cells are written.
+    pub null_mask: Vec<Vec<bool>>,
     pub cursor: (usize, usize),
     pub selection_anchor: Option<(usize, usize)>,
     pub column_widths: Vec<usize>,
@@ -102,6 +107,10 @@ pub struct Spreadsheet {
     pub mouse_mode: MouseMode,
 }
 
+/// Sentinel rendered in the grid for a null cell (an unquoted-empty CSV/TSV
+/// field). Distinct from a blank cell, which is an empty string.
+pub const NULL_SENTINEL: &str = "∅";
+
 pub struct CellEdit {
     pub text: String,
     pub cursor: usize,
@@ -111,39 +120,42 @@ pub struct CellEdit {
 impl Spreadsheet {
     pub fn from_file(path: &Path) -> io::Result<Self> {
         let delimiter = detect_delimiter(path);
-        let file = File::open(path)?;
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(delimiter)
-            .has_headers(false)
-            .flexible(true)
-            .from_reader(file);
+        let content = std::fs::read_to_string(path)?;
 
+        // Parse with null awareness: an unquoted-empty field is a null (shown as
+        // ∅), a quoted "" is an empty string. `rows` holds "" for both; the
+        // distinction lives in `null_mask`.
         let mut rows: Vec<Vec<String>> = Vec::new();
-        for result in reader.records() {
-            match result {
-                Ok(record) => rows.push(record.iter().map(|s| s.to_string()).collect()),
-                Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("CSV parse error: {}", e),
-                    ));
-                }
+        let mut null_mask: Vec<Vec<bool>> = Vec::new();
+        for record in crate::dsv::parse(&content, delimiter) {
+            let mut row = Vec::with_capacity(record.len());
+            let mut mask = Vec::with_capacity(record.len());
+            for field in record {
+                mask.push(field.is_none());
+                row.push(field.unwrap_or_default());
             }
+            rows.push(row);
+            null_mask.push(mask);
         }
 
         let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
-        for row in rows.iter_mut() {
+        for (row, mask) in rows.iter_mut().zip(null_mask.iter_mut()) {
+            // Pad short rows with empty strings (missing trailing fields are
+            // treated as empty, not null).
             while row.len() < max_cols {
                 row.push(String::new());
+                mask.push(false);
             }
         }
 
         if rows.is_empty() {
             rows = vec![vec![String::new(); max_cols.max(1)]];
+            null_mask = vec![vec![false; max_cols.max(1)]];
         }
 
         let mut ss = Self {
             rows,
+            null_mask,
             cursor: (0, 0),
             selection_anchor: None,
             column_widths: Vec::new(),
@@ -161,6 +173,7 @@ impl Spreadsheet {
     pub fn new_empty(delimiter: u8) -> Self {
         Self {
             rows: vec![vec![String::new()]],
+            null_mask: vec![vec![false]],
             cursor: (0, 0),
             selection_anchor: None,
             column_widths: vec![MIN_COL_WIDTH],
@@ -174,12 +187,28 @@ impl Spreadsheet {
     }
 
     pub fn save(&mut self, path: &Path) -> io::Result<()> {
-        let file = File::create(path)?;
-        let mut writer = csv::WriterBuilder::new()
-            .delimiter(self.delimiter)
-            .from_writer(file);
-        for row in &self.rows {
-            writer.write_record(row).map_err(csv_err)?;
+        use std::io::Write;
+        // Write through the null-aware serializer so null cells round-trip as
+        // unquoted-empty fields and empty strings as quoted "" (see crate::dsv).
+        let mut writer = io::BufWriter::new(File::create(path)?);
+        let mut line = String::new();
+        for (r, row) in self.rows.iter().enumerate() {
+            line.clear();
+            for (c, cell) in row.iter().enumerate() {
+                if c > 0 {
+                    line.push(self.delimiter as char);
+                }
+                let is_null = self
+                    .null_mask
+                    .get(r)
+                    .and_then(|m| m.get(c))
+                    .copied()
+                    .unwrap_or(false);
+                let field = if is_null { None } else { Some(cell.as_str()) };
+                crate::dsv::serialize_field(&mut line, field, self.delimiter);
+            }
+            line.push('\n');
+            writer.write_all(line.as_bytes())?;
         }
         writer.flush()?;
         self.modified = false;
@@ -200,6 +229,16 @@ impl Spreadsheet {
             .and_then(|r| r.get(col))
             .map(|s| s.as_str())
             .unwrap_or("")
+    }
+
+    /// Whether the cell is null (an unquoted-empty source field) as opposed to
+    /// an empty string. Null cells hold `""` in `rows` but render as `∅`.
+    pub fn is_null(&self, row: usize, col: usize) -> bool {
+        self.null_mask
+            .get(row)
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn focused_cell_text(&self) -> &str {
@@ -353,9 +392,15 @@ impl Spreadsheet {
         let (r, c) = self.cursor;
         if let Some(row) = self.rows.get_mut(r) {
             if let Some(cell) = row.get_mut(c) {
-                if *cell != edit.text {
+                // An edited cell holds a real value, never a null — even if the
+                // committed text is empty (that's now an empty string).
+                let was_null = self.null_mask.get(r).and_then(|m| m.get(c)).copied().unwrap_or(false);
+                if *cell != edit.text || was_null {
                     *cell = edit.text;
                     self.modified = true;
+                }
+                if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    *m = false;
                 }
             }
         }
@@ -373,6 +418,13 @@ impl Spreadsheet {
                             cell.clear();
                             changed = true;
                         }
+                    }
+                }
+                // Clearing yields an empty string, not a null.
+                if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    if *m {
+                        *m = false;
+                        changed = true;
                     }
                 }
             }
@@ -973,10 +1025,6 @@ fn detect_delimiter(path: &Path) -> u8 {
     }
 }
 
-fn csv_err(e: csv::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("CSV write error: {}", e))
-}
-
 fn cell_grid_width(s: &str) -> usize {
     let first_line = s.split('\n').next().unwrap_or("");
     first_line.chars().map(|c| c.width().unwrap_or(1)).sum()
@@ -1333,6 +1381,54 @@ mod tests {
         let ss2 = Spreadsheet::from_file(&path).unwrap();
         assert_eq!(ss2.cell(1, 1), "has, comma edited");
         assert_eq!(ss2.cell(2, 1), "plain");
+    }
+
+    #[test]
+    fn distinguishes_null_from_empty_on_load() {
+        // Middle field unquoted-empty (,,) is a null; quoted "" is an empty string.
+        let path = write_tmp("sage_test_nulls.csv", "a,b,c\n1,,3\n4,\"\",6\n");
+        let ss = Spreadsheet::from_file(&path).unwrap();
+        assert!(ss.is_null(1, 1));
+        assert_eq!(ss.cell(1, 1), "");
+        assert!(!ss.is_null(2, 1));
+        assert_eq!(ss.cell(2, 1), "");
+        assert!(!ss.is_null(1, 0)); // an ordinary value
+    }
+
+    #[test]
+    fn save_preserves_null_vs_empty() {
+        let path = write_tmp("sage_test_null_save.csv", "a,b,c\n1,,3\n4,\"\",6\n");
+        let mut ss = Spreadsheet::from_file(&path).unwrap();
+        ss.save(&path).unwrap();
+        // Null stays an unquoted-empty field; the empty string stays quoted.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b,c\n1,,3\n4,\"\",6\n");
+        let ss2 = Spreadsheet::from_file(&path).unwrap();
+        assert!(ss2.is_null(1, 1));
+        assert!(!ss2.is_null(2, 1));
+    }
+
+    #[test]
+    fn editing_a_null_cell_clears_null() {
+        let path = write_tmp("sage_test_null_edit.csv", "a,b\n1,\n");
+        let mut ss = Spreadsheet::from_file(&path).unwrap();
+        assert!(ss.is_null(1, 1));
+        ss.cursor = (1, 1);
+        ss.enter_edit_mode();
+        ss.edit_insert_char('x');
+        ss.commit_edit();
+        assert!(!ss.is_null(1, 1));
+        assert_eq!(ss.cell(1, 1), "x");
+    }
+
+    #[test]
+    fn clearing_a_null_cell_makes_it_empty_string() {
+        let path = write_tmp("sage_test_null_clear.csv", "a,b\n1,\n");
+        let mut ss = Spreadsheet::from_file(&path).unwrap();
+        assert!(ss.is_null(1, 1));
+        ss.cursor = (1, 1);
+        ss.selection_anchor = Some((1, 1));
+        ss.clear_selection_content();
+        assert!(!ss.is_null(1, 1));
     }
 
     #[test]

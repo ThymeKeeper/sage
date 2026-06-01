@@ -1,246 +1,182 @@
-use reqwest::{Client, Response, StatusCode};
-use serde::{Deserialize, Serialize};
+//! Session-based Snowflake client built on `snowflake-connector-rs`.
+//!
+//! Unlike the stateless SQL API v2, this opens a real, stateful session via the
+//! driver login protocol (login-request → session token → query-request), so
+//! temporary tables and session variables persist across `execute()` calls. The
+//! PAT is supplied as the password (no MFA prompt). Each statement still runs in
+//! one session, so `USE` works natively — no client-side emulation needed.
+//!
+//! Cancellation is driven by `SnowflakeKernel`: the connector exposes no abort
+//! and hides the query id, so the kernel runs `SYSTEM$CANCEL_ALL_QUERIES(<id>)`
+//! from a throwaway control session. That's why we capture the session id at
+//! connect time.
+
 use std::error::Error;
-use std::time::Duration;
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
+
+use super::connector::{
+    SnowflakeAuthMethod, SnowflakeClient as SfClient, SnowflakeClientConfig, SnowflakeRow,
+    SnowflakeSession,
+};
 
 use super::config::SnowflakeConfig;
 
-/// Thin async client for Snowflake's public SQL API v2.
-///
-/// Authenticates with a Programmatic Access Token (PAT) passed as a Bearer
-/// token plus the `X-Snowflake-Authorization-Token-Type` header. All calls go
-/// through the same `reqwest::Client`, which is `Send + Sync + Clone`-cheap,
-/// so the kernel can hand `Arc<SnowflakeClient>` to both the execute thread
-/// and the cancel handle without contention.
-pub struct SnowflakeClient {
-    config: SnowflakeConfig,
-    token: String,
-    http: Client,
-    base_url: String,
-}
-
-#[derive(Serialize)]
-struct SubmitBody<'a> {
-    statement: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    database: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    schema: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warehouse: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<String>,
-}
-
-/// Match Snowpark / Python-connector behavior: unquoted identifiers (the 99%
-/// case) get folded to uppercase. SQL API v2 is strict about case — the docs
-/// say role/warehouse/database/schema values "must match the case of the field
-/// returned by a SQL SHOW command," which for unquoted names is uppercase.
-/// Already-quoted identifiers (anyone with truly lowercase role names) are
-/// left alone.
-fn fold_identifier(s: &str) -> String {
-    if s.starts_with('"') && s.ends_with('"') {
-        s.to_string()
-    } else {
-        s.to_uppercase()
-    }
-}
-
-/// Subset of the SQL API v2 response we care about. The API returns the same
-/// envelope shape for both 202 (still running) and 200 (completed) — the
-/// distinguishing fields (`data`, `resultSetMetaData`) only populate when done.
-#[derive(Debug, Clone, Deserialize)]
-pub struct StatusResponse {
-    #[serde(default)]
-    pub code: Option<String>,
-    #[serde(default)]
-    pub message: Option<String>,
-    #[serde(rename = "sqlState", default)]
-    pub sql_state: Option<String>,
-    #[serde(rename = "statementHandle", default)]
-    pub statement_handle: Option<String>,
-    #[serde(rename = "resultSetMetaData", default)]
-    pub result_set_meta_data: Option<ResultSetMetaData>,
-    /// One row per outer element; each row is one cell per inner element.
-    /// Values are JSON strings (Snowflake serializes numbers/dates as strings
-    /// in the JSON result format).
-    #[serde(default)]
-    pub data: Option<Vec<Vec<serde_json::Value>>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResultSetMetaData {
-    #[serde(rename = "numRows", default)]
-    pub num_rows: Option<u64>,
-    #[serde(rename = "rowType", default)]
-    pub row_type: Vec<ColumnMeta>,
-    /// One entry per partition (including partition 0). Snowflake returns
-    /// partition 0 inline with the initial poll response; later partitions
-    /// must be fetched with `?partition=N` to assemble the full result.
-    #[serde(rename = "partitionInfo", default)]
-    pub partition_info: Vec<PartitionInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PartitionInfo {
-    #[serde(rename = "rowCount", default)]
-    pub row_count: Option<u64>,
-    #[serde(rename = "uncompressedSize", default)]
-    pub uncompressed_size: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
+/// Column header for the table renderer: the column name (the connector returns
+/// these uppercased) and the Snowflake type string (e.g. "text", "fixed",
+/// "timestamp_ntz"). The type string drives numeric alignment, the dimmed type
+/// label, and temporal decoding over in `kernel.rs`.
+#[derive(Debug, Clone)]
 pub struct ColumnMeta {
     pub name: String,
-    #[serde(rename = "type", default)]
     pub type_name: String,
-    #[serde(default)]
-    pub nullable: Option<bool>,
+}
+
+/// Wraps the connector's client plus one live session. The client is retained
+/// so the kernel can mint short-lived control sessions (for cancellation) and
+/// so an expired session can be rebuilt via `reconnect`.
+pub struct SnowflakeClient {
+    sf: SfClient,
+    session: Arc<SnowflakeSession>,
+    session_id: String,
+    /// Held only for its `Drop`, which stops the session's heartbeat task.
+    _heartbeat: HeartbeatGuard,
 }
 
 impl SnowflakeClient {
-    pub fn new(config: SnowflakeConfig) -> Result<Self, Box<dyn Error>> {
-        let token = config.fetch_token()?;
-        let base_url = config.account_url();
-        let http = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .user_agent(concat!("sage/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        Ok(Self { config, token, http, base_url })
+    /// Open a session: read the PAT from the keyring, log in (no MFA), and
+    /// capture the session id for later cancellation.
+    pub async fn connect(config: &SnowflakeConfig) -> Result<Self, Box<dyn Error>> {
+        let pat = config.fetch_token()?;
+        let sf = SfClient::new(
+            &config.user,
+            SnowflakeAuthMethod::Password(pat),
+            SnowflakeClientConfig {
+                account: config.account.clone(),
+                role: config.role.clone(),
+                warehouse: config.warehouse.clone(),
+                database: config.database.clone(),
+                schema: config.schema.clone(),
+                // Per-statement poll budget. Generous so long analytical /
+                // ML-training queries aren't cut off client-side; Ctrl+Backspace
+                // (cancel) is the responsive stop, and token renewal keeps the
+                // poll authenticated across the session-token expiry.
+                timeout: Some(std::time::Duration::from_secs(24 * 60 * 60)),
+            },
+        )?;
+        let (session, session_id) = Self::open_session(&sf).await?;
+        let session = Arc::new(session);
+        let heartbeat = spawn_heartbeat(&session);
+        Ok(Self {
+            sf,
+            session,
+            session_id,
+            _heartbeat: heartbeat,
+        })
     }
 
-    /// Read the response body and deserialize as `StatusResponse`. On failure,
-    /// include HTTP status, Content-Encoding, and a body excerpt so the user
-    /// sees what Snowflake actually sent instead of just "error decoding
-    /// response body". Replaces `resp.json()` at every call site.
-    async fn parse_status(
-        resp: Response,
-    ) -> Result<(StatusCode, StatusResponse), Box<dyn Error + Send + Sync>> {
-        let status = resp.status();
-        let encoding = resp
-            .headers()
-            .get(reqwest::header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("identity")
-            .to_string();
-        let bytes = resp.bytes().await?;
-        match serde_json::from_slice::<StatusResponse>(&bytes) {
-            Ok(parsed) => Ok((status, parsed)),
-            Err(e) => {
-                let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(400)]);
-                Err(format!(
-                    "decoding response body failed (HTTP {}, encoding={}, {} bytes): {} — body starts: {:?}",
-                    status,
-                    encoding,
-                    bytes.len(),
-                    e,
-                    preview
-                )
-                .into())
-            }
-        }
+    /// Log in and read back `CURRENT_SESSION()` so we have an id to cancel.
+    async fn open_session(sf: &SfClient) -> Result<(SnowflakeSession, String), Box<dyn Error>> {
+        let session = sf.create_session().await?;
+        let rows = session.query("SELECT CURRENT_SESSION()").await?;
+        let session_id = rows
+            .first()
+            .and_then(|r| r.at::<Option<String>>(0).ok().flatten())
+            .ok_or("CURRENT_SESSION() returned no value")?;
+        Ok((session, session_id))
     }
 
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.header("Authorization", format!("Bearer {}", self.token))
-            .header(
-                "X-Snowflake-Authorization-Token-Type",
-                "PROGRAMMATIC_ACCESS_TOKEN",
-            )
-            .header("Accept", "application/json")
-    }
-
-    /// Submit a statement in async mode. Returns the `statementHandle` (a.k.a.
-    /// query_id) immediately, before the query starts producing results.
-    pub async fn submit_async(&self, statement: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let url = format!("{}/api/v2/statements?async=true", self.base_url);
-        let body = SubmitBody {
-            statement,
-            database: self.config.database.as_deref().map(fold_identifier),
-            schema: self.config.schema.as_deref().map(fold_identifier),
-            warehouse: self.config.warehouse.as_deref().map(fold_identifier),
-            role: self.config.role.as_deref().map(fold_identifier),
-        };
-        let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let (status, parsed) = Self::parse_status(resp).await?;
-        // 202 is the expected async-submit response; 200 happens if Snowflake
-        // chose to execute synchronously despite the async hint (small queries).
-        if status != StatusCode::ACCEPTED && status != StatusCode::OK {
-            return Err(format!(
-                "submit failed (HTTP {}): {} {}",
-                status,
-                parsed.code.as_deref().unwrap_or(""),
-                parsed.message.as_deref().unwrap_or("")
-            )
-            .into());
-        }
-        parsed
-            .statement_handle
-            .ok_or_else(|| "submit returned no statementHandle".into())
-    }
-
-    /// Check status / fetch results for a previously-submitted statement.
-    /// Returns `(done, response)`. When `done` is `false` the response is just
-    /// status metadata; when `true`, `response.data` holds the result rows.
-    pub async fn poll(&self, handle: &str) -> Result<(bool, StatusResponse), Box<dyn Error + Send + Sync>> {
-        let url = format!("{}/api/v2/statements/{}", self.base_url, handle);
-        let resp = self.auth(self.http.get(&url)).send().await?;
-        let (status, parsed) = Self::parse_status(resp).await?;
-        match status {
-            StatusCode::OK => Ok((true, parsed)),
-            StatusCode::ACCEPTED => Ok((false, parsed)),
-            _ => Err(format!(
-                "poll failed (HTTP {}): {} {}",
-                status,
-                parsed.code.as_deref().unwrap_or(""),
-                parsed.message.as_deref().unwrap_or("")
-            )
-            .into()),
-        }
-    }
-
-    /// Fetch one additional partition of a completed statement's result set.
-    /// Partition 0 already comes back inline with `poll`, so this is called
-    /// for partitions 1..N. Returns the row data as parsed JSON values.
-    pub async fn fetch_partition(
-        &self,
-        handle: &str,
-        partition: usize,
-    ) -> Result<Vec<Vec<serde_json::Value>>, Box<dyn Error + Send + Sync>> {
-        let url = format!(
-            "{}/api/v2/statements/{}?partition={}",
-            self.base_url, handle, partition
-        );
-        let resp = self.auth(self.http.get(&url)).send().await?;
-        let (status, parsed) = Self::parse_status(resp).await?;
-        if status != StatusCode::OK {
-            return Err(format!(
-                "fetch partition {} failed (HTTP {}): {} {}",
-                partition,
-                status,
-                parsed.code.as_deref().unwrap_or(""),
-                parsed.message.as_deref().unwrap_or("")
-            )
-            .into());
-        }
-        Ok(parsed.data.unwrap_or_default())
-    }
-
-    /// Tell Snowflake to cancel a running statement. Idempotent: cancelling a
-    /// statement that's already finished is a no-op as far as the caller is
-    /// concerned — we treat 4xx as success here so a slow Ctrl+Backspace
-    /// doesn't surface a spurious error.
-    pub async fn abort(&self, handle: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let url = format!("{}/api/v2/statements/{}/cancel", self.base_url, handle);
-        let resp = self.auth(self.http.post(&url)).send().await?;
-        let status = resp.status();
-        if status.is_server_error() {
-            return Err(format!("abort failed (HTTP {})", status).into());
-        }
+    /// Rebuild the session after expiry. Session-local state (temp tables,
+    /// variables) is gone with the old session; the caller surfaces that.
+    pub async fn reconnect(&mut self) -> Result<(), Box<dyn Error>> {
+        let (session, session_id) = Self::open_session(&self.sf).await?;
+        let session = Arc::new(session);
+        let heartbeat = spawn_heartbeat(&session);
+        self.session = session;
+        self.session_id = session_id;
+        // Replacing the guard drops the old one, stopping the previous session's
+        // heartbeat task.
+        self._heartbeat = heartbeat;
         Ok(())
     }
 
-    pub fn config(&self) -> &SnowflakeConfig {
-        &self.config
+    /// Cheap `Arc` clone of the live session for the execute path.
+    pub fn session(&self) -> Arc<SnowflakeSession> {
+        self.session.clone()
     }
+
+    /// Clone of the underlying connector client, used to mint a throwaway
+    /// control session for cancellation without disturbing the live session.
+    pub fn control_client(&self) -> SfClient {
+        self.sf.clone()
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+/// Column headers from a result row — the connector's only public source of
+/// column metadata (so a zero-row result yields no headers).
+pub fn columns_of(row: &SnowflakeRow) -> Vec<ColumnMeta> {
+    row.column_types()
+        .into_iter()
+        .map(|c| ColumnMeta {
+            name: c.name().to_string(),
+            type_name: c.column_type().snowflake_type().to_string(),
+        })
+        .collect()
+}
+
+/// Convert one result row into the `serde_json::Value` cells the table renderer
+/// and CSV spool consume. Every cell is read as its raw string (NULL → Null);
+/// temporal decoding to ISO 8601 happens later in `kernel.rs`, keyed off the
+/// column type — exactly as it did for the SQL API's JSON values.
+pub fn row_to_values(row: &SnowflakeRow, ncols: usize) -> Vec<serde_json::Value> {
+    (0..ncols)
+        .map(|i| match row.at::<Option<String>>(i) {
+            Ok(Some(s)) => serde_json::Value::String(s),
+            _ => serde_json::Value::Null,
+        })
+        .collect()
+}
+
+/// Cancels the session's heartbeat task on drop (disconnect or reconnect).
+struct HeartbeatGuard(CancellationToken);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Spawn a background task that renews the session token on a timer, so the
+/// session — and its temp tables / session variables — survives the (~1h,
+/// fixed) session-token expiry whether the kernel is idle or running a long
+/// query. Holds a `Weak`, so it exits once the session is dropped; the returned
+/// guard cancels it promptly on disconnect/reconnect. Must be called from
+/// within the tokio runtime (it is — via the kernel's `block_on`).
+fn spawn_heartbeat(session: &Arc<SnowflakeSession>) -> HeartbeatGuard {
+    let weak = Arc::downgrade(session);
+    let interval = session.renew_interval();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = task_cancel.cancelled() => break,
+                _ = tokio::time::sleep(interval) => {
+                    let Some(session) = weak.upgrade() else { break };
+                    if session.renew().await.is_err() {
+                        // Master token likely lapsed; stop renewing. The next
+                        // user statement hits an expired session and the kernel
+                        // reconnects fresh.
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    HeartbeatGuard(cancel)
 }

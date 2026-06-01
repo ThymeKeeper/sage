@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use super::connector::{SnowflakeClient as SfClient, SnowflakeSession};
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -12,7 +12,7 @@ use crate::kernel::{
     SqlMetadata, TypeRelationships,
 };
 
-use super::client::{SnowflakeClient, StatusResponse};
+use super::client::{ColumnMeta, SnowflakeClient};
 use super::config::SnowflakeConfig;
 
 /// Maximum rows rendered inline in the output pane. Anything beyond this is
@@ -22,13 +22,11 @@ use super::config::SnowflakeConfig;
 const PREVIEW_ROW_LIMIT: usize = 100;
 
 /// Per-execution state shared between the executing thread and the cancel
-/// handle. Wrapped in `Arc<Mutex<...>>` so the host can read the current
-/// `statementHandle` to abort it without taking ownership of the kernel.
+/// handle. Wrapped in `Arc<Mutex<...>>` so the host can short-circuit the
+/// in-flight execute() without taking ownership of the kernel.
 struct QueryState {
-    /// statementHandle (query_id) of the active query, set after submit returns
-    /// and cleared when execute completes (success, error, or cancel).
-    current_qid: Option<String>,
-    /// Fresh token per execute(); cancelling it short-circuits the poll loop.
+    /// Fresh token per execute(); cancelling it makes execute() return at once
+    /// while the abort (SYSTEM$CANCEL_ALL_QUERIES) fires on a detached thread.
     cancel_token: CancellationToken,
 }
 
@@ -38,7 +36,7 @@ struct QueryState {
 pub struct SnowflakeKernel {
     info: KernelInfo,
     config: SnowflakeConfig,
-    client: Option<Arc<SnowflakeClient>>,
+    client: Option<SnowflakeClient>,
     rt: Arc<Runtime>,
     state: Arc<Mutex<QueryState>>,
     /// Sequence counter shown in cell prompts; mirrors DirectKernel's counter
@@ -53,10 +51,10 @@ pub struct SnowflakeKernel {
 
 impl SnowflakeKernel {
     pub fn new(config: SnowflakeConfig) -> Result<Self, Box<dyn Error>> {
-        // Multi-thread runtime is required: execute() block_ons the poll loop
-        // on the background execution thread, while cancel() block_ons the
-        // abort call from a different OS thread. Current-thread runtime can't
-        // satisfy both at once.
+        // Multi-thread runtime is required: execute() block_ons the query on the
+        // background execution thread, while cancel() block_ons the abort call
+        // from a different OS thread. A current-thread runtime can't do both,
+        // and the connector spawns its own tasks for chunk downloads.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -75,7 +73,6 @@ impl SnowflakeKernel {
             client: None,
             rt: Arc::new(rt),
             state: Arc::new(Mutex::new(QueryState {
-                current_qid: None,
                 cancel_token: CancellationToken::new(),
             })),
             execution_count: 0,
@@ -83,17 +80,29 @@ impl SnowflakeKernel {
         })
     }
 
+    /// Rebuild the session after expiry. Best-effort: on failure the client is
+    /// left as-is and the next execute() will surface the error again.
+    fn reconnect_session(&mut self) -> Result<(), Box<dyn Error>> {
+        let rt = self.rt.clone();
+        if let Some(client) = self.client.as_mut() {
+            rt.block_on(client.reconnect())?;
+        }
+        Ok(())
+    }
 }
 
 /// Result of one streamed execute(): the preview rows kept in memory for the
-/// output pane, the metadata, the row count, the spool tempfile (if any),
-/// and the server's message line (used as fallback display for DDL/DML).
+/// output pane, the column headers (absent only for a zero-row result, where
+/// the connector exposes no metadata), the total row count, and the spool
+/// tempfile holding the full result set (if any rows were produced).
 struct ExecuteOutcome {
     preview: Vec<Vec<serde_json::Value>>,
-    meta: Option<super::client::ResultSetMetaData>,
+    columns: Option<Vec<ColumnMeta>>,
     total_rows: u64,
     spool: Option<NamedTempFile>,
-    message: Option<String>,
+    /// Snowflake query id of this statement, shown in the footer so the user
+    /// can reattach to it later via RESULT_SCAN.
+    query_id: Option<String>,
 }
 
 /// Append a partition's rows to the spool CSV and capture the first
@@ -111,26 +120,110 @@ fn write_partition_and_capture_preview(
     preview: &mut Vec<Vec<serde_json::Value>>,
     preview_limit: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut wtr = csv::WriterBuilder::new()
-        .has_headers(false)
-        .from_writer(file);
-    let mut record: Vec<String> = Vec::new();
+    use std::io::Write as _;
+    let mut line = String::new();
     for row in rows {
-        record.clear();
+        line.clear();
+        let capture = preview.len() < preview_limit;
+        let mut display_row: Vec<serde_json::Value> =
+            if capture { Vec::with_capacity(row.len()) } else { Vec::new() };
         for (i, cell) in row.iter().enumerate() {
             let kind = kinds.get(i).copied().unwrap_or(TemporalKind::None);
-            record.push(cell_to_display_string(cell, kind));
+            let display = cell_to_display_string(cell, kind);
+            if i > 0 {
+                line.push(',');
+            }
+            // Encode a SQL null as an unquoted-empty field (the crate::dsv
+            // convention) so the CSV/TSV viewer shows it as ∅; non-null cells
+            // write their display string, with empty strings quoted as "".
+            let field = if cell.is_null() { None } else { Some(display.as_str()) };
+            crate::dsv::serialize_field(&mut line, field, b',');
+            if capture {
+                // Re-wrap the decoded string for the preview the table renderer
+                // consumes (nulls already rendered as ∅ by cell_to_string).
+                display_row.push(serde_json::Value::String(display));
+            }
         }
-        if preview.len() < preview_limit {
-            // Re-wrap the decoded strings as JSON values for the preview the
-            // table renderer consumes. Bounded to preview_limit rows, so the
-            // clone here is cheap regardless of total result size.
-            preview.push(record.iter().cloned().map(serde_json::Value::String).collect());
+        line.push('\n');
+        file.write_all(line.as_bytes())?;
+        if capture {
+            preview.push(display_row);
         }
-        wtr.write_record(&record)?;
     }
-    wtr.flush()?;
     Ok(())
+}
+
+/// Run one statement on the session and stream its result set into a spool CSV,
+/// capturing the first `preview_limit` rows for the output pane. Chunks are
+/// fetched and written one at a time, so memory peaks at one chunk plus the
+/// preview regardless of total result size. Column headers are taken from the
+/// first row (the connector's only metadata source), so a zero-row result
+/// yields `columns: None` and no spool.
+async fn run_query(
+    session: &SnowflakeSession,
+    code: &str,
+    preview_limit: usize,
+) -> Result<ExecuteOutcome, Box<dyn Error + Send + Sync>> {
+    let executor = session.execute(code).await?;
+    let query_id = executor.query_id().map(|s| s.to_string());
+
+    let mut preview: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut columns: Option<Vec<ColumnMeta>> = None;
+    let mut kinds: Vec<TemporalKind> = Vec::new();
+    let mut spool: Option<NamedTempFile> = None;
+    let mut total_rows: u64 = 0;
+
+    while let Some(batch) = executor.fetch_next_chunk().await? {
+        if batch.is_empty() {
+            continue;
+        }
+        // First non-empty chunk: derive columns, classify temporal types once,
+        // and open the spool with its header row.
+        if columns.is_none() {
+            let cols = super::client::columns_of(&batch[0]);
+            kinds = cols.iter().map(|c| temporal_kind(&c.type_name)).collect();
+            let mut tmp = tempfile::Builder::new()
+                .prefix("sage-snowflake-")
+                .suffix(".csv")
+                .tempfile()?;
+            {
+                use std::io::Write as _;
+                let mut line = String::new();
+                for (i, c) in cols.iter().enumerate() {
+                    if i > 0 {
+                        line.push(',');
+                    }
+                    crate::dsv::serialize_field(&mut line, Some(&c.name), b',');
+                }
+                line.push('\n');
+                tmp.as_file_mut().write_all(line.as_bytes())?;
+            }
+            spool = Some(tmp);
+            columns = Some(cols);
+        }
+
+        let ncols = columns.as_ref().map(|c| c.len()).unwrap_or(0);
+        let rows: Vec<Vec<serde_json::Value>> = batch
+            .iter()
+            .map(|r| super::client::row_to_values(r, ncols))
+            .collect();
+        total_rows += rows.len() as u64;
+        write_partition_and_capture_preview(
+            spool.as_mut().unwrap().as_file_mut(),
+            &rows,
+            &kinds,
+            &mut preview,
+            preview_limit,
+        )?;
+    }
+
+    Ok(ExecuteOutcome {
+        preview,
+        columns,
+        total_rows,
+        spool,
+        query_id,
+    })
 }
 
 impl Kernel for SnowflakeKernel {
@@ -138,22 +231,27 @@ impl Kernel for SnowflakeKernel {
         if self.client.is_some() {
             return Ok(());
         }
-        let client = SnowflakeClient::new(self.config.clone())?;
-        self.client = Some(Arc::new(client));
+        // create_session() is async; block_on it on the kernel's runtime. Clone
+        // config/rt first so neither borrow of self outlives the assignment.
+        let config = self.config.clone();
+        let rt = self.rt.clone();
+        let client = rt.block_on(SnowflakeClient::connect(&config))?;
+        self.client = Some(client);
         Ok(())
     }
 
     fn execute(&mut self, code: &str) -> Result<ExecutionResult, Box<dyn Error>> {
-        let client = self
+        let session = self
             .client
             .as_ref()
             .ok_or("Snowflake kernel not connected")?
-            .clone();
+            .session();
 
-        // Reset per-execute state: fresh cancel token, clear any stale qid.
+        // Fresh cancel token for this statement. Cancelling it short-circuits
+        // the select! below so execute() returns immediately; the cancel handle
+        // separately aborts the query server-side.
         let token = {
             let mut st = self.state.lock().unwrap();
-            st.current_qid = None;
             st.cancel_token = CancellationToken::new();
             st.cancel_token.clone()
         };
@@ -162,131 +260,66 @@ impl Kernel for SnowflakeKernel {
         self.last_result_file = None;
 
         self.execution_count += 1;
-        let state = self.state.clone();
+        let rt = self.rt.clone();
         let code = code.to_string();
 
-        // Streamed execution: each partition is fetched, written to the spool
-        // tempfile, and dropped before fetching the next. Memory usage peaks
-        // at one partition + the preview rows (PREVIEW_ROW_LIMIT max),
-        // independent of total result size.
-        let outcome: Result<
-            ExecuteOutcome,
-            Box<dyn Error + Send + Sync>,
-        > = self.rt.block_on(async move {
-            let qid = client.submit_async(&code).await?;
-            state.lock().unwrap().current_qid = Some(qid.clone());
-
-            // Poll loop: respect the cancel token, otherwise wait 250ms between
-            // status checks. The 250ms cadence keeps "Executing... 1.2s" timer
-            // updates feeling live without hammering Snowflake.
-            let mut resp = loop {
+        // Run the statement, racing it against cancellation. The query streams
+        // chunk-by-chunk into the spool (see run_query), so memory peaks at one
+        // chunk + the preview rows regardless of result size.
+        let outcome: Result<ExecuteOutcome, Box<dyn Error + Send + Sync>> =
+            rt.block_on(async move {
                 tokio::select! {
-                    _ = token.cancelled() => {
-                        return Err("cancelled by user".into());
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    biased;
+                    _ = token.cancelled() => Err("cancelled by user".into()),
+                    res = run_query(&session, &code, PREVIEW_ROW_LIMIT) => res,
                 }
-                let (done, r) = client.poll(&qid).await?;
-                if done {
-                    break r;
-                }
-            };
-
-            let meta = match resp.result_set_meta_data.take() {
-                Some(m) => m,
-                None => {
-                    // DDL/DML success with no result set.
-                    return Ok(ExecuteOutcome {
-                        preview: Vec::new(),
-                        meta: None,
-                        total_rows: 0,
-                        spool: None,
-                        message: resp.message.clone(),
-                    });
-                }
-            };
-            let total_rows = meta.num_rows.unwrap_or(0);
-            let partition_count = meta.partition_info.len().max(1);
-
-            // No columns -> still treat as DDL/DML.
-            if meta.row_type.is_empty() {
-                return Ok(ExecuteOutcome {
-                    preview: Vec::new(),
-                    meta: Some(meta),
-                    total_rows,
-                    spool: None,
-                    message: resp.message.clone(),
-                });
-            }
-
-            // Open the spool tempfile and write the header up front.
-            let mut tmp = tempfile::Builder::new()
-                .prefix("sage-snowflake-")
-                .suffix(".csv")
-                .tempfile()?;
-            {
-                let mut wtr = csv::Writer::from_writer(tmp.as_file_mut());
-                wtr.write_record(meta.row_type.iter().map(|c| &c.name))?;
-                wtr.flush()?;
-            }
-
-            // Classify each column once so temporal cells decode to ISO 8601
-            // as partitions stream through (shared by the spool and preview).
-            let kinds: Vec<TemporalKind> =
-                meta.row_type.iter().map(|c| temporal_kind(&c.type_name)).collect();
-
-            // Process partition 0 (came back inline with the poll).
-            let mut preview: Vec<Vec<serde_json::Value>> = Vec::new();
-            let part0 = resp.data.take().unwrap_or_default();
-            write_partition_and_capture_preview(
-                tmp.as_file_mut(),
-                &part0,
-                &kinds,
-                &mut preview,
-                PREVIEW_ROW_LIMIT,
-            )?;
-            drop(part0);
-
-            // Fetch remaining partitions one at a time, write, drop.
-            for partition in 1..partition_count {
-                if token.is_cancelled() {
-                    return Err("cancelled by user".into());
-                }
-                let part = client.fetch_partition(&qid, partition).await?;
-                write_partition_and_capture_preview(
-                    tmp.as_file_mut(),
-                    &part,
-                    &kinds,
-                    &mut preview,
-                    PREVIEW_ROW_LIMIT,
-                )?;
-                drop(part);
-            }
-
-            Ok(ExecuteOutcome {
-                preview,
-                meta: Some(meta),
-                total_rows,
-                spool: Some(tmp),
-                message: resp.message.clone(),
-            })
-        });
-
-        // Clear qid regardless of outcome — the query is no longer "current".
-        self.state.lock().unwrap().current_qid = None;
+            });
 
         let outputs = match outcome {
             Ok(out) => {
                 if let Some(tmp) = out.spool {
                     self.last_result_file = Some(tmp);
                 }
-                format_outcome(out.meta.as_ref(), &out.preview, out.total_rows, &out.message)
+                format_outcome(
+                    out.columns.as_deref(),
+                    &out.preview,
+                    out.total_rows,
+                    out.query_id.as_deref(),
+                )
             }
-            Err(e) => vec![ExecutionOutput::Error {
-                ename: "SnowflakeError".to_string(),
-                evalue: e.to_string(),
-                traceback: vec![],
-            }],
+            Err(e) => {
+                let msg = e.to_string();
+                let lower = msg.to_ascii_lowercase();
+                // Token renewal (the heartbeat plus reactive renewal on 390112)
+                // normally keeps the session alive. If an auth-expiry still
+                // surfaces here — session token (390112) or master token
+                // (390114), i.e. renewal has lapsed — rebuild the session so the
+                // next statement works and tell the user their session-local
+                // state was reset.
+                // A QueryInterrupted error ("…may still be running…") must keep
+                // its reattach hint rather than be turned into a reconnect.
+                let expired = !lower.contains("may still be running")
+                    && (lower.contains("session expired")
+                        || lower.contains("authentication token has expired")
+                        || lower.contains("390114"));
+                if expired {
+                    let _ = self.reconnect_session();
+                    vec![ExecutionOutput::Error {
+                        ename: "SnowflakeError".to_string(),
+                        evalue: "Session expired and was reconnected — session-local \
+                                 state (temporary tables, variables) was reset. Re-run \
+                                 any setup statements."
+                            .to_string(),
+                        traceback: vec![],
+                    }]
+                } else {
+                    vec![ExecutionOutput::Error {
+                        ename: "SnowflakeError".to_string(),
+                        evalue: msg,
+                        traceback: vec![],
+                    }]
+                }
+            }
         };
 
         let success = !outputs
@@ -304,8 +337,9 @@ impl Kernel for SnowflakeKernel {
     }
 
     fn disconnect(&mut self) -> Result<(), Box<dyn Error>> {
-        // PAT-authenticated requests are stateless server-side. Drop the
-        // client; the next connect() rebuilds it.
+        // Dropping the wrapper drops the session; Snowflake reclaims it on its
+        // idle timeout (the connector exposes no explicit logout). The next
+        // connect() logs in fresh. Session-local state is intentionally gone.
         self.client = None;
         Ok(())
     }
@@ -319,9 +353,10 @@ impl Kernel for SnowflakeKernel {
     }
 
     fn cancel_handle(&self) -> Option<Arc<dyn CancelHandle>> {
-        let client = self.client.as_ref()?.clone();
+        let client = self.client.as_ref()?;
         let handle: Arc<dyn CancelHandle> = Arc::new(SnowflakeCancelHandle {
-            client,
+            control: client.control_client(),
+            session_id: client.session_id().to_string(),
             rt: self.rt.clone(),
             state: self.state.clone(),
         });
@@ -329,8 +364,9 @@ impl Kernel for SnowflakeKernel {
     }
 
     fn cancel_preserves_session(&self) -> bool {
-        // Cancellation just POSTs an abort and short-circuits the poll loop;
-        // the HTTP client (PAT, base URL) and tokio runtime stay alive.
+        // Cancellation aborts the running query via SYSTEM$CANCEL_ALL_QUERIES
+        // and short-circuits the execute() select!; the login session, HTTP
+        // client, and runtime all stay alive, so the kernel is reusable.
         true
     }
 
@@ -339,65 +375,75 @@ impl Kernel for SnowflakeKernel {
     }
 }
 
-/// Cancels an in-flight Snowflake statement by POSTing to the abort endpoint.
-/// The cancel token short-circuits the poll loop immediately (host UI returns
-/// to responsive); the abort fires on a detached OS thread so the cancel call
-/// itself never blocks the UI.
+/// Cancels the in-flight statement. The cancel token short-circuits execute()
+/// immediately (host UI returns to responsive); the server-side abort runs
+/// `SYSTEM$CANCEL_ALL_QUERIES(<session_id>)` from a throwaway control session on
+/// a detached OS thread, so the cancel call never blocks the UI. The function
+/// is session-scoped — it only touches queries in this kernel's session, not
+/// other sessions under the same user.
 struct SnowflakeCancelHandle {
-    client: Arc<SnowflakeClient>,
+    control: SfClient,
+    session_id: String,
     rt: Arc<Runtime>,
     state: Arc<Mutex<QueryState>>,
 }
 
 impl CancelHandle for SnowflakeCancelHandle {
     fn cancel(&self) {
-        let qid = {
-            let st = self.state.lock().unwrap();
-            st.cancel_token.cancel();
-            st.current_qid.clone()
-        };
-        if let Some(qid) = qid {
-            let client = self.client.clone();
-            let rt = self.rt.clone();
-            std::thread::spawn(move || {
-                rt.block_on(async move {
-                    let _ = client.abort(&qid).await;
-                });
+        self.state.lock().unwrap().cancel_token.cancel();
+        let control = self.control.clone();
+        let session_id = self.session_id.clone();
+        let rt = self.rt.clone();
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                if let Ok(session) = control.create_session().await {
+                    let _ = session
+                        .query(format!("SELECT SYSTEM$CANCEL_ALL_QUERIES({session_id})"))
+                        .await;
+                }
             });
-        }
+        });
     }
 }
 
-/// Render an ExecuteOutcome as ExecutionOutput entries. For row results,
-/// builds a DuckDB-style table from the in-memory preview and notes how
-/// many additional rows are on disk. For DDL/DML, shows the server message.
+/// Render an ExecuteOutcome as ExecutionOutput entries. For row results, builds
+/// a DuckDB-style table from the in-memory preview and notes how many more rows
+/// are on disk. DDL/DML come back as a one-row status result and render as a
+/// small table; a genuinely empty result set has no columns to show.
 fn format_outcome(
-    meta: Option<&super::client::ResultSetMetaData>,
+    columns: Option<&[ColumnMeta]>,
     preview: &[Vec<serde_json::Value>],
     total_rows: u64,
-    message: &Option<String>,
+    query_id: Option<&str>,
 ) -> Vec<ExecutionOutput> {
-    let meta = match meta {
-        Some(m) if !m.row_type.is_empty() => m,
-        _ => {
-            let msg = message
-                .clone()
-                .unwrap_or_else(|| "Statement executed.".to_string());
-            return vec![ExecutionOutput::Stdout(msg + "\n")];
-        }
+    let id = query_id_suffix(query_id);
+    let columns = match columns {
+        Some(c) if !c.is_empty() => c,
+        // Zero-row results expose no column metadata via the connector.
+        _ => return vec![ExecutionOutput::Stdout(format!("(0 rows){id}\n"))],
     };
 
-    let table = render_table(&meta.row_type, preview);
+    let table = render_table(columns, preview);
     let shown = preview.len() as u64;
-    let footer = if shown < total_rows {
+    let count = if shown < total_rows {
         format!(
-            "\n(showing first {} of {} rows — F9 to export full result)\n",
+            "(showing first {} of {} rows — F9 to export full result)",
             shown, total_rows
         )
     } else {
-        format!("\n({} row{})\n", total_rows, if total_rows == 1 { "" } else { "s" })
+        format!("({} row{})", total_rows, if total_rows == 1 { "" } else { "s" })
     };
-    vec![ExecutionOutput::Result(table + &footer)]
+    vec![ExecutionOutput::Result(format!("{table}\n{count}{id}\n"))]
+}
+
+/// A trailing " · query <id>" note for the result footer, enabling reattach via
+/// `SELECT * FROM TABLE(RESULT_SCAN('<id>'))`. Plain text (no ANSI) so it
+/// renders the same in any output kind.
+fn query_id_suffix(query_id: Option<&str>) -> String {
+    match query_id {
+        Some(id) if !id.is_empty() => format!("  ·  query {id}"),
+        _ => String::new(),
+    }
 }
 
 // Unicode box-drawing characters for the DuckDB-style table renderer.
@@ -415,13 +461,24 @@ const BOX_TT: char = '┬';
 const BOX_BT: char = '┴';
 const BOX_X: char = '┼';
 
+/// ANSI used to dim the type-name header and null (∅) cells: an explicit muted
+/// grey foreground (256-color 244), closed with SGR 39 (default foreground) so
+/// the surrounding background is left intact. An explicit colour rather than
+/// SGR 2 (faint) because faint isn't rendered by every terminal (e.g. it shows
+/// undimmed in the output pane), whereas 256-colour is.
+const DIM: (&str, &str) = ("\x1b[38;5;244m", "\x1b[39m");
+
+/// Glyph displayed for a SQL null (distinct from an empty string). Rendered
+/// dimly (see DIM) in the output-pane table.
+const NULL_SENTINEL: &str = "∅";
+
 /// Render result rows as a DuckDB-style boxed table. Two header rows: the
 /// column names on top, the Snowflake type names dimmed below (e.g. TEXT,
 /// FIXED, REAL, TIMESTAMP_NTZ). Numeric columns are right-aligned (detected
 /// by type name); everything else left-aligned. Cells truncated at
 /// `MAX_CELL` with `…`.
 fn render_table(
-    columns: &[super::client::ColumnMeta],
+    columns: &[ColumnMeta],
     rows: &[Vec<serde_json::Value>],
 ) -> String {
     use unicode_width::UnicodeWidthStr;
@@ -463,18 +520,16 @@ fn render_table(
         columns.iter().map(|c| c.name.as_str()),
         &widths,
         &vec![Align::Left; widths.len()],
-        None,
+        |_| None,
     );
-    // Type row: dimmed via ANSI SGR 2, closed with a full reset (SGR 0).
-    // Closing with SGR 22 alone (intensity-only reset) isn't honored by
-    // every terminal — full reset is the compatibility-safe choice. The
-    // same code path that color-codes Python errors handles these escapes.
+    // Type row: dimmed to a muted grey (see DIM). The output pane preserves
+    // these escapes when it renders the result text.
     push_row(
         &mut out,
         type_labels.iter().map(|s| s.as_str()),
         &widths,
         &vec![Align::Left; widths.len()],
-        Some(("\x1b[2m", "\x1b[0m")),
+        |_| Some(DIM),
     );
     push_border(&mut out, &widths, BOX_LT, BOX_X, BOX_RT);
     for row in rows {
@@ -482,15 +537,24 @@ fn render_table(
             .map(|i| {
                 row.get(i)
                     .map(cell_to_string)
-                    .unwrap_or_else(|| "NULL".to_string())
+                    .unwrap_or_else(|| NULL_SENTINEL.to_string())
             })
             .collect();
+        // Dim by rendered glyph, not JSON type: the preview feeds us nulls as
+        // the already-decoded display string (cell_to_string turned Value::Null
+        // into the sentinel upstream), so there's no Value::Null left to test.
         push_row(
             &mut out,
             cells.iter().map(|s| s.as_str()),
             &widths,
             &aligns,
-            None,
+            |i| {
+                if cells.get(i).map(|s| s == NULL_SENTINEL).unwrap_or(false) {
+                    Some(DIM)
+                } else {
+                    None
+                }
+            },
         );
     }
     push_border(&mut out, &widths, BOX_BL, BOX_BT, BOX_BR);
@@ -549,16 +613,17 @@ fn push_row<'a, I: IntoIterator<Item = &'a str>>(
     cells: I,
     widths: &[usize],
     aligns: &[Align],
-    ansi: Option<(&str, &str)>,
+    ansi: impl Fn(usize) -> Option<(&'static str, &'static str)>,
 ) {
     use unicode_width::UnicodeWidthStr;
     out.push(BOX_V);
     for (i, (cell, &w)) in cells.into_iter().zip(widths.iter()).enumerate() {
+        let cell_ansi = ansi(i);
         let truncated = truncate(cell, w);
         let cell_w = UnicodeWidthStr::width(truncated.as_str());
         let pad = w.saturating_sub(cell_w);
         out.push(' ');
-        if let Some((open, _)) = ansi {
+        if let Some((open, _)) = cell_ansi {
             out.push_str(open);
         }
         match aligns.get(i).copied().unwrap_or(Align::Left) {
@@ -575,7 +640,7 @@ fn push_row<'a, I: IntoIterator<Item = &'a str>>(
                 out.push_str(&truncated);
             }
         }
-        if let Some((_, close)) = ansi {
+        if let Some((_, close)) = cell_ansi {
             out.push_str(close);
         }
         out.push(' ');
@@ -586,7 +651,10 @@ fn push_row<'a, I: IntoIterator<Item = &'a str>>(
 
 fn cell_to_string(v: &serde_json::Value) -> String {
     match v {
-        serde_json::Value::Null => "NULL".to_string(),
+        // Display nulls as the ∅ sentinel (matches the CSV/TSV viewer). The CSV
+        // spool encodes nulls structurally instead — see
+        // write_partition_and_capture_preview — so this only affects rendering.
+        serde_json::Value::Null => NULL_SENTINEL.to_string(),
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
@@ -674,13 +742,16 @@ fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<Strin
         TemporalKind::TimestampTz => {
             // "<fractional seconds since epoch> <offset>", where the offset is
             // the timezone offset in minutes biased by +1440 (so 1440 == UTC).
-            let mut parts = raw.split_whitespace();
-            let ts = parts.next().unwrap_or("");
-            let offset_minutes = parts
-                .next()
-                .and_then(|o| o.parse::<i64>().ok())
-                .map(|o| o - 1440)
-                .unwrap_or(0);
+            // Require exactly those two parts: the driver protocol can also emit
+            // a single float with the offset baked in, which this decoder can't
+            // interpret — fall back to the raw string rather than show a wrong
+            // time.
+            let parts: Vec<&str> = raw.split_whitespace().collect();
+            if parts.len() != 2 {
+                return None;
+            }
+            let ts = parts[0];
+            let offset_minutes = parts[1].parse::<i64>().ok().map(|o| o - 1440)?;
             parse_fractional_seconds(ts).and_then(|(secs, nanos)| {
                 FixedOffset::east_opt((offset_minutes * 60) as i32).and_then(|off| {
                     Utc.timestamp_opt(secs, nanos).single().map(|dt| {
@@ -853,10 +924,56 @@ mod tests {
         assert_eq!(disp("hello", TemporalKind::None), "hello");
         // A temporal column whose cell can't be parsed keeps its raw text.
         assert_eq!(disp("not-a-number", TemporalKind::Date), "not-a-number");
-        // NULL cells fall back to the plain NULL rendering.
+        // NULL cells render as the ∅ sentinel.
         assert_eq!(
             cell_to_display_string(&Value::Null, TemporalKind::TimestampNtz),
-            "NULL"
+            "∅"
         );
+    }
+
+    #[test]
+    fn spool_encodes_null_distinctly_and_preview_shows_sentinel() {
+        use std::io::{Read, Seek};
+        let rows = vec![vec![
+            Value::String("a".into()),
+            Value::Null,
+            Value::String(String::new()),
+        ]];
+        let kinds = vec![TemporalKind::None; 3];
+        let mut preview: Vec<Vec<Value>> = Vec::new();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write_partition_and_capture_preview(tmp.as_file_mut(), &rows, &kinds, &mut preview, 100)
+            .unwrap();
+
+        // On disk: null -> unquoted-empty (,,), empty string -> quoted "".
+        let mut content = String::new();
+        tmp.as_file_mut().seek(std::io::SeekFrom::Start(0)).unwrap();
+        tmp.as_file_mut().read_to_string(&mut content).unwrap();
+        assert_eq!(content, "a,,\"\"\n");
+
+        // In the output-pane preview: null shows the ∅ sentinel, "" stays blank.
+        assert_eq!(preview[0][0], Value::String("a".into()));
+        assert_eq!(preview[0][1], Value::String("∅".into()));
+        assert_eq!(preview[0][2], Value::String(String::new()));
+    }
+
+    #[test]
+    fn render_table_dims_null_cells() {
+        let columns = vec![ColumnMeta {
+            name: "x".to_string(),
+            type_name: "TEXT".to_string(),
+        }];
+        // The preview feeds render_table already-decoded display strings, so a
+        // null arrives as the sentinel *string* (not Value::Null) — the case the
+        // real flow hits. Include a literal Value::Null too for good measure.
+        let rows = vec![
+            vec![Value::String(NULL_SENTINEL.into())],
+            vec![Value::Null],
+            vec![Value::String("v".into())],
+        ];
+        let table = render_table(&columns, &rows);
+        // The null sentinel is wrapped in the dim grey; the real value is not.
+        assert!(table.contains("\x1b[38;5;244m∅"), "null cell should be dimmed: {table:?}");
+        assert!(!table.contains("\x1b[38;5;244mv"), "value cell should not be dimmed");
     }
 }

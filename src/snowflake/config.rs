@@ -57,10 +57,6 @@ impl SnowflakeConfig {
         Ok(root.snowflake)
     }
 
-    pub fn account_url(&self) -> String {
-        format!("https://{}.snowflakecomputing.com", self.account)
-    }
-
     pub fn keyring_account(&self) -> &str {
         self.keyring_account.as_deref().unwrap_or(&self.user)
     }

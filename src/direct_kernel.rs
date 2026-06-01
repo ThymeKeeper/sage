@@ -83,11 +83,13 @@ while True:
         # Use Jupyter-style execution: try eval, then try exec with last expression
         stdout_capture = io.StringIO()
         _sage_result = None
+        _sage_evaluated = False  # True iff the cell was a single expression (eval path)
 
         try:
             # First, try to eval the entire code (for simple expressions)
             with contextlib.redirect_stdout(stdout_capture):
                 _sage_result = eval(code, globals())
+            _sage_evaluated = True
             with open(_sage_debug_file, 'a') as debug_f:
                 debug_f.write(f'>>> EVAL succeeded\n')
         except SyntaxError:
@@ -519,6 +521,16 @@ while True:
 
             print("SAGE_OUTPUT_START", flush=True)
             print(json.dumps({"type": "result", "data": formatted}), flush=True)
+            print("SAGE_OUTPUT_END", flush=True)
+        elif _sage_evaluated and not captured:
+            # The cell was an expression that evaluated to None and printed
+            # nothing: show the null sentinel (∅) so an explicit None value is
+            # visible. Statements/assignments (exec path) and cells that printed
+            # output fall through to the plain success signal below. The muted
+            # grey (256-color 244) dims the glyph, matching the CSV/TSV and SQL
+            # renderings (SGR 2 faint isn't honored by every terminal).
+            print("SAGE_OUTPUT_START", flush=True)
+            print(json.dumps({"type": "result", "data": "\x1b[38;5;244m∅\x1b[39m"}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
         else:
             # No result to show (None result) - just signal success

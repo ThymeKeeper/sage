@@ -10,6 +10,7 @@ mod kernel;
 mod direct_kernel;
 mod snowflake;
 mod cell;
+mod dsv;
 mod sql_split;
 mod kernel_selector;
 mod language_selector;
@@ -284,104 +285,10 @@ fn main() -> io::Result<()> {
         let mut full_command = vec![program_path.as_str()];
         full_command.extend(&file_args);
         
-        // Method 1: Check environment variable (all platforms)
-        if let Ok(terminal) = std::env::var("TERMINAL") {
-            if launch_in_terminal(&terminal, &full_command) {
-                return Ok(());
-            }
+        if launch_command_in_new_terminal(&full_command) {
+            return Ok(());
         }
 
-        // Platform-specific terminal detection
-        #[cfg(target_os = "linux")]
-        {
-            // Method 2: Check Cinnamon desktop settings (Linux Mint)
-            if let Ok(output) = std::process::Command::new("gsettings")
-                .args(&["get", "org.cinnamon.desktop.default-applications.terminal", "exec"])
-                .output()
-            {
-                if output.status.success() {
-                    let terminal = String::from_utf8_lossy(&output.stdout).trim().trim_matches('\'').to_string();
-                    if !terminal.is_empty() && launch_in_terminal(&terminal, &full_command) {
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Method 3: Check GNOME desktop settings
-            if let Ok(output) = std::process::Command::new("gsettings")
-                .args(&["get", "org.gnome.desktop.default-applications.terminal", "exec"])
-                .output()
-            {
-                if output.status.success() {
-                    let terminal = String::from_utf8_lossy(&output.stdout).trim().trim_matches('\'').to_string();
-                    if !terminal.is_empty() && terminal != "x-terminal-emulator" {
-                        if launch_in_terminal(&terminal, &full_command) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            // Method 4: Use x-terminal-emulator (Debian/Ubuntu standard)
-            if launch_in_terminal("x-terminal-emulator", &full_command) {
-                return Ok(());
-            }
-
-            // Method 5: Try sensible-terminal
-            if launch_in_terminal("sensible-terminal", &full_command) {
-                return Ok(());
-            }
-
-            // Method 6: Fallback to common Linux terminal emulators
-            let fallback_terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm", "mate-terminal", "alacritty", "kitty", "terminator"];
-            for terminal in &fallback_terminals {
-                if launch_in_terminal(terminal, &full_command) {
-                    return Ok(());
-                }
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // macOS terminal detection
-            // Try Terminal.app (default macOS terminal)
-            if launch_in_terminal_macos("Terminal", &full_command) {
-                return Ok(());
-            }
-
-            // Try iTerm2 (popular alternative)
-            if launch_in_terminal_macos("iTerm", &full_command) {
-                return Ok(());
-            }
-
-            // Try Alacritty, Kitty (cross-platform terminals available on macOS)
-            let fallback_terminals = ["alacritty", "kitty"];
-            for terminal in &fallback_terminals {
-                if launch_in_terminal(terminal, &full_command) {
-                    return Ok(());
-                }
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            // Windows terminal detection
-            // Try Windows Terminal (modern default)
-            if launch_in_terminal_windows("wt.exe", &full_command) {
-                return Ok(());
-            }
-
-            // Try PowerShell
-            if launch_in_terminal_windows("powershell.exe", &full_command) {
-                return Ok(());
-            }
-
-            // Fallback to cmd.exe
-            if launch_in_terminal_windows("cmd.exe", &full_command) {
-                return Ok(());
-            }
-        }
-        
         eprintln!("Error: Not running in a terminal and no terminal emulator found");
         return Err(io::Error::new(io::ErrorKind::Other, "No terminal available"));
     }
@@ -455,6 +362,124 @@ fn main() -> io::Result<()> {
     }
     
     Ok(())
+}
+
+/// Launch `command` (command[0] = executable, the rest its arguments) in a new
+/// terminal window, returning true at the first emulator that starts. Honors
+/// $TERMINAL first, then walks a platform-specific fallback list. Shared by the
+/// start-outside-a-TTY relaunch path and `launch_child_session`.
+fn launch_command_in_new_terminal(command: &[&str]) -> bool {
+    // Method 1: Check environment variable (all platforms)
+    if let Ok(terminal) = std::env::var("TERMINAL") {
+        if launch_in_terminal(&terminal, command) {
+            return true;
+        }
+    }
+
+    // Platform-specific terminal detection
+    #[cfg(target_os = "linux")]
+    {
+        // Method 2: Check Cinnamon desktop settings (Linux Mint)
+        if let Ok(output) = std::process::Command::new("gsettings")
+            .args(&["get", "org.cinnamon.desktop.default-applications.terminal", "exec"])
+            .output()
+        {
+            if output.status.success() {
+                let terminal = String::from_utf8_lossy(&output.stdout).trim().trim_matches('\'').to_string();
+                if !terminal.is_empty() && launch_in_terminal(&terminal, command) {
+                    return true;
+                }
+            }
+        }
+
+        // Method 3: Check GNOME desktop settings
+        if let Ok(output) = std::process::Command::new("gsettings")
+            .args(&["get", "org.gnome.desktop.default-applications.terminal", "exec"])
+            .output()
+        {
+            if output.status.success() {
+                let terminal = String::from_utf8_lossy(&output.stdout).trim().trim_matches('\'').to_string();
+                if !terminal.is_empty() && terminal != "x-terminal-emulator" {
+                    if launch_in_terminal(&terminal, command) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Method 4: Use x-terminal-emulator (Debian/Ubuntu standard)
+        if launch_in_terminal("x-terminal-emulator", command) {
+            return true;
+        }
+
+        // Method 5: Try sensible-terminal
+        if launch_in_terminal("sensible-terminal", command) {
+            return true;
+        }
+
+        // Method 6: Fallback to common Linux terminal emulators
+        let fallback_terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm", "mate-terminal", "alacritty", "kitty", "terminator"];
+        for terminal in &fallback_terminals {
+            if launch_in_terminal(terminal, command) {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS terminal detection
+        // Try Terminal.app (default macOS terminal)
+        if launch_in_terminal_macos("Terminal", command) {
+            return true;
+        }
+
+        // Try iTerm2 (popular alternative)
+        if launch_in_terminal_macos("iTerm", command) {
+            return true;
+        }
+
+        // Try Alacritty, Kitty (cross-platform terminals available on macOS)
+        let fallback_terminals = ["alacritty", "kitty"];
+        for terminal in &fallback_terminals {
+            if launch_in_terminal(terminal, command) {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows terminal detection
+        // Try Windows Terminal (modern default)
+        if launch_in_terminal_windows("wt.exe", command) {
+            return true;
+        }
+
+        // Try PowerShell
+        if launch_in_terminal_windows("powershell.exe", command) {
+            return true;
+        }
+
+        // Fallback to cmd.exe
+        if launch_in_terminal_windows("cmd.exe", command) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Open `file_path` in a new `sage` instance running in its own terminal
+/// window. Used by the Ctrl+D "open results" keybinding to view exported query
+/// results (a TSV tempfile) in a separate spreadsheet session. Returns false if
+/// the current executable can't be located or no terminal could be launched.
+pub(crate) fn launch_child_session(file_path: &str) -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => return false,
+    };
+    launch_command_in_new_terminal(&[exe.as_str(), file_path])
 }
 
 fn launch_in_terminal(terminal: &str, command: &[&str]) -> bool {

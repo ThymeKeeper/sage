@@ -87,6 +87,7 @@ impl HelpScreen {
                 ("Ctrl+Backspace", "Cancel query (server-side abort, session preserved)"),
                 ("Ctrl+K", "Select kernel"),
                 ("F9", "Export full result to CSV (Downloads folder)"),
+                ("Ctrl+D", "Open results in a new sage session (first 10k rows)"),
                 ("Ctrl+L", "Clear output pane"),
                 ("Ctrl+O", "Toggle output pane visibility"),
                 ("Esc", "Toggle output pane focus"),

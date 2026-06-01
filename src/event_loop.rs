@@ -896,6 +896,56 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
                         commands::Command::None
                     }
+
+                    // Open query results in a new sage session (Ctrl+D) — copies the
+                    // first 10,000 rows of the active kernel's (already-CSV) result spool
+                    // into a temp file and opens it in a fresh sage window in spreadsheet
+                    // mode. SQL mode only; like F9 export, a no-op for kernels that don't
+                    // spool results.
+                    KeyCode::Char('d') | KeyCode::Char('D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if *editor.get_language() != syntax::Language::Sql {
+                            editor.status_message = Some((
+                                "Open results (Ctrl+D) is only available in SQL mode.".to_string(),
+                                true,
+                            ));
+                        } else {
+                            match editor.kernel_latest_result_file() {
+                                Some(src) => match results_head_tempfile(&src, 10_000) {
+                                    Ok((out_path, rows)) => {
+                                        let out_str = out_path.to_string_lossy().into_owned();
+                                        if crate::launch_child_session(&out_str) {
+                                            editor.status_message = Some((
+                                                format!("Opened {} row(s) in a new sage session", rows),
+                                                false,
+                                            ));
+                                        } else {
+                                            editor.status_message = Some((
+                                                format!(
+                                                    "Saved results to {} but couldn't open a terminal window",
+                                                    out_str
+                                                ),
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        editor.status_message = Some((
+                                            format!("Failed to prepare results: {}", e),
+                                            true,
+                                        ));
+                                    }
+                                },
+                                None => {
+                                    editor.status_message = Some((
+                                        "No query results to open.".to_string(),
+                                        true,
+                                    ));
+                                }
+                            }
+                        }
+                        needs_redraw = true;
+                        commands::Command::None
+                    }
                     
                     // Undo/Redo
                     KeyCode::Char('z') | KeyCode::Char('Z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2372,4 +2422,34 @@ fn handle_spreadsheet_key(
             _ => true,
         }
     }
+}
+
+/// Copy the kernel's CSV result spool at `src` into a freshly created temp CSV
+/// file holding the header row plus up to `max_data_rows` data rows, and return
+/// its (persisted) path along with the number of data rows written.
+///
+/// Used by the "open results in a new sage session" keybinding (Ctrl+D in SQL
+/// mode). The spool is already CSV and sage opens CSV directly, so this only
+/// truncates — no re-encoding. The copy is byte-accurate (via
+/// [`crate::dsv::copy_first_records`]), so the null/empty encoding and any
+/// quoting are preserved exactly, and a quoted field with an embedded newline
+/// still counts as one row. The file is opened by a separate `sage` process, so
+/// it is kept rather than deleted on drop and lives in the OS temp dir until the
+/// OS cleans it up.
+fn results_head_tempfile(
+    src: &std::path::Path,
+    max_data_rows: usize,
+) -> Result<(std::path::PathBuf, usize), Box<dyn std::error::Error>> {
+    let infile = std::fs::File::open(src)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("sage-results-")
+        .suffix(".csv")
+        .tempfile()?;
+    // +1 for the header row; copy_first_records returns the total records copied.
+    let records =
+        crate::dsv::copy_first_records(infile, tmp.as_file_mut(), max_data_rows.saturating_add(1))?;
+    // Persist the tempfile so the child sage process can still read it after
+    // this process moves on (and after the parent eventually exits).
+    let (_file, path) = tmp.keep()?;
+    Ok((path, records.saturating_sub(1)))
 }
