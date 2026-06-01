@@ -15,11 +15,11 @@ use crate::kernel::{
 use super::client::{ColumnMeta, SnowflakeClient};
 use super::config::SnowflakeConfig;
 
-/// Maximum rows rendered inline in the output pane. Anything beyond this is
-/// only on disk in the spool tempfile — accessible via the save-results
-/// keybinding. Keeps the in-memory output `String` bounded regardless of
-/// result size.
-const PREVIEW_ROW_LIMIT: usize = 100;
+/// Maximum rows rendered inline in the output-pane table — a quick peek only.
+/// Anything beyond this lives in the spool tempfile: open the first 10k in the
+/// spreadsheet viewer with F8, or export the full result with F9. Keeps the
+/// in-memory output `String` bounded regardless of result size.
+const PREVIEW_ROW_LIMIT: usize = 10;
 
 /// Per-execution state shared between the executing thread and the cancel
 /// handle. Wrapped in `Arc<Mutex<...>>` so the host can short-circuit the
@@ -427,7 +427,7 @@ fn format_outcome(
     let shown = preview.len() as u64;
     let count = if shown < total_rows {
         format!(
-            "(showing first {} of {} rows — F9 to export full result)",
+            "(showing first {} of {} rows — F8 to open in viewer, F9 to export)",
             shown, total_rows
         )
     } else {

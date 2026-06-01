@@ -471,7 +471,7 @@ fn launch_command_in_new_terminal(command: &[&str]) -> bool {
 }
 
 /// Open `file_path` in a new `sage` instance running in its own terminal
-/// window. Used by the Ctrl+D "open results" keybinding to view exported query
+/// window. Used by the F8 "open results" keybinding to view exported query
 /// results (a TSV tempfile) in a separate spreadsheet session. Returns false if
 /// the current executable can't be located or no terminal could be launched.
 pub(crate) fn launch_child_session(file_path: &str) -> bool {

@@ -897,15 +897,15 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         commands::Command::None
                     }
 
-                    // Open query results in a new sage session (Ctrl+D) — copies the
+                    // Open query results in a new sage session (F8) — copies the
                     // first 10,000 rows of the active kernel's (already-CSV) result spool
                     // into a temp file and opens it in a fresh sage window in spreadsheet
                     // mode. SQL mode only; like F9 export, a no-op for kernels that don't
                     // spool results.
-                    KeyCode::Char('d') | KeyCode::Char('D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::F(8) => {
                         if *editor.get_language() != syntax::Language::Sql {
                             editor.status_message = Some((
-                                "Open results (Ctrl+D) is only available in SQL mode.".to_string(),
+                                "Open results (F8) is only available in SQL mode.".to_string(),
                                 true,
                             ));
                         } else {
@@ -2428,7 +2428,7 @@ fn handle_spreadsheet_key(
 /// file holding the header row plus up to `max_data_rows` data rows, and return
 /// its (persisted) path along with the number of data rows written.
 ///
-/// Used by the "open results in a new sage session" keybinding (Ctrl+D in SQL
+/// Used by the "open results in a new sage session" keybinding (F8 in SQL
 /// mode). The spool is already CSV and sage opens CSV directly, so this only
 /// truncates — no re-encoding. The copy is byte-accurate (via
 /// [`crate::dsv::copy_first_records`]), so the null/empty encoding and any
