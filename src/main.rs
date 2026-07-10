@@ -204,8 +204,8 @@ fn execute_file(file_path: Option<String>, python_path: Option<String>) -> io::R
                                 }
                             }
                         }
-                        kernel::ExecutionOutput::Display { data, .. } => {
-                            println!("{}", data);
+                        kernel::ExecutionOutput::Display { mime_type, .. } => {
+                            println!("[{} displayed in a window]", mime_type);
                         }
                     }
                 }

@@ -1,7 +1,7 @@
 //! SQL statement splitter. Splits a SQL buffer into one `Cell` per statement
 //! on uncommented, unquoted semicolons. Used as the cell parser when the
 //! editor language is SQL — analogous to `cell::parse_cells` for Python's
-//! `##$$` delimiters.
+//! `##--` delimiters.
 //!
 //! Handles Snowflake-flavored SQL quoting:
 //! - `-- line comments` (terminated by newline)
@@ -180,6 +180,63 @@ fn find_dollar_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// True if `text` holds at least one character worth sending to the database:
+/// anything that isn't whitespace, a `;`, or a comment. Uses the same lexer as
+/// [`parse_sql_cells`] so a `--`/`/* */`/`;` inside a string or a nested block
+/// comment is classified correctly. A string literal counts as content, so the
+/// scan returns as soon as Normal state sees a non-comment character.
+pub fn has_executable_sql(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut state = State::Normal;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match &state {
+            State::Normal => {
+                if b == b';' || b.is_ascii_whitespace() {
+                    i += 1;
+                } else if b == b'-' && next == Some(b'-') {
+                    state = State::LineComment;
+                    i += 2;
+                } else if b == b'/' && next == Some(b'*') {
+                    state = State::BlockComment(1);
+                    i += 2;
+                } else {
+                    // Any other byte — an identifier, operator, or a string
+                    // opener (`'`, `"`, `$`) — is executable content.
+                    return true;
+                }
+            }
+            State::LineComment => {
+                if b == b'\n' {
+                    state = State::Normal;
+                }
+                i += 1;
+            }
+            State::BlockComment(depth) => {
+                if b == b'/' && next == Some(b'*') {
+                    state = State::BlockComment(depth + 1);
+                    i += 2;
+                } else if b == b'*' && next == Some(b'/') {
+                    state = if *depth == 1 {
+                        State::Normal
+                    } else {
+                        State::BlockComment(depth - 1)
+                    };
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            // Unreachable: Normal returns `true` the moment it sees a string
+            // opener, so we never enter these states. Treat as content anyway.
+            State::SingleString | State::DoubleString | State::DollarString(_) => return true,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +312,32 @@ mod tests {
     #[test]
     fn empty() {
         assert_eq!(split(""), vec![""]);
+    }
+
+    #[test]
+    fn executable_detects_real_sql() {
+        assert!(has_executable_sql("select 1"));
+        assert!(has_executable_sql("-- note\nselect 1;"));
+        assert!(has_executable_sql("/* c */ select 1;"));
+        // A `--` inside a string is not a comment — there's real content.
+        assert!(has_executable_sql("select '-- not a comment'"));
+    }
+
+    #[test]
+    fn executable_rejects_blank_and_comment_only() {
+        assert!(!has_executable_sql(""));
+        assert!(!has_executable_sql("   \n\t  "));
+        assert!(!has_executable_sql("-- just a comment"));
+        assert!(!has_executable_sql("-- one\n-- two\n"));
+        assert!(!has_executable_sql("/* block comment */"));
+        assert!(!has_executable_sql("/* nested /* still */ closed */"));
+        assert!(!has_executable_sql("/* unterminated"));
+    }
+
+    #[test]
+    fn executable_rejects_bare_semicolons() {
+        assert!(!has_executable_sql(";"));
+        assert!(!has_executable_sql(";;\n;"));
+        assert!(!has_executable_sql("-- c\n;"));
     }
 }

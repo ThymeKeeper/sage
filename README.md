@@ -27,7 +27,7 @@ Sage lets you write and execute Python code in cells, just like Jupyter notebook
 
 ### 📓 Interactive Notebook Experience
 
-- **Cell-based execution**: Organize code with optional `##$$` delimiters
+- **Cell-based execution**: Organize code with optional `##--` delimiters (titled by the text after the marker)
 - **Live output display**: View execution results in a dedicated pane
 - **Multiple kernels**: Connect to different Python environments
 - **Execution state tracking**: See cell history and outputs
@@ -132,23 +132,27 @@ Autocomplete automatically shows:
 
 ## Working with Cells
 
-Cells let you organize code into logical sections. Use `##$$` as a delimiter:
+Cells let you organize code into logical sections. Use `##--` as a delimiter.
+Any text after the marker becomes the cell's title in the output pane:
 
 ```python
-##$$ Cell1: import libraries
+##-- Cell1: import libraries
 import pandas as pd
 import duckdb as db
 
-##$$ Cell 2: Load data
+##-- Cell 2: Load data
 df = pd.read_csv("data.csv")
 db.register("data", df)
 
-##$$ Cell 3: Query with SQL autocomplete
+##-- Cell 3: Query with SQL autocomplete
 result = db.sql("SELECT * FROM data WHERE amount > 100")
 result.pl()  # Method chain autocomplete works here!
 ```
 
 **Pro tip**: Cell delimiters are optional! Without them, the entire file runs as one cell.
+
+In SQL mode, statements are split on semicolons, and a leading `--## <title>`
+comment titles that statement's output the same way.
 
 ## Python Kernel Selection
 

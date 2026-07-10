@@ -11,7 +11,7 @@ use std::io;
 /// metadata snapshot.
 enum ExecMsg {
     Cell {
-        cell_number: usize,
+        label: String,
         output: String,
         is_error: bool,
         elapsed: f64,
@@ -77,13 +77,13 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 };
                 match msg {
                     ExecMsg::Cell {
-                        cell_number,
+                        label,
                         output,
                         is_error,
                         elapsed,
                     } => {
                         output_pane.add_output(output_pane::OutputEntry {
-                            cell_line: cell_number,
+                            label,
                             output,
                             is_error,
                             elapsed_secs: elapsed,
@@ -499,6 +499,23 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 // Ignore key release events (both Windows and other platforms)
                 if key.kind == event::KeyEventKind::Release {
                     continue;
+                }
+
+                // Modal "busy" state: while an execution is in flight — a cell,
+                // or a standalone app whose window is still open — swallow every
+                // keystroke except the cancel chord, so the buffer can't be
+                // edited or navigated mid-run. The ticking "Executing..." status
+                // signals the block. Cancel comes in as Ctrl+Backspace, or Ctrl+H
+                // on terminals that map the two; let both reach their handlers.
+                if execution_rx.is_some() {
+                    let is_cancel = key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(
+                            key.code,
+                            KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Char('H')
+                        );
+                    if !is_cancel {
+                        continue;
+                    }
                 }
 
                 needs_redraw = true; // Key events usually need redraw
@@ -1070,9 +1087,13 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 executing_preserves_session = preserves;
                                 editor.status_message = Some(("Executing...".to_string(), false));
                                 needs_redraw = true;
-                            } else {
-                                // No kernel connected
+                            } else if !editor.is_kernel_connected() {
+                                // None with no kernel → prompt to connect. (When
+                                // a kernel IS connected, None means "nothing to
+                                // execute" and spawn already set that message.)
                                 editor.status_message = Some(("No kernel connected. Press Ctrl+K to select a kernel.".to_string(), true));
+                                needs_redraw = true;
+                            } else {
                                 needs_redraw = true;
                             }
                         }
@@ -1613,6 +1634,10 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                     executing_preserves_session = preserves;
                                     editor.status_message = Some(("Executing...".to_string(), false));
                                     needs_redraw = true;
+                                } else {
+                                    // No kernel, or nothing executable — spawn set
+                                    // the status message in the latter case.
+                                    needs_redraw = true;
                                 }
                             }
                             commands::Command::None
@@ -1829,38 +1854,116 @@ fn spawn_background_execution(
     // Get selection or current cell position
     let selection = editor.selection();
     let cursor_offset = editor.cursor();  // Get byte offset, not line/col
+    let is_sql = *editor.get_language() == crate::syntax::Language::Sql;
 
-    // Clone cell data we need
+    // Build the statements to run as (header_label, code). The label is a
+    // title from the cell's marker line (`--##` for SQL, the `##--` delimiter
+    // for other languages), falling back to "Cell N".
     editor.update_cells();
-    let cells: Vec<(usize, usize, String)> = {
-        use crate::cell::{get_cell_at_position, get_cell_content};
+    let cells: Vec<(String, String)> = {
+        use crate::cell::{
+            cell_title, get_cell_at_position, get_cell_content, has_executable_content,
+            statements_in_text,
+        };
 
-        // Find cells to execute (same logic as execute_selected_cells_with_output)
-        let cells_to_execute: Vec<usize> = if let Some((sel_start, sel_end)) = selection {
-            editor.get_cells_ref().iter().enumerate()
-                .filter(|(_, cell)| cell.start < sel_end && cell.end > sel_start)
-                .map(|(idx, _)| idx)
+        if let Some((sel_start, sel_end)) = selection {
+            // Explicit selection: treat the selected text as its own buffer and
+            // run the statements inside it (split on semicolons for SQL). We run
+            // exactly what's selected — nothing before sel_start or after
+            // sel_end — so selecting a statement plus the blank line that
+            // follows it never drags the next statement into the run.
+            let selected = editor
+                .buffer_rope()
+                .byte_slice(sel_start..sel_end)
+                .to_string();
+            statements_in_text(&selected, is_sql)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (title, code))| {
+                    let label = title.unwrap_or_else(|| format!("Cell {}", i + 1));
+                    (label, code)
+                })
                 .collect()
-        } else {
-            if let Some(cell_idx) = get_cell_at_position(editor.get_cells_ref(), cursor_offset) {
-                vec![cell_idx]
+        } else if let Some(cell_idx) =
+            get_cell_at_position(editor.get_cells_ref(), cursor_offset)
+        {
+            // No selection: run the single statement under the caret, unless
+            // it has nothing executable (only comments / blank lines).
+            let cell = &editor.get_cells_ref()[cell_idx];
+            let code = get_cell_content(editor.buffer_rope(), cell);
+            if has_executable_content(&code, is_sql) {
+                let full = editor.buffer_rope().byte_slice(cell.start..cell.end).to_string();
+                let label = cell_title(&full, is_sql).unwrap_or_else(|| format!("Cell {}", cell_idx + 1));
+                vec![(label, code)]
             } else {
                 vec![]
             }
-        };
-
-        // Extract cell contents
-        cells_to_execute.iter().map(|&idx| {
-            let cell = &editor.get_cells_ref()[idx];
-            let code = get_cell_content(editor.buffer_rope(), cell);
-            let cell_number = idx + 1;
-            (idx, cell_number, code)
-        }).collect()
+        } else {
+            vec![]
+        }
     };
 
     if cells.is_empty() {
+        // Nothing executable (a comment-only or blank cell/selection). Restore
+        // the kernel and explain why nothing ran — callers distinguish this
+        // from the no-kernel case via is_kernel_connected().
         editor.set_kernel(kernel);
+        editor.status_message = Some(("Nothing to execute".to_string(), false));
         return None;
+    }
+
+    // Application lane: a single Python program that would take over its own
+    // event loop (a GUI app / game — see cell::is_standalone_program) can't run
+    // in the shared kernel without blocking the REPL thread for its whole
+    // lifetime. Instead run just this cell as its own OS process, but keep it in
+    // the foreground: capture stdout/stderr and stream the result — including a
+    // crash traceback — back into the output pane, exactly like a cell. We run
+    // only the current cell's code (not the whole buffer) so `##--` separators
+    // are respected: running the app cell doesn't drag sibling cells along. sage
+    // shows "Executing..." while the app's window is open; Ctrl+Backspace kills
+    // the app (soft cancel — the kernel is never touched and is handed straight
+    // back via Done). Explicit selections and SQL always stay in-session; a
+    // Snowflake kernel (empty python_path) has no interpreter to run, so skip.
+    if !is_sql
+        && selection.is_none()
+        && cells.len() == 1
+        && !kernel_info.python_path.is_empty()
+        && crate::cell::is_standalone_program(&cells[0].1)
+    {
+        let program = cells[0].1.clone();
+        match spawn_app_process(&kernel_info.python_path, &program) {
+            Ok(child) => {
+                let cancel: Option<std::sync::Arc<dyn kernel::CancelHandle>> = Some(
+                    std::sync::Arc::new(direct_kernel::ProcessKillHandle::new(child.id())),
+                );
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let start = std::time::Instant::now();
+                    let (output, is_error) = run_and_capture(child);
+                    let _ = tx.send(ExecMsg::Cell {
+                        label: "application".to_string(),
+                        output,
+                        is_error,
+                        elapsed: start.elapsed().as_secs_f64(),
+                    });
+                    let _ = tx.send(ExecMsg::Done {
+                        kernel,
+                        completions: Vec::new(),
+                        type_relationships: kernel::TypeRelationships::default(),
+                        sql_metadata: kernel::SqlMetadata::default(),
+                    });
+                });
+                // preserves_session = true → soft cancel: Ctrl+Backspace kills
+                // the app and the thread hands the (unused) kernel back via Done.
+                return Some((rx, kernel_info, cancel, true));
+            }
+            Err(e) => {
+                editor.set_kernel(kernel);
+                editor.status_message =
+                    Some((format!("Failed to launch application: {}", e), true));
+                return None;
+            }
+        }
     }
 
     // Spawn background thread. Sends one ExecMsg::Cell per statement as it
@@ -1873,7 +1976,7 @@ fn spawn_background_execution(
         let mut type_relationships = crate::kernel::TypeRelationships::default();
         let mut sql_metadata = crate::kernel::SqlMetadata::default();
 
-        for (_cell_idx, cell_number, code) in cells {
+        for (label, code) in cells {
             let start_time = std::time::Instant::now();
 
             match kernel.execute(&code) {
@@ -1887,7 +1990,7 @@ fn spawn_background_execution(
                     sql_metadata = result.sql_metadata;
 
                     let _ = tx.send(ExecMsg::Cell {
-                        cell_number,
+                        label,
                         output: output_text,
                         is_error,
                         elapsed,
@@ -1900,7 +2003,7 @@ fn spawn_background_execution(
                 Err(e) => {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let _ = tx.send(ExecMsg::Cell {
-                        cell_number,
+                        label,
                         output: format!("Error: {}", e),
                         is_error: true,
                         elapsed,
@@ -1919,6 +2022,77 @@ fn spawn_background_execution(
     });
 
     Some((rx, kernel_info, cancel, preserves_session))
+}
+
+/// Spawn `source` as a standalone Python program (its own OS process) with
+/// stdout/stderr piped so the host can capture them. The GUI window still
+/// appears; only the console is suppressed.
+///
+/// The program is written to a temp `.py` so the child runs a real file (a
+/// correct `__file__`, tracebacks, and `__name__ == "__main__"`). It inherits
+/// none of sage's stdio — sage is a raw-mode TUI, and letting the child touch
+/// those terminal handles (or opening a new console against them) is what made
+/// an earlier version flash-and-die. `CREATE_NO_WINDOW` keeps it off sage's
+/// console entirely while still allowing its own GUI window.
+fn spawn_app_process(python_path: &str, source: &str) -> io::Result<std::process::Child> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static APP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = APP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("sage_app_{}_{}.py", std::process::id(), seq));
+    std::fs::File::create(&path)?.write_all(source.as_bytes())?;
+
+    let mut cmd = std::process::Command::new(python_path);
+    cmd.arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the app never attaches to / flashes sage's raw-mode
+        // console; its own GUI window still appears, and we read stdout/stderr
+        // through the pipes.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
+}
+
+/// Wait for a standalone app to exit and turn its captured output into a pane
+/// entry. stderr (where Python tracebacks land) is appended after stdout; a
+/// non-zero exit marks the entry as an error so it renders red, just like a cell
+/// error. Blocks until the process exits — the app's window being open is what
+/// keeps sage in the "Executing..." state.
+fn run_and_capture(child: std::process::Child) -> (String, bool) {
+    match child.wait_with_output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.trim().is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&err);
+            }
+            let is_error = !out.status.success();
+            let text = text.trim_end().to_string();
+            if text.is_empty() {
+                let note = if is_error {
+                    match out.status.code() {
+                        Some(c) => format!("Application exited with code {}", c),
+                        None => "Application terminated".to_string(),
+                    }
+                } else {
+                    "Application exited.".to_string()
+                };
+                return (note, is_error);
+            }
+            (text, is_error)
+        }
+        Err(e) => (format!("Failed to run application: {}", e), true),
+    }
 }
 
 fn ensure_ss_cursor_visible(editor: &mut editor::Editor) -> io::Result<()> {

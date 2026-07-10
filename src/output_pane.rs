@@ -174,7 +174,9 @@ fn slice_with_ansi(s: &str, start: usize, visible_width: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub struct OutputEntry {
-    pub cell_line: usize,
+    /// Header label for this result — a title from the cell's leading `--##`
+    /// marker, or a fallback like "Cell 3".
+    pub label: String,
     pub output: String,
     pub is_error: bool,
     pub elapsed_secs: f64,
@@ -865,7 +867,7 @@ impl OutputPane {
         }
 
         // Only forget the preferred column if we landed on a normal line.
-        // On OutputEntry header rows ("Cell N (X.XXXs):"), keep the
+        // On OutputEntry header rows ("<title> (X.XXXs):"), keep the
         // preferred column so the next vertical move resumes there.
         if !self.is_header_line(self.cursor_line) {
             self.preferred_column = None;
@@ -917,7 +919,7 @@ impl OutputPane {
         }
 
         // Only forget the preferred column if we landed on a normal line.
-        // On OutputEntry header rows ("Cell N (X.XXXs):"), keep the
+        // On OutputEntry header rows ("<title> (X.XXXs):"), keep the
         // preferred column so the next vertical move resumes there.
         if !self.is_header_line(self.cursor_line) {
             self.preferred_column = None;
@@ -1126,7 +1128,7 @@ impl OutputPane {
         self.cursor_col = content_end;
     }
 
-    /// True if `line_idx` is an OutputEntry header (the "Cell N (X.XXXs):"
+    /// True if `line_idx` is an OutputEntry header (the "<title> (X.XXXs):"
     /// line between cell outputs). Identified via the `is_header` flag in
     /// the flattened all_lines list, not by pattern-matching the text.
     fn is_header_line(&self, line_idx: usize) -> bool {
@@ -1347,7 +1349,7 @@ impl OutputPane {
     fn get_all_lines(&self) -> Vec<(String, bool, bool)> {
         let mut all_lines = Vec::new();
         for entry in &self.outputs {
-            all_lines.push((format!("Cell {} ({:.3}s):", entry.cell_line, entry.elapsed_secs), true, false));
+            all_lines.push((format!("{} ({:.3}s):", entry.label, entry.elapsed_secs), true, false));
             for line in entry.output.lines() {
                 all_lines.push((line.to_string(), false, entry.is_error));
             }
@@ -1572,7 +1574,7 @@ impl OutputPane {
         let mut all_lines: Vec<(String, bool, bool)> = Vec::new(); // (line_text, is_header, is_error)
         for entry in &self.outputs {
             // Add header line with elapsed time
-            all_lines.push((format!("Cell {} ({:.3}s):", entry.cell_line, entry.elapsed_secs), true, false));
+            all_lines.push((format!("{} ({:.3}s):", entry.label, entry.elapsed_secs), true, false));
 
             // Add output lines (no truncation - horizontal scrolling will handle this)
             for line in entry.output.lines() {

@@ -1,6 +1,7 @@
 use crate::kernel::{CancelHandle, ExecutionOutput, ExecutionResult, Kernel, KernelInfo};
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
@@ -11,6 +12,11 @@ pub struct DirectKernel {
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
     execution_count: usize,
+    /// Paths to the bundled viewer scripts written to the temp dir on connect.
+    /// `execute()` spawns these (as siblings of sage, not children of the
+    /// Python kernel) to show charts/images in their own orphan windows.
+    figview_path: Option<PathBuf>,
+    imgview_path: Option<PathBuf>,
 }
 
 impl DirectKernel {
@@ -25,6 +31,8 @@ impl DirectKernel {
             stdin: None,
             stdout: None,
             execution_count: 0,
+            figview_path: None,
+            imgview_path: None,
         }
     }
 
@@ -105,6 +113,77 @@ while True:
             print("SAGE_OUTPUT_START", flush=True)
             print(json.dumps({"type": "stdout", "data": captured}), flush=True)
             print("SAGE_OUTPUT_END", flush=True)
+
+        # --- Orphan-window display -------------------------------------------
+        # Hand any matplotlib figures / PIL images produced by this cell to
+        # detached viewer processes so they render in their own OS window
+        # instead of trying (and failing) to draw into the terminal. The kernel
+        # runs matplotlib headless (MPLBACKEND=Agg), so figures are built
+        # off-screen here; we pickle each one and let the viewer re-show it
+        # under an interactive backend. Pickle failures fall back to a static
+        # PNG. All names here are underscore-prefixed so the completion
+        # harvester below ignores them.
+        try:
+            _sage_disp_dir = tempfile.gettempdir()
+            _sage_disp_seq = globals().get('_SAGE_DISPLAY_SEQ', 0)
+
+            # matplotlib figures (only touch matplotlib if it was imported)
+            if 'matplotlib' in sys.modules:
+                try:
+                    import matplotlib.pyplot as _sage_plt
+                    for _sage_num in _sage_plt.get_fignums():
+                        _sage_fig = _sage_plt.figure(_sage_num)
+                        _sage_disp_seq += 1
+                        _sage_stem = os.path.join(_sage_disp_dir, f'sage_fig_{os.getpid()}_{_sage_disp_seq}')
+                        _sage_emitted = False
+                        try:
+                            import pickle as _sage_pickle
+                            _sage_pkl = _sage_stem + '.pkl'
+                            with open(_sage_pkl, 'wb') as _sage_pf:
+                                _sage_pickle.dump(_sage_fig, _sage_pf)
+                            print("SAGE_OUTPUT_START", flush=True)
+                            print(json.dumps({"type": "display", "kind": "figure", "path": _sage_pkl}), flush=True)
+                            print("SAGE_OUTPUT_END", flush=True)
+                            _sage_emitted = True
+                        except Exception:
+                            _sage_emitted = False
+                        if not _sage_emitted:
+                            try:
+                                _sage_png = _sage_stem + '.png'
+                                _sage_fig.savefig(_sage_png)
+                                print("SAGE_OUTPUT_START", flush=True)
+                                print(json.dumps({"type": "display", "kind": "image", "path": _sage_png}), flush=True)
+                                print("SAGE_OUTPUT_END", flush=True)
+                            except Exception:
+                                pass
+                        try:
+                            _sage_plt.close(_sage_fig)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # A PIL image as the cell's result value
+            if _sage_result is not None:
+                try:
+                    from PIL.Image import Image as _SagePILImage
+                    if isinstance(_sage_result, _SagePILImage):
+                        _sage_disp_seq += 1
+                        _sage_png = os.path.join(_sage_disp_dir, f'sage_img_{os.getpid()}_{_sage_disp_seq}.png')
+                        _sage_result.save(_sage_png)
+                        print("SAGE_OUTPUT_START", flush=True)
+                        print(json.dumps({"type": "display", "kind": "image", "path": _sage_png}), flush=True)
+                        print("SAGE_OUTPUT_END", flush=True)
+                        # Shown in a window; don't also echo its repr or the ∅.
+                        _sage_result = None
+                        _sage_evaluated = False
+                except Exception:
+                    pass
+
+            globals()['_SAGE_DISPLAY_SEQ'] = _sage_disp_seq
+        except Exception:
+            pass
+        # --- end orphan-window display ---------------------------------------
 
         # Collect namespace completions for autocomplete
         # IMPORTANT: Send completions BEFORE the success/result marker
@@ -554,13 +633,144 @@ while True:
         break
 "#
     }
+
+    /// Write the bundled viewer scripts to the temp dir and remember their
+    /// paths. Called from connect(); cheap and idempotent.
+    fn ensure_viewers(&mut self) {
+        let dir = std::env::temp_dir();
+        let figview = dir.join("sage_figview.py");
+        let imgview = dir.join("sage_imgview.py");
+        if std::fs::write(&figview, FIGVIEW_SCRIPT).is_ok() {
+            self.figview_path = Some(figview);
+        }
+        if std::fs::write(&imgview, IMGVIEW_SCRIPT).is_ok() {
+            self.imgview_path = Some(imgview);
+        }
+    }
+
 }
+
+/// Launch a detached viewer window for a `display` message. Spawned with the
+/// kernel's own interpreter but as a child of the sage host — a *sibling* of the
+/// Python kernel process — so a cancel (`taskkill /F /T` on the kernel pid)
+/// never reaps the window and it outlives the kernel.
+fn spawn_viewer(
+    python_path: &str,
+    figview: Option<&Path>,
+    imgview: Option<&Path>,
+    kind: &str,
+    data_path: &str,
+) {
+    let script = match kind {
+        "figure" => figview,
+        _ => imgview,
+    };
+    let script = match script {
+        Some(s) => s,
+        None => return,
+    };
+    let interp = viewer_python(python_path);
+    let mut cmd = Command::new(interp);
+    cmd.arg(script)
+        .arg(data_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no attached console, its
+        // own process group, independent lifetime.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let _ = cmd.spawn();
+}
+
+/// Prefer the windowless `pythonw.exe` next to the interpreter so a chart/image
+/// viewer doesn't flash a console window. Falls back to the given path.
+#[cfg(windows)]
+fn viewer_python(python_path: &str) -> String {
+    let p = Path::new(python_path);
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) {
+        if name.eq_ignore_ascii_case("python.exe") {
+            let candidate = parent.join("pythonw.exe");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    python_path.to_string()
+}
+
+#[cfg(not(windows))]
+fn viewer_python(python_path: &str) -> String {
+    python_path.to_string()
+}
+
+/// Viewer: re-show a pickled matplotlib figure under an interactive backend in
+/// its own window (pan/zoom/toolbar). A pickled figure comes back detached from
+/// pyplot's manager, so we graft it onto a fresh managed canvas before show().
+const FIGVIEW_SCRIPT: &str = r#"import sys
+import pickle
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+
+
+def main():
+    if len(sys.argv) < 2:
+        return
+    with open(sys.argv[1], "rb") as f:
+        fig = pickle.load(f)
+    # Unpickling a pyplot figure already registers it with a manager/window, so
+    # DON'T create another — that popped a second, blank window. Only graft onto
+    # a fresh managed canvas if the load left no manager (bare Figure() pickles).
+    if not plt.get_fignums():
+        mgr = plt.figure().canvas.manager
+        mgr.canvas.figure = fig
+        fig.set_canvas(mgr.canvas)
+    try:
+        fig.canvas.manager.set_window_title("sage chart")
+    except Exception:
+        pass
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+/// Viewer: show a PNG in a plain Tk window (static image / pickle fallback).
+const IMGVIEW_SCRIPT: &str = r#"import sys
+import tkinter as tk
+
+
+def main():
+    if len(sys.argv) < 2:
+        return
+    root = tk.Tk()
+    root.title("sage image")
+    img = tk.PhotoImage(file=sys.argv[1])
+    label = tk.Label(root, image=img)
+    label.image = img  # keep a reference so it isn't garbage-collected
+    label.pack()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+"#;
 
 impl Kernel for DirectKernel {
     fn connect(&mut self) -> Result<(), Box<dyn Error>> {
         if self.is_connected() {
             return Ok(());
         }
+
+        // Write the chart/image viewer scripts so execute() can spawn them.
+        self.ensure_viewers();
 
         // Start Python process with our REPL script
         // Set TERM to dumb to avoid escape codes, and clear terminal-related env vars
@@ -573,6 +783,10 @@ impl Kernel for DirectKernel {
             .stderr(Stdio::null())  // Ignore stderr to avoid broken pipe
             .env("TERM", "dumb")  // Prevent terminal control codes
             .env_remove("TERM_PROGRAM")  // Remove any terminal program settings
+            // Keep matplotlib headless in the kernel: figures are built
+            // off-screen (Agg) and handed to detached viewer windows instead of
+            // blocking the REPL thread on a GUI show().
+            .env("MPLBACKEND", "Agg")
             .spawn()
             .map_err(|e| format!("Failed to spawn Python process: {}", e))?;
 
@@ -617,6 +831,13 @@ impl Kernel for DirectKernel {
         }
 
         self.execution_count += 1;
+
+        // Capture what spawn_viewer needs up front: the `reader` borrow below
+        // holds &mut self.stdout for the rest of the function, so we can't call
+        // an &self method while draining output.
+        let viewer_python_path = self.info.python_path.clone();
+        let figview_path = self.figview_path.clone();
+        let imgview_path = self.imgview_path.clone();
 
         let stdin = self.stdin.as_mut().ok_or("No stdin available")?;
         let reader = self.stdout.as_mut().ok_or("No stdout available")?;
@@ -725,6 +946,26 @@ impl Kernel for DirectKernel {
                     }
                     // Don't set finished - continue reading for success/result markers
                 }
+                Some("display") => {
+                    // A chart/image the kernel rendered off-screen. Launch a
+                    // detached viewer window (sibling of the kernel process) and
+                    // leave a breadcrumb in the pane. Keep reading for the final
+                    // success/result marker.
+                    if let Some(path) = output_data["path"].as_str() {
+                        let kind = output_data["kind"].as_str().unwrap_or("image");
+                        spawn_viewer(
+                            &viewer_python_path,
+                            figview_path.as_deref(),
+                            imgview_path.as_deref(),
+                            kind,
+                            path,
+                        );
+                        outputs.push(ExecutionOutput::Display {
+                            data: path.to_string(),
+                            mime_type: kind.to_string(),
+                        });
+                    }
+                }
                 _ => {
                     finished = true;
                 }
@@ -785,8 +1026,17 @@ impl Kernel for DirectKernel {
 /// PID. Closing the process's stdout pipe unblocks the thread's blocked
 /// `read_line` and lets the kernel drop cleanly; closing its sockets is what
 /// the host actually cares about (e.g. so remote servers see the disconnect).
-struct ProcessKillHandle {
+pub(crate) struct ProcessKillHandle {
     pid: u32,
+}
+
+impl ProcessKillHandle {
+    /// Cancel handle that force-kills an arbitrary process tree by pid. Used by
+    /// the DirectKernel to cancel its own process, and by the application lane
+    /// to let Ctrl+Backspace kill a running standalone app.
+    pub(crate) fn new(pid: u32) -> Self {
+        ProcessKillHandle { pid }
+    }
 }
 
 impl CancelHandle for ProcessKillHandle {

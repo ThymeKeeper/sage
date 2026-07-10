@@ -705,7 +705,7 @@ fn cell_to_display_string(cell: &serde_json::Value, kind: TemporalKind) -> Strin
 /// `None` for NULLs, non-numeric payloads, or values that don't parse, letting
 /// the caller fall back to plain rendering.
 fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<String> {
-    use chrono::{Duration, FixedOffset, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
+    use chrono::{FixedOffset, NaiveTime, TimeZone, Timelike, Utc};
 
     // Normally a JSON string ("1761177600.000"); accept a bare number too.
     let raw: String = match cell {
@@ -722,10 +722,7 @@ fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<Strin
         TemporalKind::Date => raw
             .parse::<i64>()
             .ok()
-            .and_then(|days| {
-                NaiveDate::from_ymd_opt(1970, 1, 1)
-                    .and_then(|epoch| epoch.checked_add_signed(Duration::days(days)))
-            })
+            .and_then(decode_date_from_epoch)
             .map(|d| d.format("%Y-%m-%d").to_string()),
         TemporalKind::Time => parse_fractional_seconds(&raw)
             .and_then(|(secs, nanos)| {
@@ -784,6 +781,63 @@ fn decode_temporal(cell: &serde_json::Value, kind: TemporalKind) -> Option<Strin
                 })
         }
     }
+}
+
+/// Decode a Snowflake DATE cell into a `NaiveDate`, detecting the epoch unit.
+///
+/// Snowflake encodes DATE as a whole number of days since the Unix epoch, and
+/// that's what every well-formed cell carries. Occasionally a column surfaces a
+/// value in a finer unit instead — seconds, milliseconds, microseconds, or
+/// nanoseconds since the epoch — e.g. data loaded through a path that preserved
+/// a timestamp's resolution. Because a date has no intra-day component, such a
+/// value is always an exact multiple of that unit's count-per-day, so the day
+/// count is recoverable without guessing.
+///
+/// The plain days reading is tried first, so any value already inside
+/// Snowflake's DATE domain (0001-01-01 ..= 9999-12-31) is taken verbatim and
+/// well-formed dates are never second-guessed. Only when days is out of that
+/// domain do we test the finer units, coarsest first; the in-range check on
+/// each candidate makes the choice unambiguous for any realistic date. Returns
+/// `None` when no unit yields an in-range date, letting the caller fall back to
+/// raw text instead of crashing.
+fn decode_date_from_epoch(value: i64) -> Option<chrono::NaiveDate> {
+    use chrono::{Duration, NaiveDate};
+
+    // Snowflake's DATE domain as days since the epoch: 0001-01-01 ..= 9999-12-31.
+    const MIN_DAYS: i64 = -719_162;
+    const MAX_DAYS: i64 = 2_932_896;
+
+    let from_days = |days: i64| -> Option<NaiveDate> {
+        if !(MIN_DAYS..=MAX_DAYS).contains(&days) {
+            return None;
+        }
+        // Bounded above, so `try_days` can't overflow — but it keeps the path
+        // panic-free regardless, unlike the `Duration::days` it replaces.
+        NaiveDate::from_ymd_opt(1970, 1, 1)?.checked_add_signed(Duration::try_days(days)?)
+    };
+
+    // Native encoding (days) first: every in-domain value is taken as-is.
+    if let Some(date) = from_days(value) {
+        return Some(date);
+    }
+
+    // Otherwise the value is in a finer unit. A date divides evenly by the
+    // unit's count-per-day; the quotient is the day count. Coarsest first — the
+    // in-range check rejects a too-coarse guess (its quotient overshoots the
+    // domain), so the first hit is the right unit for any realistic date.
+    const UNITS_PER_DAY: [i64; 4] = [
+        86_400,             // seconds
+        86_400_000,         // milliseconds
+        86_400_000_000,     // microseconds
+        86_400_000_000_000, // nanoseconds
+    ];
+    UNITS_PER_DAY.into_iter().find_map(|per_day| {
+        if value % per_day == 0 {
+            from_days(value / per_day)
+        } else {
+            None
+        }
+    })
 }
 
 /// Parse a decimal "seconds[.fraction]" string into whole seconds plus a
@@ -870,6 +924,32 @@ mod tests {
         assert_eq!(disp("20384", TemporalKind::Date), "2025-10-23");
         assert_eq!(disp("0", TemporalKind::Date), "1970-01-01");
         assert_eq!(disp("-1", TemporalKind::Date), "1969-12-31");
+    }
+
+    #[test]
+    fn decodes_date_from_finer_epoch_units() {
+        // 2025-10-23 is 20384 days since the epoch. The same date arriving in a
+        // finer unit is detected by exact divisibility and normalized to days.
+        // (20384 * 86_400 = 1_761_177_600 seconds, and so on up the units.)
+        assert_eq!(disp("20384", TemporalKind::Date), "2025-10-23"); // days
+        assert_eq!(disp("1761177600", TemporalKind::Date), "2025-10-23"); // seconds
+        assert_eq!(disp("1761177600000", TemporalKind::Date), "2025-10-23"); // millis
+        assert_eq!(disp("1761177600000000", TemporalKind::Date), "2025-10-23"); // micros
+        assert_eq!(disp("1761177600000000000", TemporalKind::Date), "2025-10-23"); // nanos
+        // A pre-epoch date in millis resolves with the sign intact. 1950-01-01
+        // is -7305 days, i.e. -631_152_000_000 ms; the seconds reading
+        // (-7_305_000 days) overshoots the domain, so millis is chosen.
+        assert_eq!(disp("-631152000000", TemporalKind::Date), "1950-01-01");
+    }
+
+    #[test]
+    fn out_of_range_date_falls_back_instead_of_panicking() {
+        // Values that aren't a valid date in days or any finer epoch unit must
+        // fall back to raw text, never panic. Regression test for the
+        // `TimeDelta::days out of bounds` panic on `Duration::days`.
+        assert_eq!(disp("99999999999999", TemporalKind::Date), "99999999999999");
+        assert_eq!(disp(&i64::MAX.to_string(), TemporalKind::Date), i64::MAX.to_string());
+        assert_eq!(disp(&i64::MIN.to_string(), TemporalKind::Date), i64::MIN.to_string());
     }
 
     #[test]
