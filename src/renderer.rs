@@ -917,7 +917,7 @@ impl Renderer {
     }
 
     pub fn draw_spreadsheet(&mut self, editor: &mut Editor) -> io::Result<()> {
-        use crate::spreadsheet::{col_letter, render_cell_text, FORMULA_BAR_HEIGHT, MIN_COL_WIDTH, ROW_NUM_WIDTH};
+        use crate::spreadsheet::{col_letter, render_cell_text, FORMULA_BAR_HEIGHT, MIN_COL_WIDTH};
         use unicode_width::UnicodeWidthChar;
 
         // Update title
@@ -968,6 +968,9 @@ impl Renderer {
 
         let _ = visible_data_rows; // cursor visibility is managed by the event loop now
         let ss = editor.spreadsheet().expect("spreadsheet mode");
+        // Row-number gutter width scales with the row count so the header letters
+        // stay aligned with the data columns even at the bottom of a huge file.
+        let row_num_width = ss.row_num_width();
         let editing = ss.is_editing();
         let (cur_row, cur_col) = ss.cursor;
         let ((sel_r0, sel_c0), (sel_r1, sel_c1)) = ss.selected_range();
@@ -1111,12 +1114,12 @@ impl Renderer {
         {
             let mut line = String::new();
             line.push_str("\x1b[48;5;238m\x1b[38;5;252m\x1b[1m");
-            for _ in 0..ROW_NUM_WIDTH {
+            for _ in 0..row_num_width {
                 line.push(' ');
             }
             line.push_str("\x1b[38;5;240m│\x1b[38;5;252m");
 
-            let mut used: usize = ROW_NUM_WIDTH + 1;
+            let mut used: usize = row_num_width + 1;
             let num_cols = ss.num_cols();
             let mut col_idx = ss.scroll_col;
             while col_idx < num_cols {
@@ -1181,11 +1184,11 @@ impl Renderer {
             } else {
                 line.push_str("\x1b[48;5;238m\x1b[38;5;250m");
             }
-            let row_label = format!("{:>width$} ", row_idx + 1, width = ROW_NUM_WIDTH - 1);
+            let row_label = format!("{:>width$} ", row_idx + 1, width = row_num_width - 1);
             line.push_str(&row_label);
             line.push_str("\x1b[0m\x1b[48;5;234m\x1b[38;5;240m│\x1b[0m");
 
-            let mut used: usize = ROW_NUM_WIDTH + 1;
+            let mut used: usize = row_num_width + 1;
             let num_cols = ss.num_cols();
             let mut col_idx = ss.scroll_col;
             while col_idx < num_cols {

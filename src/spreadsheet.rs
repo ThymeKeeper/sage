@@ -266,6 +266,15 @@ impl Spreadsheet {
         self.rows.first().map(|r| r.len()).unwrap_or(0)
     }
 
+    /// Width of the row-number gutter, sized to hold the largest row number (plus
+    /// a trailing space) and never narrower than the default. Sizing to the total
+    /// row count keeps the header letters aligned with the data columns — and the
+    /// layout stable while scrolling — even when row numbers reach the millions.
+    pub fn row_num_width(&self) -> usize {
+        let digits = self.num_rows().max(1).to_string().len();
+        (digits + 1).max(ROW_NUM_WIDTH)
+    }
+
     pub fn cell(&self, row: usize, col: usize) -> &str {
         self.rows
             .get(row)
@@ -374,6 +383,19 @@ impl Spreadsheet {
     pub fn move_top_left(&mut self, with_selection: bool) {
         self.prepare_selection(with_selection);
         self.cursor = (0, 0);
+    }
+
+    /// Jump to the first row, keeping the current column (Ctrl+Up).
+    pub fn move_first_row(&mut self, with_selection: bool) {
+        self.prepare_selection(with_selection);
+        self.cursor.0 = 0;
+    }
+
+    /// Jump to the last row, keeping the current column (Ctrl+Down). O(1)
+    /// regardless of row count, so it stays instant on multi-million-row files.
+    pub fn move_last_row(&mut self, with_selection: bool) {
+        self.prepare_selection(with_selection);
+        self.cursor.0 = self.num_rows().saturating_sub(1);
     }
 
     pub fn move_bottom_right(&mut self, with_selection: bool) {
@@ -658,7 +680,8 @@ impl Spreadsheet {
             return GridHit::Outside;
         }
 
-        if col < ROW_NUM_WIDTH {
+        let rw = self.row_num_width();
+        if col < rw {
             if is_data_row {
                 let row_idx = self.scroll_row + (row - data_start);
                 if row_idx < self.num_rows() {
@@ -669,11 +692,11 @@ impl Spreadsheet {
         }
 
         // Fixed separator between row-num and first visible column
-        if col == ROW_NUM_WIDTH {
+        if col == rw {
             return GridHit::Outside;
         }
 
-        let mut pos = ROW_NUM_WIDTH + 1;
+        let mut pos = rw + 1;
         let mut cur_col = self.scroll_col;
         while cur_col < self.num_cols() && pos < term_width as usize {
             let w = self
@@ -942,7 +965,7 @@ impl Spreadsheet {
         if self.cursor.1 < self.scroll_col {
             self.scroll_col = self.cursor.1;
         } else {
-            let mut width_needed = ROW_NUM_WIDTH + 1;
+            let mut width_needed = self.row_num_width() + 1;
             for c in self.scroll_col..=self.cursor.1 {
                 let cw = self.column_widths.get(c).copied().unwrap_or(MIN_COL_WIDTH);
                 width_needed += cw + 1;
@@ -959,38 +982,51 @@ impl Spreadsheet {
         }
     }
 
+    /// The auto-fit cap for a cell on row `r`. The first row usually holds column
+    /// headers, so it may size a column to fit fully (up to the resize cap) and
+    /// its label is never truncated on load; data rows stay capped at the
+    /// narrower MAX_COL_WIDTH so a single long value can't blow a column open.
+    fn col_width_cap(r: usize) -> usize {
+        if r == 0 {
+            MAX_RESIZE_WIDTH
+        } else {
+            MAX_COL_WIDTH
+        }
+    }
+
     fn recompute_column_widths(&mut self) {
         let num_cols = self.num_cols();
         let mut widths = vec![MIN_COL_WIDTH; num_cols];
-        for row in &self.rows {
+        for (r, row) in self.rows.iter().enumerate() {
+            let cap = Self::col_width_cap(r);
             for (c, cell) in row.iter().enumerate() {
                 if c >= widths.len() {
                     continue;
                 }
-                let w = cell_grid_width(cell);
+                let w = cell_grid_width(cell).min(cap);
                 if w > widths[c] {
-                    widths[c] = w.min(MAX_COL_WIDTH);
+                    widths[c] = w;
                 }
             }
         }
         for w in widths.iter_mut() {
-            *w = (*w).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+            *w = (*w).clamp(MIN_COL_WIDTH, MAX_RESIZE_WIDTH);
         }
         self.column_widths = widths;
     }
 
     fn recompute_col_width(&mut self, col: usize) {
         let mut w = MIN_COL_WIDTH;
-        for row in &self.rows {
+        for (r, row) in self.rows.iter().enumerate() {
             if let Some(cell) = row.get(col) {
-                let cw = cell_grid_width(cell);
+                let cw = cell_grid_width(cell).min(Self::col_width_cap(r));
                 if cw > w {
-                    w = cw.min(MAX_COL_WIDTH);
+                    w = cw;
                 }
             }
         }
         if col < self.column_widths.len() {
-            self.column_widths[col] = w.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+            self.column_widths[col] = w.clamp(MIN_COL_WIDTH, MAX_RESIZE_WIDTH);
         }
     }
 }
@@ -1643,6 +1679,21 @@ mod tests {
         assert_eq!(ss.column_widths[0], MIN_COL_WIDTH);
         ss.end_mouse();
         assert_eq!(ss.mouse_mode, MouseMode::None);
+    }
+
+    #[test]
+    fn header_row_drives_column_width() {
+        // The first row usually holds column headers; a long header must not be
+        // truncated on load even when the data below it is short. Data cells stay
+        // capped at the narrower MAX_COL_WIDTH.
+        let mut ss = Spreadsheet::new_empty(b',');
+        ss.rows = vec![
+            vec!["Transaction Description Field".into(), "n".into()], // 29-char header
+            vec!["12".into(), "a data value far longer than twenty characters".into()],
+        ];
+        ss.recompute_column_widths();
+        assert_eq!(ss.column_widths[0], 29); // header drives the full width
+        assert_eq!(ss.column_widths[1], MAX_COL_WIDTH); // long data stays capped
     }
 
     #[test]

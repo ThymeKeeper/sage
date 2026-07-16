@@ -2132,6 +2132,16 @@ fn run_and_capture(child: std::process::Child) -> (String, bool) {
     }
 }
 
+/// Number of visible data rows in the spreadsheet grid, for a full-screen page
+/// step. Mirrors the layout math in `ensure_ss_cursor_visible_with_bottom`
+/// (status bar + formula bar + divider + header above the data area).
+fn spreadsheet_visible_rows() -> usize {
+    use crate::spreadsheet::FORMULA_BAR_HEIGHT;
+    let (_, height) = crossterm::terminal::size().unwrap_or((80, 25));
+    let data_start = FORMULA_BAR_HEIGHT + 2;
+    (height as usize).saturating_sub(1 + data_start).max(1)
+}
+
 fn ensure_ss_cursor_visible(editor: &mut editor::Editor) -> io::Result<()> {
     ensure_ss_cursor_visible_with_bottom(editor, 0)
 }
@@ -2526,12 +2536,22 @@ fn handle_spreadsheet_key(
         let ss = editor.spreadsheet_mut().expect("spreadsheet");
         match key.code {
             KeyCode::Up => {
-                ss.move_up(shift);
+                // Ctrl+Up jumps to the first row (fast navigation for huge files).
+                if ctrl {
+                    ss.move_first_row(shift);
+                } else {
+                    ss.move_up(shift);
+                }
                 *needs_redraw = true;
                 true
             }
             KeyCode::Down => {
-                ss.move_down(shift);
+                // Ctrl+Down jumps to the last row — instant even on millions of rows.
+                if ctrl {
+                    ss.move_last_row(shift);
+                } else {
+                    ss.move_down(shift);
+                }
                 *needs_redraw = true;
                 true
             }
@@ -2566,12 +2586,12 @@ fn handle_spreadsheet_key(
                 true
             }
             KeyCode::PageUp => {
-                ss.page_up(20, shift);
+                ss.page_up(spreadsheet_visible_rows(), shift);
                 *needs_redraw = true;
                 true
             }
             KeyCode::PageDown => {
-                ss.page_down(20, shift);
+                ss.page_down(spreadsheet_visible_rows(), shift);
                 *needs_redraw = true;
                 true
             }
