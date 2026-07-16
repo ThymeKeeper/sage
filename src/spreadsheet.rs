@@ -164,13 +164,18 @@ impl Spreadsheet {
     pub fn from_file(path: &Path) -> io::Result<Self> {
         let delimiter = detect_delimiter(path);
         let content = std::fs::read_to_string(path)?;
+        // Strip a leading UTF-8 BOM. It is zero-width per Unicode, so it doesn't
+        // count toward the column width, yet many terminals still render it as a
+        // cell — which makes the first header cell look one column too wide. Text
+        // mode strips it in Buffer::from_string; the grid loader must too.
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
 
         // Parse with null awareness: an unquoted-empty field is a null (shown as
         // ∅), a quoted "" is an empty string. `rows` holds "" for both; the
         // distinction lives in `null_mask`.
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut null_mask: Vec<Vec<bool>> = Vec::new();
-        for record in crate::dsv::parse(&content, delimiter) {
+        for record in crate::dsv::parse(content, delimiter) {
             let mut row = Vec::with_capacity(record.len());
             let mut mask = Vec::with_capacity(record.len());
             for field in record {
@@ -1694,6 +1699,19 @@ mod tests {
         ss.recompute_column_widths();
         assert_eq!(ss.column_widths[0], 29); // header drives the full width
         assert_eq!(ss.column_widths[1], MAX_COL_WIDTH); // long data stays capped
+    }
+
+    #[test]
+    fn strips_leading_bom_from_first_header_cell() {
+        use std::io::Write;
+        // Excel-style UTF-8 BOM before the first header field.
+        let mut tmp = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        write!(tmp, "\u{FEFF}GTWY,DEST\nYYZ,PUJ\n").unwrap();
+        tmp.flush().unwrap();
+        let ss = Spreadsheet::from_file(tmp.path()).unwrap();
+        // The BOM is gone: the header cell is "GTWY" (4 cols), not "\u{FEFF}GTWY".
+        assert_eq!(ss.cell(0, 0), "GTWY");
+        assert_eq!(ss.column_widths[0], 4);
     }
 
     #[test]
