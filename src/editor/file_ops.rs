@@ -89,6 +89,7 @@ impl Editor {
             self.selection_start = None;
             self.modified = false;
             self.viewport_offset = (0, 0);
+            self.viewport_top_seg = 0;
             self.last_saved_undo_len = 0;
             self.read_only = self.is_file_read_only(path);
             self.syntax = SyntaxHighlighter::new();
@@ -106,6 +107,7 @@ impl Editor {
         self.selection_start = None;
         self.modified = false;
         self.viewport_offset = (0, 0);
+        self.viewport_top_seg = 0;
         self.last_saved_undo_len = 0;
         self.mouse_selecting = false;
         self.word_select_mode = false;

@@ -60,6 +60,7 @@ impl HelpScreen {
                 ("Ctrl+Arrow Keys", "Move by word/paragraph"),
                 ("Home / End", "Start / End of line"),
                 ("Page Up / Page Down", "Scroll page"),
+                ("Ctrl+W", "Toggle word wrap (plain text & Markdown)"),
             ]),
             ("SEARCH & REPLACE", vec![
                 ("Ctrl+F", "Find / Find next"),

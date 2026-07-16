@@ -309,6 +309,17 @@ impl Renderer {
         let find_matches = editor.get_find_matches();
         let current_find_match = editor.get_current_find_match();
 
+        // Word-wrap layout: when active, each buffer line may span several screen
+        // rows. Precompute the (vline, seg) at each screen row so the draw loop and
+        // cursor placement share one walk of the visual-row space.
+        let wrap_active = editor.is_wrap_active();
+        let cursor_line_idx = editor.cursor_position().0;
+        let wrap_rows: Vec<(usize, usize)> = if wrap_active {
+            editor.visual_rows((viewport_offset.0, editor.viewport_top_seg()), content_height, width as usize)
+        } else {
+            Vec::new()
+        };
+
         // Hide cursor while drawing (but not if bottom window is focused - it handles its own cursor)
         // Only hide cursor for full redraws to avoid blinking on differential updates (e.g., mouse clicks)
         #[cfg(target_os = "windows")]
@@ -326,8 +337,27 @@ impl Renderer {
 
         // Draw all lines
         for screen_row in 0..content_height {
+            // Word-wrap path: render one visual segment per screen row.
+            if wrap_active {
+                let (vline, seg) = wrap_rows[screen_row];
+                let line_content = build_wrap_row(
+                    editor,
+                    vline,
+                    seg,
+                    width as usize,
+                    selection,
+                    matching_brackets,
+                    matching_text_positions,
+                    find_matches,
+                    current_find_match,
+                    cursor_line_idx,
+                );
+                self.emit_row(screen_row, line_content)?;
+                continue;
+            }
+
             let mut line_content = String::with_capacity(width as usize);
-            
+
             // Calculate which logical line we're displaying
             // Logical lines: 0 and 1 are virtual, 2+ map to buffer lines 0+
             let logical_line = viewport_offset.0 + screen_row;
@@ -680,27 +710,7 @@ impl Renderer {
                 }
             }
             
-            // Only update if this line has changed
-            #[cfg(target_os = "windows")]
-            {
-                if self.needs_full_redraw || self.last_screen.get(screen_row) != Some(&line_content) {
-                    write!(self.stdout, "\x1b[{};1H{}", screen_row + 1, line_content)?;
-                    if screen_row < self.last_screen.len() {
-                        self.last_screen[screen_row] = line_content;
-                    }
-                }
-            }
-            
-            #[cfg(not(target_os = "windows"))]
-            {
-                if self.last_screen.get(screen_row) != Some(&line_content) {
-                    execute!(self.stdout, MoveTo(0, screen_row as u16))?;
-                    print!("{}", line_content);
-                    if screen_row < self.last_screen.len() {
-                        self.last_screen[screen_row] = line_content;
-                    }
-                }
-            }
+            self.emit_row(screen_row, line_content)?;
         }
 
         // Build status line - position it above any bottom window
@@ -741,7 +751,15 @@ impl Renderer {
             crate::syntax::Language::Csv => "CSV",
             crate::syntax::Language::Tsv => "TSV",
         };
-        let language_info = format!(" [{}] ", language_name);
+        let language_info = if editor.is_wrappable_language() {
+            if editor.is_wrap_active() {
+                format!(" [{} wrap] ", language_name)
+            } else {
+                format!(" [{} no-wrap] ", language_name)
+            }
+        } else {
+            format!(" [{}] ", language_name)
+        };
 
         // Add kernel info if in REPL mode
         let mut kernel_info = if editor.is_repl_mode() {
@@ -854,6 +872,13 @@ impl Renderer {
         // Position cursor - map buffer position to screen position
         // Only show cursor if there's no bottom window (find/replace is closed)
         if bottom_window_height == 0 {
+            if wrap_active {
+                if let Some((srow, scol)) = editor.wrap_screen_position(content_height, width as usize) {
+                    self.show_cursor_at(srow, scol)?;
+                } else {
+                    self.hide_cursor_now()?;
+                }
+            } else {
             let (cursor_line, cursor_col) = editor.cursor_position();
             let logical_cursor_line = cursor_line + 2; // Add 2 for virtual lines before buffer
 
@@ -882,6 +907,7 @@ impl Renderer {
 
                 #[cfg(not(target_os = "windows"))]
                 execute!(self.stdout, Hide)?;
+            }
             }
         }
         // If find/replace is open, cursor will be positioned by find_replace.draw()
@@ -1403,6 +1429,17 @@ impl Renderer {
         // Calculate content height (excluding status bar and bottom window)
         let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize;
 
+        // Word-wrap mode resolves the cursor's screen cell through the visual-row walk.
+        if editor.is_wrap_active() {
+            if let Some((srow, scol)) = editor.wrap_screen_position(content_height, width as usize) {
+                self.show_cursor_at(srow, scol)?;
+            } else {
+                self.hide_cursor_now()?;
+            }
+            self.stdout.flush()?;
+            return Ok(());
+        }
+
         // Calculate logical cursor position (add 2 for virtual lines before buffer)
         let logical_cursor_line = cursor_line + 2;
 
@@ -1483,7 +1520,15 @@ impl Renderer {
             crate::syntax::Language::Csv => "CSV",
             crate::syntax::Language::Tsv => "TSV",
         };
-        let language_info = format!(" [{}] ", language_name);
+        let language_info = if editor.is_wrappable_language() {
+            if editor.is_wrap_active() {
+                format!(" [{} wrap] ", language_name)
+            } else {
+                format!(" [{} no-wrap] ", language_name)
+            }
+        } else {
+            format!(" [{}] ", language_name)
+        };
 
         // Add kernel info if in REPL mode
         let mut kernel_info = if editor.is_repl_mode() {
@@ -1556,6 +1601,239 @@ impl Renderer {
 
         Ok(())
     }
+
+    /// Diff-write one already-rendered content row at `screen_row`.
+    fn emit_row(&mut self, screen_row: usize, line_content: String) -> io::Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            if self.needs_full_redraw || self.last_screen.get(screen_row) != Some(&line_content) {
+                write!(self.stdout, "\x1b[{};1H{}", screen_row + 1, line_content)?;
+                if screen_row < self.last_screen.len() {
+                    self.last_screen[screen_row] = line_content;
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            if self.last_screen.get(screen_row) != Some(&line_content) {
+                execute!(self.stdout, MoveTo(0, screen_row as u16))?;
+                print!("{}", line_content);
+                if screen_row < self.last_screen.len() {
+                    self.last_screen[screen_row] = line_content;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Move the terminal cursor to a screen cell and show it.
+    fn show_cursor_at(&mut self, screen_row: usize, screen_col: usize) -> io::Result<()> {
+        #[cfg(target_os = "windows")]
+        write!(self.stdout, "\x1b[{};{}H\x1b[?25h", screen_row + 1, screen_col + 1)?;
+        #[cfg(not(target_os = "windows"))]
+        execute!(self.stdout, MoveTo(screen_col as u16, screen_row as u16), Show)?;
+        Ok(())
+    }
+
+    /// Hide the terminal cursor.
+    fn hide_cursor_now(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "windows")]
+        write!(self.stdout, "\x1b[?25l")?;
+        #[cfg(not(target_os = "windows"))]
+        execute!(self.stdout, Hide)?;
+        Ok(())
+    }
+}
+
+/// Append one character to `out` with selection / find / bracket / matching-text
+/// / syntax styling. Shared by the word-wrap renderer; mirrors the per-character
+/// styling of the non-wrapped path.
+fn push_styled_char(
+    out: &mut String,
+    ch: char,
+    is_selected: bool,
+    is_current_find_match: bool,
+    is_find_match: bool,
+    is_matching_bracket: bool,
+    is_matching_text: bool,
+    syntax_state: SyntaxState,
+    line_bg_color: &str,
+) {
+    if is_selected {
+        out.push_str("\x1b[48;5;30m\x1b[30m");
+    } else if is_current_find_match {
+        out.push_str("\x1b[48;5;172m\x1b[30m");
+    } else if is_find_match {
+        out.push_str("\x1b[48;5;94m");
+    } else if is_matching_bracket {
+        out.push_str("\x1b[93m\x1b[1m");
+    } else if is_matching_text {
+        out.push_str("\x1b[48;5;23m");
+    } else {
+        match syntax_state {
+            SyntaxState::StringDouble
+            | SyntaxState::StringSingle
+            | SyntaxState::StringTriple
+            | SyntaxState::StringTripleSingle => out.push_str(syntax_colors::STRING),
+            SyntaxState::LineComment | SyntaxState::BlockComment => {
+                out.push_str(syntax_colors::COMMENT)
+            }
+            SyntaxState::Keyword => out.push_str(syntax_colors::KEYWORD),
+            SyntaxState::Type => out.push_str(syntax_colors::TYPE),
+            SyntaxState::Function => out.push_str(syntax_colors::FUNCTION),
+            SyntaxState::Number => out.push_str(syntax_colors::NUMBER),
+            SyntaxState::Operator => out.push_str(syntax_colors::OPERATOR),
+            SyntaxState::Punctuation => out.push_str(syntax_colors::COMMENT),
+            SyntaxState::SqlKeyword => out.push_str(&get_sql_colors().keyword),
+            SyntaxState::SqlFunction => out.push_str(&get_sql_colors().function),
+            SyntaxState::SqlNumber => out.push_str(&get_sql_colors().number),
+            SyntaxState::SqlText => out.push_str(&get_sql_colors().text),
+            SyntaxState::SqlComment => out.push_str(&get_sql_colors().comment),
+            SyntaxState::SqlString => out.push_str(&get_sql_colors().string),
+            SyntaxState::Normal => out.push_str(syntax_colors::NORMAL),
+        }
+    }
+    out.push(ch);
+    if is_selected || is_current_find_match || is_find_match {
+        out.push_str("\x1b[0m");
+        out.push_str(line_bg_color);
+    } else if is_matching_bracket {
+        out.push_str("\x1b[0m");
+        out.push_str(line_bg_color);
+    } else if is_matching_text {
+        out.push_str("\x1b[49m");
+        out.push_str(line_bg_color);
+    } else if syntax_state != SyntaxState::Normal && syntax_state != SyntaxState::Punctuation {
+        out.push_str("\x1b[39m");
+    }
+}
+
+/// Build the styled string for a single word-wrapped screen row at visual
+/// position `(vline, seg_idx)`. Draws one segment of a buffer line with its
+/// hanging indent; no horizontal scrolling applies while wrapped.
+fn build_wrap_row(
+    editor: &crate::editor::Editor,
+    vline: usize,
+    seg_idx: usize,
+    width: usize,
+    selection: Option<(usize, usize)>,
+    matching_brackets: Option<(usize, usize)>,
+    matching_text_positions: &[(usize, usize)],
+    find_matches: &[(usize, usize)],
+    current_find_match: Option<usize>,
+    cursor_line: usize,
+) -> String {
+    let buffer = editor.buffer();
+    let mut out = String::with_capacity(width);
+
+    // Virtual `~` rows: before the buffer, or past its last line.
+    if vline < 2 || (vline - 2) >= buffer.len_lines() {
+        out.push_str("\x1b[48;5;234m");
+        out.push_str("\x1b[90m");
+        out.push('~');
+        out.push_str("\x1b[39m");
+        for _ in 1..width {
+            out.push(' ');
+        }
+        out.push_str("\x1b[0m");
+        return out;
+    }
+
+    let file_row = vline - 2;
+    let line_str = buffer.line(file_row);
+    let content = line_str.strip_suffix('\n').unwrap_or(&line_str);
+    let segs = editor.line_segments(file_row, width);
+    let seg = if seg_idx < segs.len() {
+        segs[seg_idx]
+    } else {
+        *segs.last().unwrap()
+    };
+    let line_byte_start = buffer.line_to_byte(file_row);
+    let syntax_spans = editor.get_syntax_spans(file_row);
+
+    let is_current_line = file_row == cursor_line;
+    let line_bg_color = if is_current_line {
+        "\x1b[48;5;237m"
+    } else {
+        "\x1b[48;5;234m"
+    };
+    out.push_str(line_bg_color);
+
+    let mut screen_col = 0usize;
+    // Hanging indent (continuation rows render blank padding here).
+    for _ in 0..seg.indent {
+        out.push(' ');
+        screen_col += 1;
+    }
+
+    let seg_text = &content[seg.start..seg.end];
+    let mut local = seg.start; // byte offset within the line
+    for ch in seg_text.chars() {
+        let char_width = ch.width().unwrap_or(1);
+        if screen_col + char_width > width {
+            break;
+        }
+        let byte_pos = line_byte_start + local;
+        let is_selected = selection.map_or(false, |(s, e)| byte_pos >= s && byte_pos < e);
+        let is_matching_bracket =
+            matching_brackets.map_or(false, |(p1, p2)| byte_pos == p1 || byte_pos == p2);
+        let is_matching_text = matching_text_positions
+            .iter()
+            .any(|(s, e)| byte_pos >= *s && byte_pos < *e);
+        let (is_find_match, is_current_find_match) = find_matches
+            .iter()
+            .enumerate()
+            .find(|(_, (s, e))| byte_pos >= *s && byte_pos < *e)
+            .map(|(idx, _)| (true, current_find_match == Some(idx)))
+            .unwrap_or((false, false));
+        let mut syntax_state = SyntaxState::Normal;
+        if let Some(spans) = syntax_spans {
+            for span in spans {
+                if local >= span.start && local < span.end {
+                    syntax_state = span.state;
+                    break;
+                }
+            }
+        }
+        push_styled_char(
+            &mut out,
+            ch,
+            is_selected,
+            is_current_find_match,
+            is_find_match,
+            is_matching_bracket,
+            is_matching_text,
+            syntax_state,
+            line_bg_color,
+        );
+        screen_col += char_width;
+        local += ch.len_utf8();
+    }
+
+    // Empty-line selection indicator (only a genuinely empty line has an empty
+    // first segment; continuation segments always contain at least one char).
+    if seg.start == seg.end && seg.indent == 0 {
+        if let Some((s, e)) = selection {
+            let line_end_byte = if file_row < buffer.len_lines() - 1 {
+                buffer.line_to_byte(file_row + 1)
+            } else {
+                buffer.len_bytes()
+            };
+            if s < line_end_byte && e > line_byte_start {
+                out.push_str("\x1b[36m");
+                out.push('│');
+                out.push_str("\x1b[39m");
+                screen_col += 1;
+            }
+        }
+    }
+
+    while screen_col < width {
+        out.push(' ');
+        screen_col += 1;
+    }
+    out.push_str("\x1b[0m");
+    out
 }
 
 fn render_centered(label: &str, width: usize) -> String {

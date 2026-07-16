@@ -17,6 +17,7 @@ mod mouse;
 mod viewport;
 mod matching;
 mod notebook;
+mod wrap;
 
 pub struct Editor {
     buffer: Buffer,
@@ -25,6 +26,8 @@ pub struct Editor {
     file_path: Option<PathBuf>,
     modified: bool,
     viewport_offset: (usize, usize),  // (row, col) offset for scrolling
+    viewport_top_seg: usize,          // Wrap mode: segment index of the top buffer line
+    word_wrap: bool,                  // Word-wrap preference (active only in plain text/Markdown)
     last_saved_undo_len: usize,       // Track save point for modified flag
     clipboard: ClipboardProvider,      // System clipboard (supports native + OSC 52 for SSH)
     mouse_selecting: bool,            // Track if we're actively selecting with mouse
@@ -62,6 +65,8 @@ impl Editor {
             file_path: None,
             modified: false,
             viewport_offset: (0, 0),
+            viewport_top_seg: 0,
+            word_wrap: true, // Wrap by default in plain text / Markdown; Ctrl+W toggles
             last_saved_undo_len: 0,
             clipboard: ClipboardProvider::new(),
             mouse_selecting: false,
@@ -331,6 +336,9 @@ impl Editor {
                     self.selection_start = None;
                     self.preferred_column = None; // Clear preferred column when collapsing selection
                     cursor_moved = true;
+                } else if self.is_wrap_active() {
+                    self.visual_move_vertical(false);
+                    cursor_moved = true;
                 } else {
                     let current_line = self.buffer.byte_to_line(self.cursor);
                     if current_line > 0 {
@@ -402,6 +410,9 @@ impl Editor {
                     self.cursor = end;
                     self.selection_start = None;
                     self.preferred_column = None; // Clear preferred column when collapsing selection
+                    cursor_moved = true;
+                } else if self.is_wrap_active() {
+                    self.visual_move_vertical(true);
                     cursor_moved = true;
                 } else {
                     let current_line = self.buffer.byte_to_line(self.cursor);
@@ -543,8 +554,11 @@ impl Editor {
                     // Set anchor at exact cursor position (don't skip spaces)
                     self.selection_start = Some(self.cursor);
                 }
-                let current_line = self.buffer.byte_to_line(self.cursor);
-                if current_line > 0 {
+                if self.is_wrap_active() {
+                    self.visual_move_vertical(false);
+                    cursor_moved = true;
+                } else if self.buffer.byte_to_line(self.cursor) > 0 {
+                    let current_line = self.buffer.byte_to_line(self.cursor);
                     // Set preferred column if not already set
                     if self.preferred_column.is_none() {
                         let (_, col) = self.cursor_position();
@@ -612,8 +626,11 @@ impl Editor {
                     // Set anchor at exact cursor position (don't skip spaces)
                     self.selection_start = Some(self.cursor);
                 }
-                let current_line = self.buffer.byte_to_line(self.cursor);
-                if current_line < self.buffer.len_lines() - 1 {
+                if self.is_wrap_active() {
+                    self.visual_move_vertical(true);
+                    cursor_moved = true;
+                } else if self.buffer.byte_to_line(self.cursor) < self.buffer.len_lines() - 1 {
+                    let current_line = self.buffer.byte_to_line(self.cursor);
                     // Set preferred column if not already set
                     if self.preferred_column.is_none() {
                         let (_, col) = self.cursor_position();

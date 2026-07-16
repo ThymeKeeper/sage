@@ -62,6 +62,10 @@ impl Editor {
 
     /// Update viewport to follow cursor with scrolloff
     pub(super) fn update_viewport(&mut self, viewport_height: usize, viewport_width: usize) {
+        if self.is_wrap_active() {
+            self.update_viewport_wrap(viewport_height, viewport_width);
+            return;
+        }
         let scrolloff = 3;
         let (cursor_line, cursor_col) = self.cursor_position();
 
@@ -108,6 +112,12 @@ impl Editor {
             if screen_row >= (height - 1) as usize {
                 return None;
             }
+        }
+
+        // Word-wrap mode maps screen coordinates through the visual-row walker.
+        if self.is_wrap_active() {
+            let width = self.wrap_width();
+            return self.wrap_screen_to_buffer(screen_col, screen_row, width);
         }
 
         // Calculate logical line from screen row
@@ -172,6 +182,11 @@ impl Editor {
 
     /// Scroll viewport vertically without moving cursor
     pub fn scroll_viewport_vertical(&mut self, lines: i32) {
+        if self.is_wrap_active() {
+            let width = self.wrap_width();
+            self.scroll_wrap_vertical(lines, width);
+            return;
+        }
         if lines > 0 {
             // Scrolling down (viewport moves down, content moves up)
             self.viewport_offset.0 = self.viewport_offset.0.saturating_add(lines as usize);
@@ -189,6 +204,11 @@ impl Editor {
 
     /// Scroll viewport horizontally without moving cursor
     pub fn scroll_viewport_horizontal(&mut self, cols: i32) {
+        // No horizontal scrolling while wrapped — the whole line is always visible,
+        // and letting viewport_offset.1 drift would leak into the non-wrap view.
+        if self.is_wrap_active() {
+            return;
+        }
         if cols > 0 {
             // Scrolling right (viewport moves right, content moves left)
             self.viewport_offset.1 = self.viewport_offset.1.saturating_add(cols as usize);
@@ -224,6 +244,16 @@ impl Editor {
 
     /// Get cursor screen position (for drawing overlays like autocomplete)
     pub fn cursor_screen_position(&self) -> (usize, usize) {
+        if self.is_wrap_active() {
+            let width = self.wrap_width();
+            let content_height = crossterm::terminal::size()
+                .map(|(_, h)| h as usize)
+                .unwrap_or(50);
+            if let Some((row, col)) = self.wrap_screen_position(content_height, width) {
+                return (col, row);
+            }
+            return (0, 0);
+        }
         let (cursor_line, cursor_col) = self.cursor_position();
         let (viewport_row, viewport_col) = self.viewport_offset();
 

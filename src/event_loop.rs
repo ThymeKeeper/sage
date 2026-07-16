@@ -1067,6 +1067,39 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         commands::Command::ToggleCase
                     }
 
+                    // Toggle Word Wrap (Ctrl+W) — takes effect in plain text & Markdown
+                    KeyCode::Char('w') | KeyCode::Char('W') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let now_on = !editor.word_wrap_enabled();
+                        editor.set_word_wrap(now_on);
+                        // Drop any horizontal scroll / stale top-segment, then re-follow the cursor.
+                        editor.reset_wrap_view();
+                        let bottom_height = if find_replace.is_some() {
+                            3
+                        } else if output_pane_visible {
+                            output_pane_height
+                        } else {
+                            0
+                        };
+                        editor.update_viewport_for_cursor_with_bottom(bottom_height);
+                        let wrappable = matches!(
+                            *editor.get_language(),
+                            syntax::Language::PlainText | syntax::Language::Markdown
+                        );
+                        editor.status_message = Some((
+                            match (now_on, wrappable) {
+                                (true, true) => "Word wrap: on".to_string(),
+                                (true, false) => {
+                                    "Word wrap: on (applies in plain text & Markdown)".to_string()
+                                }
+                                (false, _) => "Word wrap: off".to_string(),
+                            },
+                            false,
+                        ));
+                        renderer.force_redraw();
+                        needs_redraw = true;
+                        commands::Command::None
+                    }
+
                     // Execute Cell (Ctrl+E as alternative)
                     KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Only allow execution in REPL-mode languages (Python or SQL).
@@ -1252,6 +1285,10 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         if let Ok(Some(language)) = result {
                             // Set the new language
                             editor.set_language(language);
+                            // Switching language can flip whether wrap is active, which
+                            // changes what preferred_column means (visual vs logical); clear
+                            // the wrap view state so a stale column can't cause a jump.
+                            editor.reset_wrap_view();
 
                             // Check if we need to enable/disable REPL mode
                             if language == syntax::Language::Python {
