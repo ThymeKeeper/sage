@@ -486,14 +486,16 @@ fn render_table(
 
     let aligns: Vec<Align> = columns.iter().map(|c| align_for(&c.type_name)).collect();
     let type_labels: Vec<String> = columns.iter().map(|c| short_type(&c.type_name)).collect();
+    // Quoted identifiers can contain newlines too, so flatten names like cells.
+    let names: Vec<String> = columns.iter().map(|c| flatten_control(&c.name)).collect();
 
     // Width per column is the max of: column name, type label, and any
     // value's display width — capped at MAX_CELL.
-    let mut widths: Vec<usize> = columns
+    let mut widths: Vec<usize> = names
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            UnicodeWidthStr::width(c.name.as_str())
+        .map(|(i, name)| {
+            UnicodeWidthStr::width(name.as_str())
                 .max(UnicodeWidthStr::width(type_labels[i].as_str()))
                 .min(MAX_CELL)
         })
@@ -503,7 +505,7 @@ fn render_table(
             if i >= widths.len() {
                 break;
             }
-            let s = cell_to_string(cell);
+            let s = flatten_control(&cell_to_string(cell));
             let w = UnicodeWidthStr::width(s.as_str()).min(MAX_CELL);
             if w > widths[i] {
                 widths[i] = w;
@@ -517,7 +519,7 @@ fn render_table(
     // when paired with right-aligned numeric values below.
     push_row(
         &mut out,
-        columns.iter().map(|c| c.name.as_str()),
+        names.iter().map(|s| s.as_str()),
         &widths,
         &vec![Align::Left; widths.len()],
         |_| None,
@@ -536,7 +538,7 @@ fn render_table(
         let cells: Vec<String> = (0..widths.len())
             .map(|i| {
                 row.get(i)
-                    .map(cell_to_string)
+                    .map(|v| flatten_control(&cell_to_string(v)))
                     .unwrap_or_else(|| NULL_SENTINEL.to_string())
             })
             .collect();
@@ -647,6 +649,27 @@ fn push_row<'a, I: IntoIterator<Item = &'a str>>(
         out.push(BOX_V);
     }
     out.push('\n');
+}
+
+/// Collapse newlines — and any other control characters — to single spaces so
+/// a multi-line value can't break the table's one-line-per-row box layout
+/// (CRLF becomes one space, not two). Display-only: the CSV spool and the F8
+/// viewer keep the raw value.
+fn flatten_control(s: &str) -> String {
+    if !s.contains(|c: char| c.is_control()) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut prev_cr = false;
+    for c in s.chars() {
+        if prev_cr && c == '\n' {
+            prev_cr = false;
+            continue;
+        }
+        prev_cr = c == '\r';
+        out.push(if c.is_control() { ' ' } else { c });
+    }
+    out
 }
 
 fn cell_to_string(v: &serde_json::Value) -> String {
@@ -887,18 +910,36 @@ fn format_fractional_nanos(nanos: u32) -> String {
 /// Truncate a string to fit in `max` display columns. Appends `…` when
 /// truncated. Operates on character boundaries (not bytes) so UTF-8 stays
 /// valid.
+/// Truncate `s` to at most `max` display columns, appending `…` when cut.
+/// Budgeted in columns (not chars) so width-2 CJK/fullwidth content can't
+/// overflow the computed column width and push the box borders out of line.
 fn truncate(s: &str, max: usize) -> String {
     use unicode_width::UnicodeWidthStr;
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
     if max <= 1 {
-        return s.chars().take(max).collect();
+        return take_columns(s, max);
     }
-    let take = max.saturating_sub(1);
-    let mut t: String = s.chars().take(take).collect();
+    let mut t = take_columns(s, max - 1);
     t.push('…');
     t
+}
+
+/// The longest prefix of `s` that fits in `budget` display columns.
+fn take_columns(s: &str, budget: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1055,5 +1096,66 @@ mod tests {
         // The null sentinel is wrapped in the dim grey; the real value is not.
         assert!(table.contains("\x1b[38;5;244m∅"), "null cell should be dimmed: {table:?}");
         assert!(!table.contains("\x1b[38;5;244mv"), "value cell should not be dimmed");
+    }
+
+    #[test]
+    fn render_table_flattens_newlines() {
+        let columns = vec![ColumnMeta {
+            // Quoted identifiers can carry newlines too.
+            name: "col\nname".to_string(),
+            type_name: "TEXT".to_string(),
+        }];
+        let rows = vec![
+            vec![Value::String("line1\nline2".into())],
+            vec![Value::String("a\r\nb\tc".into())],
+        ];
+        let table = render_table(&columns, &rows);
+        assert!(table.contains("col name"), "header should flatten: {table:?}");
+        assert!(table.contains("line1 line2"), "LF should become a space: {table:?}");
+        assert!(table.contains("a b c"), "CRLF/tab should each become one space: {table:?}");
+        // Every rendered line must still start and end on a box-drawing
+        // character — an unflattened newline would split a row in two.
+        for line in table.lines() {
+            let first = line.chars().next().unwrap();
+            let last = line.chars().last().unwrap();
+            assert!([BOX_TL, BOX_LT, BOX_BL, BOX_V].contains(&first), "broken row: {line:?}");
+            assert!([BOX_TR, BOX_RT, BOX_BR, BOX_V].contains(&last), "broken row: {line:?}");
+        }
+    }
+
+    #[test]
+    fn render_table_keeps_wide_cells_within_borders() {
+        use unicode_width::UnicodeWidthStr;
+        let columns = vec![ColumnMeta {
+            name: "w".to_string(),
+            type_name: "TEXT".to_string(),
+        }];
+        // 30 width-2 chars split across two lines: flattens to 61 display
+        // columns, forcing a truncation that must land on a column budget,
+        // not a char count.
+        let rows = vec![vec![Value::String(format!(
+            "{}\n{}",
+            "好".repeat(15),
+            "好".repeat(15)
+        ))]];
+        let table = render_table(&columns, &rows);
+        // Every ANSI-free line (borders, header, data) renders to the same
+        // display width; a char-counted truncation overflows the border.
+        let border_w = UnicodeWidthStr::width(table.lines().next().unwrap());
+        for line in table.lines().filter(|l| !l.contains('\x1b')) {
+            assert_eq!(UnicodeWidthStr::width(line), border_w, "misaligned: {line:?}");
+        }
+    }
+
+    #[test]
+    fn truncate_budgets_by_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        let wide = "好".repeat(21); // 42 display columns
+        let t = truncate(&wide, 40);
+        assert!(t.ends_with('…'), "over-wide value should be cut: {t:?}");
+        assert!(UnicodeWidthStr::width(t.as_str()) <= 40);
+        // Under the cap, values pass through untouched.
+        assert_eq!(truncate("abc", 40), "abc");
+        assert_eq!(truncate(&"好".repeat(20), 40), "好".repeat(20));
     }
 }
