@@ -97,7 +97,14 @@ pub fn is_in_sql_context(rope: &Rope, cursor_pos: usize) -> bool {
     // We need to look for patterns like: .sql( or .execute( etc.
     // Increased from 200 to 1000 bytes to handle longer multiline strings
     let search_start = check_start.saturating_sub(1000);
-    let search_text = rope.slice(search_start..check_start).to_string();
+    // `search_start`/`check_start` are BYTE offsets. ropey's slice() is
+    // CHAR-indexed and would panic once a multi-byte char precedes check_start
+    // (byte offset > len_chars()). Convert to char indices; byte_to_char rounds
+    // the (possibly mid-char) search_start down to a boundary and clamps.
+    let len_bytes = rope.len_bytes();
+    let cstart = rope.byte_to_char(search_start.min(len_bytes));
+    let cend = rope.byte_to_char(check_start.min(len_bytes));
+    let search_text = rope.slice(cstart..cend).to_string();
 
     // Check if any SQL pattern appears near the string start
     for pattern in SQL_PATTERNS {
@@ -169,5 +176,18 @@ mod tests {
         // Test Spark SQL context
         let rope = Rope::from_str("spark.sql(\"SELECT \")");
         assert!(is_in_sql_context(&rope, 15));
+    }
+
+    #[test]
+    fn multibyte_before_quote_does_not_panic() {
+        // Regression: a byte cursor offset was passed straight into ropey's
+        // char-indexed slice(). Multi-byte chars before the opening quote push
+        // the quote's BYTE offset past len_chars(), so the old slice(a..b)
+        // panicked at ropey rope.rs:952. Five 'é' (2 bytes each) before the
+        // quote, and only a couple of chars after it, guarantees byte offset >
+        // len_chars. Must not panic — and should still detect the .sql( pattern.
+        let rope = Rope::from_str("ééééé.sql(\"a");
+        assert!(rope.len_bytes() > rope.len_chars());
+        assert!(is_in_sql_context(&rope, rope.len_bytes()));
     }
 }

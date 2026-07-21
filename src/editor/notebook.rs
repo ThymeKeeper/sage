@@ -78,9 +78,16 @@ impl Editor {
             }
         }
 
-        // Extract word from start to cursor
+        // Extract word from start to cursor. `start` and `cursor_pos` are BYTE
+        // offsets, but ropey's slice() is CHAR-indexed and panics once the byte
+        // offset exceeds len_chars() (i.e. any multi-byte char precedes the
+        // cursor). Convert to char indices first. byte_to_char rounds a
+        // non-boundary byte down and only panics past len_bytes, so clamp.
         if start < cursor_pos {
-            rope.slice(start..cursor_pos).to_string()
+            let len_bytes = rope.len_bytes();
+            let cstart = rope.byte_to_char(start.min(len_bytes));
+            let cend = rope.byte_to_char(cursor_pos.min(len_bytes));
+            rope.slice(cstart..cend).to_string()
         } else {
             String::new()
         }
@@ -183,7 +190,14 @@ impl Editor {
                         }
 
                         if callable_start < pos {
-                            let base_callable = rope.slice(callable_start..pos).to_string();
+                            // `callable_start` and `pos` are BYTE offsets;
+                            // convert to char indices so the char-indexed slice()
+                            // cannot panic on multi-byte content (see byte_to_char
+                            // note in get_word_at_cursor).
+                            let len_bytes = rope.len_bytes();
+                            let cstart = rope.byte_to_char(callable_start.min(len_bytes));
+                            let cend = rope.byte_to_char(pos.min(len_bytes));
+                            let base_callable = rope.slice(cstart..cend).to_string();
                             // Debug logging
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
                                 use std::io::Write;
@@ -276,5 +290,34 @@ impl Editor {
             self.status_message = Some(("Kernel disconnected".to_string(), false));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Editor;
+    use crate::syntax::Language;
+
+    #[test]
+    fn completion_after_multibyte_char_does_not_panic() {
+        // Regression for the SQL-mode paste panic: the cursor is a BYTE offset,
+        // and get_word_at_cursor fed it straight into ropey's char-indexed
+        // slice(). With a multi-byte char before the cursor, the byte offset
+        // exceeds len_chars() and slice() panicked at ropey rope.rs:952. This is
+        // exactly the autocomplete pass that runs after each key in SQL/REPL mode.
+        let mut editor = Editor::new();
+        editor.set_language(Language::Sql);
+        editor.enable_repl_mode();
+
+        // 'é' is 2 bytes: after paste the byte cursor (12) exceeds len_chars (11).
+        editor.paste_text("SELECT café".to_string());
+        assert!(editor.buffer_rope().len_bytes() > editor.buffer_rope().len_chars());
+
+        // Must not panic, and must recover the correct (char-correct) word.
+        let word = editor.get_word_at_cursor();
+        assert_eq!(word, "café");
+
+        let (_base, prefix, _is_sql) = editor.get_completion_context();
+        assert_eq!(prefix, "café");
     }
 }

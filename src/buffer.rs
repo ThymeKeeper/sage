@@ -48,22 +48,11 @@ impl Buffer {
     }
     
     pub fn from_string(s: String) -> Self {
-        // Normalize text: remove invisible characters, CRLF -> LF
-        let s = s.chars()
-            .filter(|&c| match c {
-                // Remove zero-width and invisible characters
-                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{200E}' | '\u{200F}' |
-                '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' |
-                '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' |
-                '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' |
-                '\u{17B4}' | '\u{17B5}' | '\u{180E}' | '\u{3164}' | '\u{FFA0}' |
-                '\u{FE00}'..='\u{FE0F}' => false,
-                _ if c >= '\u{E0100}' && c <= '\u{E01EF}' => false, // Variation selectors
-                _ => true, // Keep everything else
-            })
-            .collect::<String>()
-            .replace("\r\n", "\n"); // CRLF -> LF
-        
+        // Apply the shared WYSIWYG input policy (drop invisibles, fold visible
+        // confusables to ASCII, CRLF -> LF) so an opened file matches what
+        // typing or pasting the same text would produce.
+        let s = crate::normalize::normalize_text(&s);
+
         Self {
             rope: Rope::from_str(&s),
             undo_stack: Vec::new(),

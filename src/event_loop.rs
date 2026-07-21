@@ -24,6 +24,29 @@ enum ExecMsg {
     },
 }
 
+/// The literal text a key event contributes — a printable char, newline, or tab
+/// with no Ctrl/Alt modifier held. Returns `None` for anything that isn't plain
+/// text input (control chords, function/navigation keys, key releases). Used to
+/// recognize and coalesce a terminal-injected paste burst.
+fn text_key_char(event: &Event) -> Option<char> {
+    if let Event::Key(key) = event {
+        if key.kind == event::KeyEventKind::Release {
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return None;
+        }
+        return match key.code {
+            KeyCode::Char(c) => Some(c),
+            KeyCode::Enter => Some('\n'),
+            KeyCode::Tab => Some('\t'),
+            _ => None,
+        };
+    }
+    None
+}
 
 pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
@@ -56,6 +79,10 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
     // Spreadsheet: track recent click for double-click detection
     let mut ss_last_click: Option<(std::time::Instant, crate::spreadsheet::GridHit)> = None;
+
+    // Event left over from paste-burst coalescing (the non-text key that ended a
+    // burst) — consumed on the next iteration before polling for new input.
+    let mut pending_event: Option<Event> = None;
 
     loop {
         // Drain any pending execution messages from the background thread.
@@ -213,21 +240,88 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
             needs_redraw = true;
             continue;
         }
-        // Handle input - use polling with timeout when execution is running
-        let event_available = if execution_rx.is_some() {
-            // Poll with 100ms timeout to update timer frequently
-            event::poll(std::time::Duration::from_millis(100))?
+        // Handle input - use polling with timeout when execution is running.
+        // A pending event (the non-text key that ended a coalesced paste burst
+        // below) is consumed first, without polling.
+        let event = if let Some(ev) = pending_event.take() {
+            ev
         } else {
-            // Block waiting for event when not executing
-            event::poll(std::time::Duration::from_secs(3600))? // 1 hour timeout (effectively blocking)
+            let event_available = if execution_rx.is_some() {
+                // Poll with 100ms timeout to update timer frequently
+                event::poll(std::time::Duration::from_millis(100))?
+            } else {
+                // Block waiting for event when not executing
+                event::poll(std::time::Duration::from_secs(3600))? // 1 hour timeout (effectively blocking)
+            };
+
+            if !event_available {
+                // No event, continue loop to update timer
+                continue;
+            }
+
+            event::read()?
         };
 
-        if !event_available {
-            // No event, continue loop to update timer
-            continue;
+        // Coalesce a burst of text-producing key events into a single handled
+        // paste. crossterm's Windows console backend never emits Event::Paste —
+        // a terminal-side paste (Ctrl+Shift+V, right-click, or Edit > Paste in
+        // conhost) is injected as a stream of individual Char key events. Left
+        // as-is, each character is processed as its own keystroke, running
+        // per-character autocomplete/auto-indent instead of sage's normalized,
+        // atomic paste. Routing the whole burst through paste_text() makes a
+        // terminal paste behave exactly like sage's own Ctrl+V paste. Only the
+        // plain editing surface qualifies; modal UIs (find/replace, help,
+        // spreadsheet) and in-flight execution keep raw per-key handling.
+        let paste_surface = find_replace.is_none()
+            && help_screen.is_none()
+            && !editor.is_spreadsheet_mode()
+            && !(output_pane_visible && output_pane.is_focused())
+            && execution_rx.is_none();
+        if paste_surface {
+            if let Some(first_ch) = text_key_char(&event) {
+                // A lone keystroke arrives with an empty input queue; a paste
+                // arrives with the rest of its characters already queued.
+                if event::poll(std::time::Duration::ZERO)? {
+                    let mut pasted = String::new();
+                    pasted.push(first_ch);
+                    loop {
+                        if !event::poll(std::time::Duration::ZERO)? {
+                            break;
+                        }
+                        let next = event::read()?;
+                        // Key-release events don't end the burst; skip them.
+                        if matches!(&next, Event::Key(k) if k.kind == event::KeyEventKind::Release) {
+                            continue;
+                        }
+                        match text_key_char(&next) {
+                            Some(ch) => pasted.push(ch),
+                            None => {
+                                pending_event = Some(next);
+                                break;
+                            }
+                        }
+                    }
+                    // Two or more characters in one input batch is a paste, not
+                    // typing. A single character means the queued event was
+                    // something else (now stashed in pending_event) — fall
+                    // through and handle the keystroke normally so autocomplete
+                    // still works.
+                    if pasted.chars().count() >= 2 {
+                        editor.paste_text(pasted);
+                        let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
+                        editor.update_viewport_for_cursor_with_bottom(bottom_height);
+                        autocomplete.hide();
+                        if output_pane_visible {
+                            output_pane.invalidate_cache();
+                        }
+                        renderer.force_redraw();
+                        needs_redraw = true;
+                        continue;
+                    }
+                }
+            }
         }
 
-        let event = event::read()?;
         match event {
             Event::Mouse(mouse_event) => {
                 // Check if shift is held for horizontal scrolling

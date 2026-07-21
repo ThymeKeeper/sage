@@ -18,62 +18,11 @@ fn is_spreadsheet_ext(path: &Path) -> Option<u8> {
 }
 
 impl Editor {
-    /// Normalize text by removing invisible characters and converting line endings/tabs
+    /// Normalize text under the WYSIWYG input policy (drop invisibles, fold
+    /// visible confusables to ASCII, tabs to spaces, CRLF to LF). Delegates to
+    /// [`crate::normalize`] so typing, paste, and file load all share one policy.
     pub(super) fn normalize_text(text: String) -> String {
-        text.chars()
-            .filter_map(|c| match c {
-                // Convert tabs to 4 spaces
-                '\t' => Some("    ".to_string()),
-                // Remove carriage returns (handled separately for CRLF)
-                '\r' => None,
-                // Remove zero-width and invisible characters
-                '\u{200B}' | // Zero-width space
-                '\u{200C}' | // Zero-width non-joiner
-                '\u{200D}' | // Zero-width joiner
-                '\u{200E}' | // Left-to-right mark
-                '\u{200F}' | // Right-to-left mark
-                '\u{202A}' | // Left-to-right embedding
-                '\u{202B}' | // Right-to-left embedding
-                '\u{202C}' | // Pop directional formatting
-                '\u{202D}' | // Left-to-right override
-                '\u{202E}' | // Right-to-left override
-                '\u{2060}' | // Word joiner
-                '\u{2061}' | // Function application
-                '\u{2062}' | // Invisible times
-                '\u{2063}' | // Invisible separator
-                '\u{2064}' | // Invisible plus
-                '\u{2066}' | // Left-to-right isolate
-                '\u{2067}' | // Right-to-left isolate
-                '\u{2068}' | // First strong isolate
-                '\u{2069}' | // Pop directional isolate
-                '\u{206A}' | // Inhibit symmetric swapping
-                '\u{206B}' | // Activate symmetric swapping
-                '\u{206C}' | // Inhibit Arabic form shaping
-                '\u{206D}' | // Activate Arabic form shaping
-                '\u{206E}' | // National digit shapes
-                '\u{206F}' | // Nominal digit shapes
-                '\u{FEFF}' | // Zero-width no-break space (BOM)
-                '\u{FFF9}' | // Interlinear annotation anchor
-                '\u{FFFA}' | // Interlinear annotation separator
-                '\u{FFFB}' | // Interlinear annotation terminator
-                '\u{00AD}' | // Soft hyphen
-                '\u{034F}' | // Combining grapheme joiner
-                '\u{061C}' | // Arabic letter mark
-                '\u{115F}' | // Hangul choseong filler
-                '\u{1160}' | // Hangul jungseong filler
-                '\u{17B4}' | // Khmer vowel inherent AQ
-                '\u{17B5}' | // Khmer vowel inherent AA
-                '\u{180E}' | // Mongolian vowel separator
-                '\u{3164}' | // Hangul filler
-                '\u{FFA0}' | // Halfwidth hangul filler
-                '\u{FE00}'..='\u{FE0F}' | // Variation selectors
-                '\u{E0100}'..='\u{E01EF}' => None, // Variation selectors supplement
-                // Keep normal characters
-                _ => Some(c.to_string()),
-            })
-            .collect::<String>()
-            // Handle CRLF -> LF conversion after filtering
-            .replace("\r\n", "\n")
+        crate::normalize::normalize_text(&text)
     }
 
     pub fn load_file(&mut self, path: &str) -> io::Result<()> {
@@ -99,8 +48,8 @@ impl Editor {
 
         self.spreadsheet = None;
         let content = fs::read_to_string(path)?;
-        // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
-        let content = Self::normalize_text(content);
+        // Buffer::from_string applies the WYSIWYG input policy (CRLF → LF,
+        // tabs → spaces, drop invisibles, fold confusables to ASCII).
         self.buffer = Buffer::from_string(content);
         self.file_path = Some(PathBuf::from(path));
         self.cursor = 0;

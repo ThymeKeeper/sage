@@ -156,22 +156,16 @@ impl Editor {
                 self.delete_selection();
                 
                 let cursor_before = self.cursor;
-                
-                // Filter out invisible characters
-                let text = match c {
-                    '\t' => "    ".to_string(), // Convert tabs to 4 spaces
-                    '\r' => return Ok(()), // Skip carriage returns
-                    // Skip zero-width and invisible characters
-                    '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{200E}' | '\u{200F}' |
-                    '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' |
-                    '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' |
-                    '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' |
-                    '\u{17B4}' | '\u{17B5}' | '\u{180E}' | '\u{3164}' | '\u{FFA0}' |
-                    '\u{FE00}'..='\u{FE0F}' => return Ok(()), // Skip invisible chars
-                    _ if c >= '\u{E0100}' && c <= '\u{E01EF}' => return Ok(()), // Variation selectors
-                    _ => c.to_string(),
-                };
-                
+
+                // Apply the WYSIWYG input policy: invisibles are dropped, visible
+                // confusables (NBSP, curly quotes, Unicode dashes) fold to ASCII,
+                // tabs become spaces. Shared with paste and file load via
+                // crate::normalize so all input paths behave identically.
+                let text = crate::normalize::fold_char_to_str(c);
+                if text.is_empty() {
+                    return Ok(()); // Dropped character (invisible / zero-width)
+                }
+
                 self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());
                 self.cursor += text.len();
                 self.modified = true;
