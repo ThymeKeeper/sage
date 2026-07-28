@@ -7,7 +7,7 @@ use http::{
     HeaderMap,
     header::{ACCEPT, AUTHORIZATION},
 };
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url};
 use serde::de::Error as _;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
@@ -20,6 +20,17 @@ pub(super) const SESSION_EXPIRED: &str = "390112";
 pub(super) const QUERY_IN_PROGRESS_CODE: &str = "333333";
 pub(super) const QUERY_IN_PROGRESS_ASYNC_CODE: &str = "333334";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
+/// Resubmission budget for the initial query POST. Every attempt reuses the
+/// same requestId, which Snowflake dedupes server-side, so a retry after an
+/// ambiguous failure (request possibly already executed) cannot run the
+/// statement twice.
+const MAX_SUBMIT_RETRIES: u32 = 4;
+/// How many consecutive failed status polls to tolerate before giving up on
+/// the wait (~10 minutes at the 10s cadence). The query keeps running
+/// server-side regardless of whether this client can reach Snowflake, so a
+/// single blip (dropped connection, gateway 5xx/HTML error page) must not
+/// abort a long-running statement.
+const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 60;
 
 pub struct QueryExecutor {
     http: Client,
@@ -43,35 +54,32 @@ impl QueryExecutor {
         let request: QueryRequest = request.into();
 
         // Submit, transparently renewing the session token once if it has
-        // expired (390112). The proactive heartbeat usually keeps it fresh, so
-        // this is the backstop for a first statement after a long gap.
+        // expired (390112) and retrying transport-level failures (dropped
+        // connection, gateway 5xx/HTML error page) with the same requestId.
+        // The proactive heartbeat usually keeps the token fresh, so renewal
+        // is the backstop for a first statement after a long gap.
         let mut response: SnowflakeResponse = {
+            let request_id = uuid::Uuid::new_v4();
             let mut renewed = false;
+            let mut retries: u32 = 0;
             loop {
-                let request_id = uuid::Uuid::new_v4();
                 let mut url = base_url.join("queries/v1/query-request")?;
-                url.query_pairs_mut()
-                    .append_pair("requestId", &request_id.to_string());
-                let token = sess.current_token();
-                let response = sess
-                    .http()
-                    .post(url)
-                    .header(ACCEPT, "application/snowflake")
-                    .header(AUTHORIZATION, format!(r#"Snowflake Token="{token}""#))
-                    .json(&request)
-                    .send()
-                    .await?;
-
-                let status = response.status();
-                let body = response.text().await?;
-                let parsed: SnowflakeResponse = match serde_json::from_str(&body) {
-                    Ok(p) => p,
+                {
+                    let mut pairs = url.query_pairs_mut();
+                    pairs.append_pair("requestId", &request_id.to_string());
+                    if retries > 0 {
+                        pairs.append_pair("retryCount", &retries.to_string());
+                    }
+                }
+                let (status, body, parsed) = match submit_once(sess, url, &request).await {
+                    Ok(outcome) => outcome,
                     Err(e) => {
-                        return if status.is_success() {
-                            Err(Error::Json(e, body))
-                        } else {
-                            Err(Error::Communication(body))
-                        };
+                        retries += 1;
+                        if retries > MAX_SUBMIT_RETRIES {
+                            return Err(e);
+                        }
+                        sleep(submit_backoff(retries)).await;
+                        continue;
                     }
                 };
                 if parsed.code.as_deref() == Some(SESSION_EXPIRED) && !renewed {
@@ -298,60 +306,118 @@ fn interrupted(query_id: Option<String>, e: Error) -> Error {
     }
 }
 
+/// One submit attempt. `Err` means the attempt failed below the protocol
+/// layer — transport error, a 5xx, or a body that isn't Snowflake JSON (e.g.
+/// a gateway's HTML error page) — and is safe to resend with the same
+/// requestId.
+async fn submit_once(
+    sess: &SnowflakeSession,
+    url: Url,
+    request: &QueryRequest,
+) -> Result<(StatusCode, String, SnowflakeResponse)> {
+    let token = sess.current_token();
+    let response = sess
+        .http()
+        .post(url)
+        .header(ACCEPT, "application/snowflake")
+        .header(AUTHORIZATION, format!(r#"Snowflake Token="{token}""#))
+        .json(request)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_server_error() {
+        return Err(Error::Communication(body));
+    }
+    match serde_json::from_str::<SnowflakeResponse>(&body) {
+        Ok(parsed) => Ok((status, body, parsed)),
+        Err(e) if status.is_success() => Err(Error::Json(e, body)),
+        Err(_) => Err(Error::Communication(body)),
+    }
+}
+
+/// Backoff before submit retry `n` (1-origin): 2s, 4s, 8s, 16s.
+fn submit_backoff(retry: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(retry.min(4)))
+}
+
 async fn poll_for_async_results(
     sess: &SnowflakeSession,
     result_url: &str,
     base_url: Url,
 ) -> Result<SnowflakeResponse> {
     let timeout = sess.timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECONDS));
+    let url = if let Ok(url) = Url::parse(result_url) {
+        url
+    } else {
+        base_url.join(result_url)?
+    };
     let start = Instant::now();
+    let mut failures: u32 = 0;
     while start.elapsed() < timeout {
         sleep(Duration::from_secs(10)).await;
-        let url = if let Ok(url) = Url::parse(result_url) {
-            url
-        } else {
-            base_url.join(result_url)?
-        };
-
-        let token = sess.current_token();
-        let resp = sess
-            .http()
-            .get(url)
-            .header(ACCEPT, "application/snowflake")
-            .header(AUTHORIZATION, format!(r#"Snowflake Token="{token}""#))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        let body = resp.text().await?;
-        let response: SnowflakeResponse = match serde_json::from_str(&body) {
-            Ok(p) => p,
+        match poll_once(sess, url.clone()).await {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) => failures = 0,
+            // A failed poll says nothing about the query, which keeps running
+            // server-side; only a sustained outage abandons the wait (the
+            // caller then wraps the error with the RESULT_SCAN reattach hint).
             Err(e) => {
-                return if status.is_success() {
-                    Err(Error::Json(e, body))
-                } else {
-                    Err(Error::Communication(body))
-                };
+                failures += 1;
+                if failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                    return Err(e);
+                }
             }
-        };
-
-        // Session token expired mid-poll (e.g. a multi-hour query): renew via
-        // the master token and keep polling the same Snowflake query.
-        if response.code.as_deref() == Some(SESSION_EXPIRED) {
-            sess.renew().await?;
-            continue;
-        }
-        if !status.is_success() {
-            return Err(Error::Communication(body));
-        }
-        if response.code.as_deref() != Some(QUERY_IN_PROGRESS_ASYNC_CODE)
-            && response.code.as_deref() != Some(QUERY_IN_PROGRESS_CODE)
-        {
-            return Ok(response);
         }
     }
 
     Err(Error::TimedOut)
+}
+
+/// One status poll. `Ok(Some(_))` — the query reached a terminal state (the
+/// caller inspects success/code); `Ok(None)` — still running, or the session
+/// token was just renewed; `Err` — this poll itself failed (retryable
+/// upstream).
+async fn poll_once(sess: &SnowflakeSession, url: Url) -> Result<Option<SnowflakeResponse>> {
+    let token = sess.current_token();
+    let response = sess
+        .http()
+        .get(url)
+        .header(ACCEPT, "application/snowflake")
+        .header(AUTHORIZATION, format!(r#"Snowflake Token="{token}""#))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+    let response: SnowflakeResponse = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return if status.is_success() {
+                Err(Error::Json(e, body))
+            } else {
+                Err(Error::Communication(body))
+            };
+        }
+    };
+
+    // Session token expired mid-poll (e.g. a multi-hour query): renew via
+    // the master token and keep polling the same Snowflake query. A renewal
+    // that fails on a network blip is just a failed poll — the next poll gets
+    // 390112 again and re-attempts it.
+    if response.code.as_deref() == Some(SESSION_EXPIRED) {
+        sess.renew().await?;
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(Error::Communication(body));
+    }
+    if response.code.as_deref() == Some(QUERY_IN_PROGRESS_ASYNC_CODE)
+        || response.code.as_deref() == Some(QUERY_IN_PROGRESS_CODE)
+    {
+        return Ok(None);
+    }
+    Ok(Some(response))
 }
 
 /// Snowflake bind parameter type.
