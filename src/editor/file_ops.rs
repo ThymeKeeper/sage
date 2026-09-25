@@ -451,6 +451,62 @@ impl Editor {
         self.syntax.set_language_from_path(path);
     }
 
+    /// Ctrl+Y → Spreadsheet (CSV / TSV): show this text as a grid. Reads the
+    /// file on disk when there are no unsaved edits (its exact bytes: the text
+    /// editor turns tabs into spaces and folds curly quotes, which would change
+    /// the data), else the text as shown. Refuses, with the reason, text that
+    /// doesn't read as delimited data (see `Spreadsheet::from_text`).
+    pub fn enter_grid_mode(&mut self, delimiter: u8) -> Result<(), String> {
+        if self.spreadsheet.is_some() {
+            // Already a grid (perhaps showing its text view): back to the grid.
+            if self.grid_text_view {
+                self.toggle_grid_text_view();
+            }
+            return Ok(());
+        }
+        let on_disk = self.file_path.clone().filter(|p| !self.modified && p.exists());
+        // (An empty buffer has no tabs to lose: it becomes an empty grid.)
+        if on_disk.is_none() && delimiter == b'\t' && !self.buffer.to_string().trim().is_empty() {
+            // The text editor turned any tabs into spaces as they were typed,
+            // pasted or loaded, so unsaved text can't hold TSV. Saving first
+            // would write the spaces over the file's tabs, so say so.
+            return Err(if self.file_path.as_ref().map_or(false, |p| p.exists()) {
+                "the text editor turns tabs into spaces, so text with unsaved edits can't be read as TSV. \
+                 Undo the edits or reopen the file without saving (saving would write the spaces), then try again"
+                    .to_string()
+            } else {
+                "the text editor turns tabs into spaces, so text typed or pasted here can't be read as TSV. \
+                 Open the data from a .tsv file instead"
+                    .to_string()
+            });
+        }
+        let text = match &on_disk {
+            Some(path) => fs::read_to_string(path).map_err(|e| format!("the file couldn't be read ({})", e))?,
+            None => self.buffer.to_string(),
+        };
+        let mut ss = Spreadsheet::from_text(&text, delimiter, true)?;
+        if on_disk.is_none() && self.modified {
+            ss.mark_unsaved(); // the text had unsaved edits; so does the grid
+        }
+        self.spreadsheet = Some(ss);
+        self.grid_text_view = false;
+        self.buffer = Buffer::new(); // the grid is the document now
+        self.cursor = 0;
+        self.selection_start = None;
+        self.modified = false;
+        self.viewport_offset = (0, 0);
+        self.viewport_top_seg = 0;
+        self.find_matches.clear();
+        self.current_find_match = None;
+        self.syntax = SyntaxHighlighter::new();
+        self.syntax.set_language(if delimiter == b'\t' {
+            crate::syntax::Language::Tsv
+        } else {
+            crate::syntax::Language::Csv
+        });
+        Ok(())
+    }
+
     /// Ctrl+T on a CSV/TSV: switch between the grid and a read-only plain-text
     /// view of the file as it is on disk. The grid is kept, untouched, so
     /// switching back restores it exactly, unsaved edits and cursor included.
@@ -589,6 +645,74 @@ mod tests {
         assert_eq!(editor.buffer().to_string(), "a,b\n9,2\n");
         assert!(editor.is_grid_text_view());
         assert!(!editor.is_modified());
+    }
+
+    fn text_editor(suffix: &str, contents: &str) -> (Editor, tempfile::NamedTempFile) {
+        let mut tmp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+        tmp.write_all(contents.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let mut editor = Editor::new();
+        editor.load_file(tmp.path().to_str().unwrap()).unwrap();
+        assert!(!editor.is_spreadsheet_mode());
+        (editor, tmp)
+    }
+
+    #[test]
+    fn a_text_file_switches_to_a_grid_from_its_exact_bytes() {
+        // Tabs survive because the grid reads the file, not the text editor's
+        // copy (which turned them into spaces).
+        let (mut editor, tmp) = text_editor(".txt", "id\tname\n1\tAda\n");
+        assert!(!editor.buffer().to_string().contains('\t'));
+        editor.enter_grid_mode(b'\t').unwrap();
+        assert!(editor.is_spreadsheet_mode());
+        assert!(!editor.is_modified());
+        assert_eq!(editor.spreadsheet().unwrap().cell(1, 1), "Ada");
+        // Save writes it back as TSV.
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "id\tname\n1\tAda\n");
+    }
+
+    #[test]
+    fn unsaved_text_becomes_an_unsaved_grid() {
+        let (mut editor, _tmp) = text_editor(".txt", "a,b\n");
+        editor.execute(Command::MoveEnd).unwrap();
+        editor.paste_text("\n1,2".to_string());
+        assert!(editor.is_modified());
+        editor.enter_grid_mode(b',').unwrap();
+        let ss = editor.spreadsheet().unwrap();
+        assert_eq!(ss.cell(1, 1), "2");
+        assert!(editor.is_modified());
+    }
+
+    #[test]
+    fn an_empty_buffer_switches_to_an_empty_grid_as_csv_or_tsv() {
+        for delim in [b',', b'\t'] {
+            let mut editor = Editor::new(); // no file, nothing typed
+            editor.enter_grid_mode(delim).unwrap();
+            assert!(editor.is_spreadsheet_mode());
+            assert_eq!(editor.spreadsheet().unwrap().num_cols(), 0);
+        }
+        let (mut editor, _tmp) = text_editor(".txt", "");
+        editor.enter_grid_mode(b'\t').unwrap(); // an empty file on disk too
+        assert_eq!(editor.spreadsheet().unwrap().num_cols(), 0);
+    }
+
+    #[test]
+    fn unsaved_text_is_refused_as_tsv_with_the_real_reason() {
+        let (mut editor, _tmp) = text_editor(".txt", "id\tname\n1\tAda\n");
+        editor.paste_text("x".to_string());
+        let why = editor.enter_grid_mode(b'\t').unwrap_err();
+        assert!(why.contains("tabs into spaces") && why.contains("without saving"), "{why}");
+        assert!(!editor.is_spreadsheet_mode());
+    }
+
+    #[test]
+    fn text_that_isnt_a_spreadsheet_is_refused_and_stays_text() {
+        let (mut editor, _tmp) = text_editor(".txt", "a,b\n1,2,3\n");
+        let why = editor.enter_grid_mode(b',').unwrap_err();
+        assert!(why.contains("header row has only 2"), "{why}");
+        assert!(!editor.is_spreadsheet_mode());
+        assert_eq!(editor.buffer().to_string(), "a,b\n1,2,3\n");
     }
 
     #[test]

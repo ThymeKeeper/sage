@@ -6,6 +6,8 @@ use std::path::Path;
 use unicode_width::UnicodeWidthChar;
 
 pub const MIN_COL_WIDTH: usize = 4;
+/// Width of a ghost column (past the data) until something is typed into it.
+pub const GHOST_COL_WIDTH: usize = 8;
 pub const MAX_COL_WIDTH: usize = 20;
 pub const MAX_RESIZE_WIDTH: usize = 200;
 pub const ROW_NUM_WIDTH: usize = 5;
@@ -188,6 +190,20 @@ struct UndoStep {
     /// keeps matching the same rows), held like `CellChange::other`: the filter
     /// on the far side of the step, swapped in by undo/redo.
     filter: Option<(usize, Option<HashSet<String>>)>,
+    /// How the data grew to hold a value typed into a ghost cell; undo shrinks
+    /// it back, redo grows it again.
+    growth: Option<Growth>,
+}
+
+/// The data's shape before it grew to hold one typed cell.
+#[derive(Debug, Clone, Copy)]
+struct Growth {
+    rows: usize,
+    cols: usize,
+    widths: usize,
+    /// The edited file row and its length before.
+    row: usize,
+    row_len: usize,
 }
 
 /// How a cell orders in a sort: numbers (and ISO dates, as epoch seconds)
@@ -243,18 +259,66 @@ impl Spreadsheet {
     pub fn from_file(path: &Path) -> io::Result<Self> {
         let delimiter = detect_delimiter(path);
         let content = std::fs::read_to_string(path)?;
+        Ok(Self::from_text(&content, delimiter, false).expect("lenient reading never refuses"))
+    }
+
+    /// Build a grid from delimited text. The header row (row 1) sets the width;
+    /// rows shorter than it keep their missing trailing cells as nulls, which
+    /// Save writes back as empty fields.
+    ///
+    /// `strict` is for switching a text buffer to a grid (Ctrl+Y): it refuses
+    /// text that doesn't read as delimited data, with the reason: no delimiter
+    /// at all, a quote left open, or a data row with more fields than the
+    /// header row. Opening a .csv/.tsv is lenient and widens the header instead.
+    pub fn from_text(text: &str, delimiter: u8, strict: bool) -> Result<Self, String> {
         // Strip a leading UTF-8 BOM. It is zero-width per Unicode, so it doesn't
         // count toward the column width, yet many terminals still render it as a
         // cell — which makes the first header cell look one column too wide. Text
         // mode strips it in Buffer::from_string; the grid loader must too.
-        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+        // Empty text is an empty grid: no data, every cell a ghost cell to type into.
+        if text.trim().is_empty() {
+            return Ok(Self::new_empty(delimiter));
+        }
+        let (kind, seps) = if delimiter == b'\t' { ("TSV", "tabs") } else { ("CSV", "commas") };
+        if strict {
+            if !text.contains(delimiter as char) {
+                return Err(format!("there are no {} in it, so it doesn't read as {}", seps, kind));
+            }
+            if let Some(line) = crate::dsv::open_quote_line(text) {
+                return Err(format!("a quote opened on line {} is never closed", line));
+            }
+        }
 
         // Parse with null awareness: an unquoted-empty field is a null (shown as
         // ∅), a quoted "" is an empty string. `rows` holds "" for both; the
         // distinction lives in `null_mask`.
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        let mut null_mask: Vec<Vec<bool>> = Vec::new();
-        for record in crate::dsv::parse(content, delimiter) {
+        let records = crate::dsv::parse(text, delimiter);
+        if strict {
+            let header = records.first().map_or(0, |r| r.len());
+            if let Some(wide) = records.iter().skip(1).find(|r| r.len() > header) {
+                // Quote the row itself (blank lines and multi-line values make a
+                // row number differ from the editor's line number).
+                let joined: String = wide
+                    .iter()
+                    .map(|f| f.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join(&(delimiter as char).to_string())
+                    .replace(['\n', '\r'], " ");
+                let shown: String = joined.chars().take(40).collect();
+                let more = if joined.chars().count() > 40 { "..." } else { "" };
+                return Err(format!(
+                    "the row \"{}{}\" has {} fields but the header row has only {}; the header needs a field (empty is fine) for every column",
+                    shown.replace('\t', " "),
+                    more,
+                    wide.len(),
+                    header
+                ));
+            }
+        }
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(records.len());
+        let mut null_mask: Vec<Vec<bool>> = Vec::with_capacity(records.len());
+        for record in records {
             let mut row = Vec::with_capacity(record.len());
             let mut mask = Vec::with_capacity(record.len());
             for field in record {
@@ -264,20 +328,16 @@ impl Spreadsheet {
             rows.push(row);
             null_mask.push(mask);
         }
-
-        let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
-        for (row, mask) in rows.iter_mut().zip(null_mask.iter_mut()) {
-            // Pad short rows with empty strings (missing trailing fields are
-            // treated as empty, not null).
-            while row.len() < max_cols {
-                row.push(String::new());
-                mask.push(false);
-            }
-        }
-
         if rows.is_empty() {
-            rows = vec![vec![String::new(); max_cols.max(1)]];
-            null_mask = vec![vec![false; max_cols.max(1)]];
+            // Only blank lines: an empty grid (the header row, with no cells).
+            rows = vec![Vec::new()];
+            null_mask = vec![Vec::new()];
+        }
+        // The header row sets the width: widen it, with nulls, to the widest row.
+        let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        while rows[0].len() < max_cols {
+            rows[0].push(String::new());
+            null_mask[0].push(true);
         }
 
         let mut ss = Self {
@@ -303,13 +363,28 @@ impl Spreadsheet {
         Ok(ss)
     }
 
+    /// Mark the grid as holding changes the file on disk doesn't have (it was
+    /// built from unsaved text), so undo can't clear the unsaved marker.
+    pub fn mark_unsaved(&mut self) {
+        self.modified = true;
+        self.save_point = None;
+    }
+
+    /// Column `col`'s width on screen; ghost columns past the data get a default.
+    pub fn col_width(&self, col: usize) -> usize {
+        self.column_widths.get(col).copied().unwrap_or(GHOST_COL_WIDTH)
+    }
+
+    /// An empty grid: no data, so every row and column is a ghost; typing a
+    /// value anywhere grows the data out to that cell. The header row is always
+    /// there (row 1), just with no cells yet.
     pub fn new_empty(delimiter: u8) -> Self {
         Self {
-            rows: vec![vec![String::new()]],
-            null_mask: vec![vec![false]],
+            rows: vec![Vec::new()],
+            null_mask: vec![Vec::new()],
             cursor: (0, 0),
             selection_anchor: None,
-            column_widths: vec![MIN_COL_WIDTH],
+            column_widths: Vec::new(),
             scroll_row: 0,
             scroll_col: 0,
             delimiter,
@@ -329,22 +404,31 @@ impl Spreadsheet {
         use std::io::Write;
         // Write through the null-aware serializer so null cells round-trip as
         // unquoted-empty fields and empty strings as quoted "" (see crate::dsv).
+        // Every row is written out to the header's width: a short row's missing
+        // cells are nulls, so they go out as empty fields and loaders see one
+        // column count throughout.
         let mut writer = io::BufWriter::new(File::create(path)?);
         let mut line = String::new();
-        for (r, row) in self.rows.iter().enumerate() {
+        let width = self.num_cols();
+        // An empty grid (no columns yet) is an empty file.
+        let rows_to_write = if width == 0 { 0 } else { self.rows.len() };
+        for (r, row) in self.rows.iter().enumerate().take(rows_to_write) {
             line.clear();
-            for (c, cell) in row.iter().enumerate() {
+            for c in 0..width {
                 if c > 0 {
                     line.push(self.delimiter as char);
                 }
-                let is_null = self
-                    .null_mask
-                    .get(r)
-                    .and_then(|m| m.get(c))
-                    .copied()
-                    .unwrap_or(false);
-                let field = if is_null { None } else { Some(cell.as_str()) };
+                let field = match row.get(c) {
+                    Some(cell) if !self.file_is_null(r, c) => Some(cell.as_str()),
+                    _ => None,
+                };
                 crate::dsv::serialize_field(&mut line, field, self.delimiter);
+            }
+            // In a one-column file an empty row would be a blank line, which
+            // readers (sage's included) skip, shifting every later row up.
+            // Write it as an empty string so the row survives a reload.
+            if line.is_empty() {
+                line.push_str("\"\"");
             }
             line.push('\n');
             writer.write_all(line.as_bytes())?;
@@ -365,25 +449,29 @@ impl Spreadsheet {
         self.rows.len()
     }
 
-    /// Index into `rows` (the file's row order) of display row `row`.
+    /// Index into `rows` (the file's row order) of display row `row`. Ghost rows
+    /// past the data map to the file rows they would become.
     pub fn file_row(&self, row: usize) -> usize {
         match &self.view {
-            Some(v) => v.get(row).copied().unwrap_or(usize::MAX),
+            Some(v) => v.get(row).copied().unwrap_or_else(|| self.rows.len() + (row - v.len())),
             None => row,
         }
     }
 
+    /// Columns in the data: the header row's width.
     pub fn num_cols(&self) -> usize {
         self.rows.first().map(|r| r.len()).unwrap_or(0)
     }
 
-    /// Width of the row-number gutter, sized to hold the largest row number (plus
-    /// a trailing space) and never narrower than the default. Sizing to the total
-    /// row count keeps the header letters aligned with the data columns — and the
-    /// layout stable while scrolling — even when row numbers reach the millions.
-    pub fn row_num_width(&self) -> usize {
-        // Row labels are file row numbers, so size to the file, not the view.
-        let digits = self.file_row_count().max(1).to_string().len();
+    /// Width of the row-number gutter for a screen showing `visible_rows` data
+    /// rows: sized to the largest row number on it (file rows, or the ghost rows
+    /// past them), plus a trailing space, never narrower than the default.
+    /// Sizing to the file keeps the header letters aligned with the data columns
+    /// while scrolling, even when row numbers reach the millions.
+    pub fn row_num_width(&self, visible_rows: usize) -> usize {
+        let last_shown = self.scroll_row + visible_rows.max(1) - 1;
+        let largest = self.file_row_count().max(self.file_row(last_shown) + 1);
+        let digits = largest.max(1).to_string().len();
         (digits + 1).max(ROW_NUM_WIDTH)
     }
 
@@ -408,11 +496,13 @@ impl Spreadsheet {
     }
 
     fn file_is_null(&self, file_row: usize, col: usize) -> bool {
-        self.null_mask
-            .get(file_row)
-            .and_then(|r| r.get(col))
-            .copied()
-            .unwrap_or(false)
+        match self.null_mask.get(file_row) {
+            // Past the end of a short row, a cell inside the header's width is
+            // missing: a null, like the empty field Save writes for it.
+            Some(mask) => mask.get(col).copied().unwrap_or(col < self.num_cols()),
+            // Ghost rows past the data are blank, not null.
+            None => false,
+        }
     }
 
     pub fn focused_cell_text(&self) -> &str {
@@ -609,11 +699,10 @@ impl Spreadsheet {
         }
     }
 
+    /// Down one row; past the last row the cursor walks into ghost rows.
     pub fn move_down(&mut self, with_selection: bool) {
         self.prepare_selection(with_selection);
-        if self.cursor.0 + 1 < self.num_rows() {
-            self.cursor.0 += 1;
-        }
+        self.cursor.0 = self.cursor.0.saturating_add(1);
     }
 
     pub fn move_left(&mut self, with_selection: bool) {
@@ -623,11 +712,10 @@ impl Spreadsheet {
         }
     }
 
+    /// Right one column; past the last column the cursor walks into ghost columns.
     pub fn move_right(&mut self, with_selection: bool) {
         self.prepare_selection(with_selection);
-        if self.cursor.1 + 1 < self.num_cols() {
-            self.cursor.1 += 1;
-        }
+        self.cursor.1 = self.cursor.1.saturating_add(1);
     }
 
     pub fn move_home(&mut self, with_selection: bool) {
@@ -673,11 +761,12 @@ impl Spreadsheet {
         self.cursor.0 = self.cursor.0.saturating_sub(step);
     }
 
+    /// Down a page; like Excel, it carries on into ghost rows past the data
+    /// (Ctrl+Down jumps to the last data row).
     pub fn page_down(&mut self, visible_rows: usize, with_selection: bool) {
         self.prepare_selection(with_selection);
         let step = visible_rows.max(1);
-        let last = self.num_rows().saturating_sub(1);
-        self.cursor.0 = (self.cursor.0 + step).min(last);
+        self.cursor.0 = self.cursor.0.saturating_add(step);
     }
 
     pub fn select_all(&mut self) {
@@ -719,6 +808,16 @@ impl Spreadsheet {
         // Write to the file row shown there. The view isn't re-applied, so an
         // edited row stays put until the filter or sort next changes (as in Excel).
         let r = self.file_row(display_row);
+        // A value typed into a ghost cell past the data (or into a missing cell
+        // of a short row) grows the data to hold it. Typing nothing grows
+        // nothing, though a short row's missing cell becomes real, so an empty
+        // commit turns it into an empty string just as it does a stored null.
+        let growth = if edit.text.is_empty() {
+            self.fill_short_row(r, c);
+            None
+        } else {
+            self.grow_to(r, c)
+        };
         // An edited cell holds a real value, never a null — even if the
         // committed text is empty (that's now an empty string).
         let was_null = self.file_is_null(r, c);
@@ -732,9 +831,97 @@ impl Spreadsheet {
             if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
                 *m = false;
             }
-            self.record(vec![CellChange { row: r, col: c, other: before, other_null: was_null }]);
+            self.record_step(UndoStep {
+                changes: vec![CellChange { row: r, col: c, other: before, other_null: was_null }],
+                filter: None,
+                growth,
+            });
         }
         self.recompute_col_width(c);
+    }
+
+    /// Grow the data so file cell (row, col) exists. New columns widen the
+    /// header; new rows are appended in file order (and shown at the bottom of
+    /// an active filter or sort); every other new cell is a null, which Save
+    /// writes as an empty field. Returns the shape before, or `None` if the
+    /// cell already existed.
+    fn grow_to(&mut self, row: usize, col: usize) -> Option<Growth> {
+        let exists = self.rows.get(row).map_or(false, |r| col < r.len());
+        if exists {
+            return None;
+        }
+        let before = Growth {
+            rows: self.rows.len(),
+            cols: self.num_cols(),
+            widths: self.column_widths.len(),
+            row,
+            row_len: self.rows.get(row).map_or(0, |r| r.len()),
+        };
+        while self.rows[0].len() <= col {
+            self.rows[0].push(String::new());
+            self.null_mask[0].push(true);
+        }
+        while self.column_widths.len() < self.num_cols() {
+            self.column_widths.push(GHOST_COL_WIDTH);
+        }
+        while self.rows.len() <= row {
+            self.rows.push(Vec::new());
+            self.null_mask.push(Vec::new());
+            let new_row = self.rows.len() - 1;
+            if let Some(view) = self.view.as_mut() {
+                view.push(new_row);
+            }
+        }
+        while self.rows[row].len() <= col {
+            self.rows[row].push(String::new());
+            self.null_mask[row].push(true);
+        }
+        Some(before)
+    }
+
+    /// Undo a growth: back to the shape recorded before it.
+    fn shrink(&mut self, g: &Growth) {
+        if let Some(r) = self.rows.get_mut(g.row) {
+            r.truncate(g.row_len);
+        }
+        if let Some(m) = self.null_mask.get_mut(g.row) {
+            m.truncate(g.row_len);
+        }
+        self.rows.truncate(g.rows);
+        self.null_mask.truncate(g.rows);
+        self.rows[0].truncate(g.cols);
+        self.null_mask[0].truncate(g.cols);
+        self.column_widths.truncate(g.widths);
+        let rows = self.rows.len();
+        if let Some(view) = self.view.as_mut() {
+            view.retain(|&r| r < rows);
+        }
+        // A filter or sort on a column that no longer exists would keep hiding
+        // or ordering rows by it, with no menu left to clear it: drop them.
+        let cols = self.num_cols();
+        let stale = self.filters.keys().any(|&c| c >= cols) || self.sorts.iter().any(|&(c, _)| c >= cols);
+        if stale {
+            self.filters.retain(|&c, _| c < cols);
+            self.sorts.retain(|&(c, _)| c < cols);
+            let cursor = self.cursor;
+            self.rebuild_view();
+            self.cursor.1 = cursor.1;
+        }
+    }
+
+    /// Give a short row a real (null) cell at `col` when `col` is inside the
+    /// header's width. A missing cell and a stored null look and save the same;
+    /// making it real lets Delete and edits treat both alike.
+    fn fill_short_row(&mut self, row: usize, col: usize) {
+        if col >= self.num_cols() {
+            return;
+        }
+        if let (Some(cells), Some(mask)) = (self.rows.get_mut(row), self.null_mask.get_mut(row)) {
+            while cells.len() <= col {
+                cells.push(String::new());
+                mask.push(true);
+            }
+        }
     }
 
     pub fn clear_selection_content(&mut self) {
@@ -744,6 +931,8 @@ impl Spreadsheet {
         for display_row in r0..=r1 {
             let r = self.file_row(display_row);
             for c in c0..=c1 {
+                // A short row's missing cells clear like stored nulls.
+                self.fill_short_row(r, c);
                 // Clearing yields an empty string, not a null.
                 let was_null = self.file_is_null(r, c);
                 let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { continue };
@@ -764,7 +953,7 @@ impl Spreadsheet {
 
     /// Push a change onto the undo history (nothing to record is a no-op).
     fn record(&mut self, changes: Vec<CellChange>) {
-        self.record_step(UndoStep { changes, filter: None });
+        self.record_step(UndoStep { changes, filter: None, growth: None });
     }
 
     fn record_step(&mut self, step: UndoStep) {
@@ -836,7 +1025,7 @@ impl Spreadsheet {
                 .collect::<HashSet<String>>()
         });
         let filter = filter.map(|mapped| (col, self.filters.insert(col, mapped)));
-        self.record_step(UndoStep { changes, filter });
+        self.record_step(UndoStep { changes, filter, growth: None });
         self.recompute_col_width(col);
         converted
     }
@@ -850,6 +1039,9 @@ impl Spreadsheet {
         if let Some((col, stored)) = step.filter.as_mut() {
             self.swap_filter(*col, stored);
         }
+        if let Some(growth) = step.growth {
+            self.shrink(&growth);
+        }
         self.finish_step(&step);
         self.redo.push(step);
         self.modified = self.save_point != Some(self.undo.len());
@@ -859,6 +1051,12 @@ impl Spreadsheet {
     /// Redo the last undone step (Ctrl+Shift+Z or Ctrl+Y). Returns false with nothing to redo.
     pub fn redo(&mut self) -> bool {
         let Some(mut step) = self.redo.pop() else { return false };
+        if step.growth.is_some() {
+            if let Some(first) = step.changes.first() {
+                let (row, col) = (first.row, first.col);
+                self.grow_to(row, col);
+            }
+        }
         for change in step.changes.iter_mut() {
             self.swap_cell(change);
         }
@@ -1080,7 +1278,7 @@ impl Spreadsheet {
             return GridHit::Outside;
         }
 
-        let rw = self.row_num_width();
+        let rw = self.row_num_width(visible_data_rows);
         if col < rw {
             if is_data_row {
                 let row_idx = self.scroll_row + (row - data_start);
@@ -1096,27 +1294,24 @@ impl Spreadsheet {
             return GridHit::Outside;
         }
 
+        // Columns run on past the data as ghost columns to the screen's edge;
+        // rows likewise past the last row. Ghost cells are clickable; ghost
+        // column letters and separators aren't (nothing there to select or size).
         let mut pos = rw + 1;
         let mut cur_col = self.scroll_col;
-        while cur_col < self.num_cols() && pos < term_width as usize {
-            let w = self
-                .column_widths
-                .get(cur_col)
-                .copied()
-                .unwrap_or(MIN_COL_WIDTH);
+        while pos < term_width as usize {
+            let ghost_col = cur_col >= self.num_cols();
+            let w = self.col_width(cur_col);
             if col >= pos && col < pos + w {
                 if is_header_row {
-                    return GridHit::ColumnHeader { col: cur_col };
+                    return if ghost_col { GridHit::Outside } else { GridHit::ColumnHeader { col: cur_col } };
                 }
                 let row_idx = self.scroll_row + (row - data_start);
-                if row_idx < self.num_rows() {
-                    return GridHit::DataCell { row: row_idx, col: cur_col };
-                }
-                return GridHit::Outside;
+                return GridHit::DataCell { row: row_idx, col: cur_col };
             }
             let sep_pos = pos + w;
             if col == sep_pos {
-                return GridHit::ColumnSeparator { col: cur_col };
+                return if ghost_col { GridHit::Outside } else { GridHit::ColumnSeparator { col: cur_col } };
             }
             pos = sep_pos + 1;
             cur_col += 1;
@@ -1131,9 +1326,8 @@ impl Spreadsheet {
             self.commit_edit();
         }
         self.prepare_selection(with_selection);
-        let last_row = self.num_rows().saturating_sub(1);
-        let last_col = self.num_cols().saturating_sub(1);
-        self.cursor = (row.min(last_row), col.min(last_col));
+        // Ghost cells past the data are valid places to land (a click, a drag).
+        self.cursor = (row, col);
     }
 
     /// Select the entire column `col`. Cursor lands at (0, col); anchor at (last_row, col).
@@ -1351,15 +1545,18 @@ impl Spreadsheet {
         self.mouse_mode = MouseMode::None;
     }
 
+    /// Mouse-wheel scrolling. It can reach the data's last row and column, or
+    /// as far out into the ghost cells as the cursor (or the view) already is,
+    /// so a wheel tick out there doesn't snap the view back to the data.
     pub fn scroll_by(&mut self, row_delta: i32, col_delta: i32) {
-        let rows = self.num_rows();
-        let cols = self.num_cols();
-        self.scroll_row = ((self.scroll_row as i32 + row_delta)
-            .max(0) as usize)
-            .min(rows.saturating_sub(1));
-        self.scroll_col = ((self.scroll_col as i32 + col_delta)
-            .max(0) as usize)
-            .min(cols.saturating_sub(1));
+        let rows = self.num_rows().max(self.cursor.0 + 1).max(self.scroll_row + 1);
+        let cols = self.num_cols().max(self.cursor.1 + 1).max(self.scroll_col + 1);
+        let shift = |from: usize, delta: i32, limit: usize| -> usize {
+            let moved = if delta < 0 { from.saturating_sub(delta.unsigned_abs() as usize) } else { from.saturating_add(delta as usize) };
+            moved.min(limit.saturating_sub(1))
+        };
+        self.scroll_row = shift(self.scroll_row, row_delta, rows);
+        self.scroll_col = shift(self.scroll_col, col_delta, cols);
     }
 
     pub fn ensure_cursor_visible(&mut self, visible_rows: usize, visible_width: usize) {
@@ -1372,18 +1569,12 @@ impl Spreadsheet {
         if self.cursor.1 < self.scroll_col {
             self.scroll_col = self.cursor.1;
         } else {
-            let mut width_needed = self.row_num_width() + 1;
+            let mut width_needed = self.row_num_width(visible_rows) + 1;
             for c in self.scroll_col..=self.cursor.1 {
-                let cw = self.column_widths.get(c).copied().unwrap_or(MIN_COL_WIDTH);
-                width_needed += cw + 1;
+                width_needed += self.col_width(c) + 1;
             }
             while width_needed > visible_width && self.scroll_col < self.cursor.1 {
-                let cw = self
-                    .column_widths
-                    .get(self.scroll_col)
-                    .copied()
-                    .unwrap_or(MIN_COL_WIDTH);
-                width_needed -= cw + 1;
+                width_needed -= self.col_width(self.scroll_col) + 1;
                 self.scroll_col += 1;
             }
         }
@@ -2719,6 +2910,218 @@ mod tests {
         ss.set_filter(1, Some(set(&["a"])));
         assert_eq!(ss.visible_data_rows(), 3);
         assert!(!ss.is_modified());
+    }
+
+    // --- reading text strictly, ghost cells, growth ---
+
+    fn saved(ss: &mut Spreadsheet) -> String {
+        let tmp = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        ss.save(tmp.path()).unwrap();
+        std::fs::read_to_string(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn strict_reading_refuses_text_that_isnt_delimited_data() {
+        let refuse = |text: &str, delim: u8| Spreadsheet::from_text(text, delim, true).err().unwrap_or_default();
+        assert!(refuse("just some prose\nover two lines", b',').contains("no commas"));
+        assert!(refuse("a\tb\n1\t2", b',').contains("no commas"));
+        assert!(refuse("a,b\n1,\"open\n2,3\n", b',').contains("line 2"));
+        let wide = refuse("a,b\n\n1,2\n1,2,3\n", b',');
+        assert!(wide.contains("\"1,2,3\" has 3 fields") && wide.contains("header row has only 2"), "{wide}");
+    }
+
+    #[test]
+    fn empty_text_is_an_all_ghost_grid_that_grows_as_you_type() {
+        for text in ["", "\n\n", "  \n"] {
+            for strict in [true, false] {
+                let ss = Spreadsheet::from_text(text, b',', strict).unwrap();
+                assert_eq!((ss.num_cols(), ss.visible_data_rows()), (0, 0), "{text:?}");
+            }
+        }
+        let mut ss = Spreadsheet::from_text("", b',', true).unwrap();
+        assert_eq!(saved(&mut ss), ""); // an empty grid saves as an empty file
+        // Typing in B3 makes a two-column header (A1 and B1 null) and three rows.
+        ss.cursor = (2, 1);
+        ss.enter_edit_mode_replace('x');
+        ss.commit_edit();
+        assert_eq!((ss.num_cols(), ss.num_rows()), (2, 3));
+        assert_eq!(saved(&mut ss), ",\n,\n,x\n");
+        assert!(ss.undo());
+        assert_eq!(ss.num_cols(), 0);
+        assert_eq!(saved(&mut ss), "");
+        // A new file starts the same way.
+        let mut fresh = Spreadsheet::new_empty(b'\t');
+        assert_eq!(fresh.num_cols(), 0);
+        assert_eq!(saved(&mut fresh), "");
+    }
+
+    #[test]
+    fn undoing_a_grown_column_drops_its_filter_and_sort() {
+        let mut ss = grid(&[&["a", "b"], &["1", "2"], &["3", "4"]]);
+        ss.cursor = (1, 2); // C2, a ghost column
+        ss.enter_edit_mode_replace('x');
+        ss.commit_edit();
+        ss.set_filter(2, Some(set(&["x"])));
+        ss.sort_by(2, false);
+        assert_eq!(ss.visible_data_rows(), 1);
+        assert!(ss.undo());
+        assert!(!ss.is_filtered() && !ss.is_sorted());
+        assert_eq!(ss.visible_data_rows(), 2); // both rows back
+        assert_eq!(ss.column_values(0).len(), 2); // other menus list values again
+    }
+
+    #[test]
+    fn a_one_column_empty_row_survives_save_and_reload() {
+        let mut ss = grid(&[&["id"], &["1"]]);
+        ss.cursor = (3, 0); // two ghost rows down
+        ss.enter_edit_mode_replace('9');
+        ss.commit_edit();
+        let text = saved(&mut ss);
+        assert_eq!(text, "id\n1\n\"\"\n9\n");
+        let back = Spreadsheet::from_text(&text, b',', false).unwrap();
+        assert_eq!(back.num_rows(), 4);
+        assert_eq!(back.cell(3, 0), "9");
+    }
+
+    #[test]
+    fn missing_cells_clear_and_commit_like_stored_nulls() {
+        let mut ss = Spreadsheet::from_text("a,b,c\n1,,\n2\n", b',', false).unwrap();
+        // B2:C2 are stored nulls, B3:C3 missing; Delete turns all four into empty strings.
+        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (2, 2);
+        ss.clear_selection_content();
+        for (r, c) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
+            assert!(!ss.is_null(r, c), "{r},{c}");
+        }
+        assert!(ss.undo());
+        assert!(ss.is_null(2, 1) && ss.is_null(2, 2)); // back to null
+        // Enter then Enter on a missing cell: an empty string, as for a stored null.
+        let mut ss = Spreadsheet::from_text("a,b\n1\n", b',', false).unwrap();
+        ss.cursor = (1, 1);
+        ss.enter_edit_mode();
+        ss.commit_edit();
+        assert!(!ss.is_null(1, 1));
+        assert_eq!(saved(&mut ss), "a,b\n1,\"\"\n");
+    }
+
+    #[test]
+    fn wheel_scrolling_out_in_the_ghost_cells_does_not_snap_back() {
+        let mut ss = grid(&[&["a"], &["1"]]);
+        ss.cursor = (72, 0);
+        ss.scroll_row = 49;
+        ss.scroll_by(3, 0);
+        assert_eq!(ss.scroll_row, 52);
+        ss.scroll_by(-3, 0);
+        assert_eq!(ss.scroll_row, 49);
+        ss.scroll_by(-100, 0);
+        assert_eq!(ss.scroll_row, 0);
+    }
+
+    #[test]
+    fn short_rows_are_fine_when_the_header_covers_them() {
+        // Empty header fields still count: the header says there are three columns.
+        let mut ss = Spreadsheet::from_text("a,,\n1\n2,3\n4,5,6\n", b',', true).unwrap();
+        assert_eq!(ss.num_cols(), 3);
+        assert_eq!(ss.cell(1, 0), "1");
+        assert!(ss.is_null(1, 1) && ss.is_null(1, 2)); // missing cells are nulls
+        assert!(!ss.is_null(3, 2));
+        // Save writes every row to the header's width with empty fields.
+        assert_eq!(saved(&mut ss), "a,,\n1,,\n2,3,\n4,5,6\n");
+    }
+
+    #[test]
+    fn a_value_typed_into_a_ghost_cell_grows_the_data_and_undo_shrinks_it() {
+        let mut ss = grid(&[&["a", "b"], &["1", "2"]]);
+        let widths_before = ss.column_widths.len();
+        ss.move_down(false);
+        ss.move_down(false);
+        ss.move_down(false); // display row 3: two rows past the data
+        ss.move_right(false);
+        ss.move_right(false);
+        ss.move_right(false); // column D: two past the data
+        assert_eq!(ss.cursor, (3, 3));
+        ss.enter_edit_mode_replace('x');
+        ss.commit_edit();
+        assert_eq!((ss.num_rows(), ss.num_cols()), (4, 4));
+        assert_eq!(ss.cell(3, 3), "x");
+        assert!(ss.is_null(3, 0) && ss.is_null(2, 1) && ss.is_null(0, 3));
+        assert!(ss.is_modified());
+        assert_eq!(saved(&mut ss), "a,b,,\n1,2,,\n,,,\n,,,x\n");
+
+        assert!(ss.undo());
+        assert_eq!((ss.num_rows(), ss.num_cols()), (2, 2));
+        assert_eq!(ss.column_widths.len(), widths_before);
+        assert_eq!(saved(&mut ss), "a,b\n1,2\n");
+
+        assert!(ss.redo());
+        assert_eq!(ss.cell(3, 3), "x");
+        assert_eq!((ss.num_rows(), ss.num_cols()), (4, 4));
+    }
+
+    #[test]
+    fn typing_nothing_into_a_ghost_cell_grows_nothing() {
+        let mut ss = grid(&[&["a"], &["1"]]);
+        ss.cursor = (5, 5);
+        ss.enter_edit_mode();
+        ss.commit_edit();
+        assert_eq!((ss.num_rows(), ss.num_cols()), (2, 1));
+        assert!(!ss.undo());
+    }
+
+    #[test]
+    fn a_missing_cell_in_a_short_row_fills_in_place() {
+        let mut ss = Spreadsheet::from_text("a,b,c\n1\n", b',', false).unwrap();
+        ss.cursor = (1, 2);
+        ss.enter_edit_mode_replace('z');
+        ss.commit_edit();
+        assert_eq!(ss.cell(1, 2), "z");
+        assert!(ss.is_null(1, 1));
+        assert_eq!(saved(&mut ss), "a,b,c\n1,,z\n");
+        assert!(ss.undo());
+        assert_eq!(saved(&mut ss), "a,b,c\n1,,\n");
+    }
+
+    #[test]
+    fn a_row_grown_under_a_filter_shows_at_the_bottom_of_the_view() {
+        let mut ss = grid(&[&["k"], &["x"], &["y"], &["x"]]);
+        ss.set_filter(0, Some(set(&["x"]))); // shows file rows 1 and 3
+        assert_eq!(ss.num_rows(), 3);
+        ss.cursor = (3, 0); // the ghost row right under the view
+        ss.enter_edit_mode_replace('n');
+        ss.commit_edit();
+        assert_eq!(ss.rows.len(), 5); // appended to the file
+        assert_eq!(ss.num_rows(), 4);
+        assert_eq!(ss.cell(3, 0), "n");
+        assert_eq!(ss.file_row(3), 4);
+        assert!(ss.undo());
+        assert_eq!((ss.rows.len(), ss.num_rows()), (4, 3));
+    }
+
+    #[test]
+    fn the_cursor_walks_into_ghost_cells_but_ctrl_down_finds_the_data_edge() {
+        let mut ss = grid(&[&["a", "b"], &["1", "2"]]);
+        ss.page_down(10, false);
+        assert_eq!(ss.cursor.0, 10);
+        ss.move_last_row(false);
+        assert_eq!(ss.cursor.0, 1);
+        ss.move_end(false);
+        assert_eq!(ss.cursor.1, 1);
+        ss.move_to(7, 9, false); // a click far out in the ghost area
+        assert_eq!(ss.cursor, (7, 9));
+        assert_eq!(ss.cursor_label(), "J8");
+    }
+
+    #[test]
+    fn ghost_cells_are_clickable_and_ghost_row_numbers_widen_the_gutter() {
+        let ss = grid(&[&["a"], &["1"]]);
+        // Row 5 on screen is the first data row (formula bar, divider, letters above).
+        match ss.hit_test(30, (FORMULA_BAR_HEIGHT + 2 + 4) as u16, 80, 30) {
+            GridHit::DataCell { row, col } => assert!(row >= 2 && col >= 1, "{row},{col}"),
+            other => panic!("expected a ghost data cell, got {:?}", other),
+        }
+        let mut far = grid(&[&["a"], &["1"]]);
+        far.scroll_row = 99_990;
+        assert_eq!(far.row_num_width(20), 7); // labels reach 100,009
     }
 
     #[test]

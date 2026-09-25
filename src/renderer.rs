@@ -909,7 +909,7 @@ impl Renderer {
     }
 
     pub fn draw_spreadsheet(&mut self, editor: &mut Editor) -> io::Result<()> {
-        use crate::spreadsheet::{col_letter, render_cell_text, FORMULA_BAR_HEIGHT, MIN_COL_WIDTH};
+        use crate::spreadsheet::{col_letter, render_cell_text, FORMULA_BAR_HEIGHT};
         use unicode_width::UnicodeWidthChar;
 
         // Update title
@@ -962,7 +962,7 @@ impl Renderer {
         let ss = editor.spreadsheet().expect("spreadsheet mode");
         // Row-number gutter width scales with the row count so the header letters
         // stay aligned with the data columns even at the bottom of a huge file.
-        let row_num_width = ss.row_num_width();
+        let row_num_width = ss.row_num_width(visible_data_rows);
         let editing = ss.is_editing();
         let (cur_row, cur_col) = ss.cursor;
         let ((sel_r0, sel_c0), (sel_r1, sel_c1)) = ss.selected_range();
@@ -1114,16 +1114,14 @@ impl Renderer {
             let mut used: usize = row_num_width + 1;
             let num_cols = ss.num_cols();
             let mut col_idx = ss.scroll_col;
-            while col_idx < num_cols {
-                let col_width = ss
-                    .column_widths
-                    .get(col_idx)
-                    .copied()
-                    .unwrap_or(MIN_COL_WIDTH);
+            // Letters run on, dimmed, over the ghost columns past the data.
+            loop {
+                let col_width = ss.col_width(col_idx);
                 let remaining = (width as usize).saturating_sub(used);
                 if remaining == 0 {
                     break;
                 }
+                let ghost = col_idx >= num_cols;
                 // Column letter, then ↑/↓ for a sort level and ▼ for a filter.
                 let sort = ss.column_sort(col_idx);
                 let filtered = ss.column_filter(col_idx).is_some();
@@ -1142,6 +1140,7 @@ impl Renderer {
                 let is_focused = col_idx == cur_col;
                 let active = sort.is_some() || filtered;
                 match (active, is_focused) {
+                    _ if ghost && !is_focused => line.push_str("\x1b[48;5;236m\x1b[38;5;242m"),
                     (true, true) => line.push_str("\x1b[48;5;172m\x1b[38;5;16m"),
                     (true, false) => line.push_str("\x1b[48;5;136m\x1b[38;5;16m"),
                     (false, true) => line.push_str("\x1b[48;5;24m\x1b[38;5;230m"),
@@ -1175,21 +1174,17 @@ impl Renderer {
             let screen_row = data_start + offset;
             let mut line = String::new();
 
-            if row_idx >= ss.num_rows() {
-                line.push_str("\x1b[48;5;234m");
-                for _ in 0..width {
-                    line.push(' ');
-                }
-                line.push_str("\x1b[0m");
-                self.write_spreadsheet_row(screen_row, &line)?;
-                continue;
-            }
-
+            // Rows past the data are ghost rows: dim numbers (the file rows they
+            // would become) and empty cells to type into.
+            // (With no columns yet, the empty header row is a ghost row too.)
+            let ghost_row = row_idx >= ss.num_rows() || ss.num_cols() == 0;
             let is_current_row = row_idx == cur_row;
             // Row-number column: the file's row number (blue while a filter
             // hides rows, as in Excel, so gaps in the numbering read as hidden rows).
             if is_current_row {
                 line.push_str("\x1b[48;5;24m\x1b[38;5;230m\x1b[1m");
+            } else if ghost_row {
+                line.push_str("\x1b[48;5;236m\x1b[38;5;241m");
             } else if ss.is_filtered() {
                 line.push_str("\x1b[48;5;238m\x1b[38;5;75m");
             } else {
@@ -1202,16 +1197,20 @@ impl Renderer {
             let mut used: usize = row_num_width + 1;
             let num_cols = ss.num_cols();
             let mut col_idx = ss.scroll_col;
-            while col_idx < num_cols {
-                let col_width = ss
-                    .column_widths
-                    .get(col_idx)
-                    .copied()
-                    .unwrap_or(MIN_COL_WIDTH);
+            // Cells run on past the data as ghost cells, out to the screen edge.
+            loop {
+                let col_width = ss.col_width(col_idx);
                 let remaining = (width as usize).saturating_sub(used);
                 if remaining == 0 {
                     break;
                 }
+                let ghost = ghost_row || col_idx >= num_cols;
+                // Ghost cells get faint grid lines.
+                let separator = if ghost {
+                    "\x1b[0m\x1b[48;5;234m\x1b[38;5;236m│\x1b[0m"
+                } else {
+                    "\x1b[0m\x1b[48;5;234m\x1b[38;5;240m│\x1b[0m"
+                };
                 let is_focused_cell = row_idx == cur_row && col_idx == cur_col;
                 let in_selection = has_multi_selection
                     && row_idx >= sel_r0
@@ -1248,7 +1247,7 @@ impl Renderer {
                 if remaining >= col_width + 1 {
                     let rendered = render_cell_text(text, col_width);
                     line.push_str(&rendered);
-                    line.push_str("\x1b[0m\x1b[48;5;234m\x1b[38;5;240m│\x1b[0m");
+                    line.push_str(separator);
                     used += col_width + 1;
                     col_idx += 1;
                 } else {
@@ -1278,8 +1277,9 @@ impl Renderer {
 
         // --- Status bar ---
         let pos_label = ss.cursor_label();
-        let num_rows = ss.file_row_count();
         let num_cols = ss.num_cols();
+        // An empty grid reads 0×0, not 1×0 (its header row has no cells yet).
+        let num_rows = if num_cols == 0 { 0 } else { ss.file_row_count() };
         let ro = editor.is_read_only();
         let (status_msg, is_error) = if let Some((msg, is_err)) = &editor.status_message {
             (msg.clone(), *is_err)

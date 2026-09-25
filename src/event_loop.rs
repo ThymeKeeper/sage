@@ -382,10 +382,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             Some(GridHit::ColumnHeader { col }) => Some(col),
                             _ => None,
                         };
-                        if let Some(col) = col {
+                        // Only data columns have a menu; a ghost column has nothing to sort or filter.
+                        let data_cols = editor.spreadsheet().map_or(0, |ss| ss.num_cols());
+                        if let Some(col) = col.filter(|&c| c < data_cols) {
                             open_filter_menu(editor, col, renderer, &mut output_pane)?;
-                            needs_redraw = true;
+                        } else {
+                            ensure_ss_cursor_visible(editor)?; // the cursor may have moved to a cut-off cell
                         }
+                        needs_redraw = true;
                         continue;
                     }
 
@@ -682,7 +686,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                     if key.code == KeyCode::Down && alt && !ctrl {
-                        if let Some(col) = editor.spreadsheet().map(|ss| ss.cursor.1) {
+                        // Only data columns have a menu (not a ghost column past the data).
+                        let col = editor.spreadsheet().map(|ss| ss.cursor.1).filter(|&c| {
+                            editor.spreadsheet().map_or(false, |ss| c < ss.num_cols())
+                        });
+                        if let Some(col) = col {
                             open_filter_menu(editor, col, renderer, &mut output_pane)?;
                         }
                         continue;
@@ -1423,7 +1431,28 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         // Clear and redraw
                         full_redraw(renderer, &mut output_pane)?;
 
-                        if let Ok(Some(language)) = result {
+                        let grid_delimiter = match &result {
+                            Ok(Some(syntax::Language::Csv)) => Some(b','),
+                            Ok(Some(syntax::Language::Tsv)) => Some(b'\t'),
+                            _ => None,
+                        };
+                        if let Some(delimiter) = grid_delimiter {
+                            // Spreadsheet: read the text as a grid, or say why it can't be.
+                            match editor.enter_grid_mode(delimiter) {
+                                Ok(()) => {
+                                    if editor.is_repl_mode() {
+                                        editor.disable_repl_mode();
+                                    }
+                                    output_pane_visible = false;
+                                    editor.status_message = None;
+                                    ensure_ss_cursor_visible(editor)?;
+                                }
+                                Err(why) => {
+                                    editor.status_message =
+                                        Some((format!("Can't show this as a spreadsheet: {}", why), true));
+                                }
+                            }
+                        } else if let Ok(Some(language)) = result {
                             // Set the new language
                             editor.set_language(language);
                             // Switching language can flip whether wrap is active, which
@@ -2986,6 +3015,21 @@ mod tests {
         assert!(!editor.is_modified());
         editor.save().unwrap();
         assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), CSV);
+    }
+
+    #[test]
+    fn arrowing_past_the_data_and_typing_adds_a_row_and_a_column() {
+        let (mut editor, tmp) = load("a,b\n1,2\n");
+        press(&mut editor, &[
+            (KeyCode::Down, NONE), (KeyCode::Down, NONE), // the ghost row under the data
+            (KeyCode::Right, NONE), (KeyCode::Right, NONE), // the ghost column after it
+            (KeyCode::Char('9'), NONE), (KeyCode::Enter, NONE),
+        ]);
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a,b,\n1,2,\n,,9\n");
+        press(&mut editor, &[(KeyCode::Char('z'), KeyModifiers::CONTROL)]);
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a,b\n1,2\n");
     }
 
     #[test]

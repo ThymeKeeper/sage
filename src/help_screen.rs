@@ -110,6 +110,8 @@ impl HelpScreen {
                 ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
                 ("", "Filters and sorts change the view only, never the file"),
                 ("Ctrl+T", "Switch grid / read-only text view"),
+                ("Past the last row/column", "Ghost cells: type a value to add rows/columns"),
+                ("Ctrl+Y (in text)", "Spreadsheet (CSV/TSV): show the text as a grid"),
             ]),
             ("LANGUAGE", vec![
                 ("Ctrl+Y", "Select language"),

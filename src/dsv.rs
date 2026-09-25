@@ -90,6 +90,35 @@ pub fn parse(input: &str, delim: u8) -> Vec<Vec<Field>> {
     rows
 }
 
+/// The line (1-based) where a quote opens that is never closed, if any: the
+/// text doesn't read as delimited data then, since everything after it would
+/// fold into one field. Follows `parse`'s quoting (`""` inside quotes is a
+/// literal quote).
+pub fn open_quote_line(input: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut line = 1;
+    let mut opened_at = 0;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            line += 1;
+        }
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            }
+        } else if ch == '"' {
+            in_quotes = true;
+            opened_at = line;
+        }
+    }
+    in_quotes.then_some(opened_at)
+}
+
 fn make_field(content: &str, quoted: bool) -> Field {
     if !quoted && content.is_empty() {
         None

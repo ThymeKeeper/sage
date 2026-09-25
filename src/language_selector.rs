@@ -19,6 +19,8 @@ impl LanguageSelector {
             (Language::PlainText, "Plain Text"),
             (Language::Python, "Python"),
             (Language::Sql, "SQL"),
+            (Language::Csv, "Spreadsheet (CSV)"),
+            (Language::Tsv, "Spreadsheet (TSV)"),
             (Language::Rust, "Rust"),
             (Language::R, "R"),
             (Language::Yaml, "YAML"),
