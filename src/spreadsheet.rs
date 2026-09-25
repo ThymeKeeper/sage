@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -148,6 +150,59 @@ pub struct Spreadsheet {
     pub modified: bool,
     pub editing: Option<CellEdit>,
     pub mouse_mode: MouseMode,
+    /// Row 1 is the header. Filters and sorts are view-only: `rows` keeps the
+    /// file's order and Save writes every row. Grid positions (cursor, scroll,
+    /// selection, `cell()`) are display rows, mapped through `view`.
+    ///
+    /// Display order while a filter or sort is active: the index into `rows`
+    /// shown at each grid row, the header (0) always first. `None` is the file
+    /// order, every row, so an unfiltered grid costs nothing on huge files.
+    view: Option<Vec<usize>>,
+    /// Active filters: column -> the filter keys (see `filter_key`) left visible.
+    filters: BTreeMap<usize, HashSet<String>>,
+    /// Sort levels as (column, descending), oldest first. Each is re-applied in
+    /// order as a stable sort, so the latest is the primary key and earlier ones
+    /// break its ties, as with successive sorts in Excel.
+    sorts: Vec<(usize, bool)>,
+}
+
+/// How a cell orders in a sort: numbers (and ISO dates, as epoch seconds)
+/// before text, text ignoring case, blanks last in either direction.
+#[derive(Debug, Clone)]
+enum SortKey {
+    Num(f64),
+    Text(String),
+    Blank,
+}
+
+impl SortKey {
+    fn of(raw: &str, is_null: bool) -> SortKey {
+        // Blank means empty or null, as in the filter; a cell of spaces is text.
+        if is_null || raw.is_empty() {
+            return SortKey::Blank;
+        }
+        let t = raw.trim();
+        if let Some(n) = parse_number(t) {
+            SortKey::Num(n)
+        } else if let Some((secs, _, _)) = parse_iso_datetime(t) {
+            SortKey::Num(secs as f64)
+        } else {
+            SortKey::Text(raw.to_lowercase())
+        }
+    }
+
+    fn cmp(&self, other: &SortKey, descending: bool) -> Ordering {
+        let ord = match (self, other) {
+            (SortKey::Blank, SortKey::Blank) => return Ordering::Equal,
+            (SortKey::Blank, _) => return Ordering::Greater,
+            (_, SortKey::Blank) => return Ordering::Less,
+            (SortKey::Num(a), SortKey::Num(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (SortKey::Num(_), SortKey::Text(_)) => Ordering::Less,
+            (SortKey::Text(_), SortKey::Num(_)) => Ordering::Greater,
+            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+        };
+        if descending { ord.reverse() } else { ord }
+    }
 }
 
 /// Sentinel rendered in the grid for a null cell (an unquoted-empty CSV/TSV
@@ -213,6 +268,9 @@ impl Spreadsheet {
             modified: false,
             editing: None,
             mouse_mode: MouseMode::None,
+            view: None,
+            filters: BTreeMap::new(),
+            sorts: Vec::new(),
         };
         ss.recompute_column_widths();
         Ok(ss)
@@ -231,6 +289,9 @@ impl Spreadsheet {
             modified: false,
             editing: None,
             mouse_mode: MouseMode::None,
+            view: None,
+            filters: BTreeMap::new(),
+            sorts: Vec::new(),
         }
     }
 
@@ -263,8 +324,22 @@ impl Spreadsheet {
         Ok(())
     }
 
+    /// Rows in the grid as displayed (the header plus the rows a filter leaves).
     pub fn num_rows(&self) -> usize {
+        self.view.as_ref().map_or(self.rows.len(), |v| v.len())
+    }
+
+    /// Rows in the file, header included, whatever the view shows.
+    pub fn file_row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Index into `rows` (the file's row order) of display row `row`.
+    pub fn file_row(&self, row: usize) -> usize {
+        match &self.view {
+            Some(v) => v.get(row).copied().unwrap_or(usize::MAX),
+            None => row,
+        }
     }
 
     pub fn num_cols(&self) -> usize {
@@ -276,23 +351,34 @@ impl Spreadsheet {
     /// row count keeps the header letters aligned with the data columns — and the
     /// layout stable while scrolling — even when row numbers reach the millions.
     pub fn row_num_width(&self) -> usize {
-        let digits = self.num_rows().max(1).to_string().len();
+        // Row labels are file row numbers, so size to the file, not the view.
+        let digits = self.file_row_count().max(1).to_string().len();
         (digits + 1).max(ROW_NUM_WIDTH)
     }
 
+    /// Text of the cell at display row `row`.
     pub fn cell(&self, row: usize, col: usize) -> &str {
+        self.file_cell(self.file_row(row), col)
+    }
+
+    /// Whether the cell at display row `row` is null (an unquoted-empty source
+    /// field) as opposed to an empty string. Null cells hold `""` in `rows` but
+    /// render as `∅`.
+    pub fn is_null(&self, row: usize, col: usize) -> bool {
+        self.file_is_null(self.file_row(row), col)
+    }
+
+    fn file_cell(&self, file_row: usize, col: usize) -> &str {
         self.rows
-            .get(row)
+            .get(file_row)
             .and_then(|r| r.get(col))
             .map(|s| s.as_str())
             .unwrap_or("")
     }
 
-    /// Whether the cell is null (an unquoted-empty source field) as opposed to
-    /// an empty string. Null cells hold `""` in `rows` but render as `∅`.
-    pub fn is_null(&self, row: usize, col: usize) -> bool {
+    fn file_is_null(&self, file_row: usize, col: usize) -> bool {
         self.null_mask
-            .get(row)
+            .get(file_row)
             .and_then(|r| r.get(col))
             .copied()
             .unwrap_or(false)
@@ -332,8 +418,141 @@ impl Spreadsheet {
         if self.delimiter == b'\t' { "TSV" } else { "CSV" }
     }
 
+    // --- Filter & sort (view-only; row 1 is the header) ---------------------
+
+    /// The value a filter matches a cell on: its text, with nulls and empty
+    /// strings both "" (listed as "(Blanks)").
+    fn filter_key(&self, file_row: usize, col: usize) -> &str {
+        if self.file_is_null(file_row, col) {
+            ""
+        } else {
+            self.file_cell(file_row, col)
+        }
+    }
+
+    fn passes_filters(&self, file_row: usize, skip_col: Option<usize>) -> bool {
+        self.filters.iter().all(|(&col, allowed)| {
+            Some(col) == skip_col || allowed.contains(self.filter_key(file_row, col))
+        })
+    }
+
+    /// Distinct values in column `col` with how many rows hold each, over the
+    /// data rows the other columns' filters leave (what Excel's dropdown lists).
+    /// Ordered as an ascending sort would order them, "" (blanks) last.
+    pub fn column_values(&self, col: usize) -> Vec<(String, usize)> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for r in 1..self.rows.len() {
+            if self.passes_filters(r, Some(col)) {
+                *counts.entry(self.filter_key(r, col)).or_insert(0) += 1;
+            }
+        }
+        let mut values: Vec<(SortKey, String, usize)> = counts
+            .into_iter()
+            .map(|(v, n)| (SortKey::of(v, false), v.to_string(), n))
+            .collect();
+        values.sort_by(|a, b| a.0.cmp(&b.0, false).then_with(|| a.1.cmp(&b.1)));
+        values.into_iter().map(|(_, v, n)| (v, n)).collect()
+    }
+
+    /// The values column `col`'s filter leaves visible, if it has a filter.
+    pub fn column_filter(&self, col: usize) -> Option<&HashSet<String>> {
+        self.filters.get(&col)
+    }
+
+    pub fn is_filtered(&self) -> bool {
+        !self.filters.is_empty()
+    }
+
+    /// Direction of column `col` if it is a sort level (true = descending).
+    pub fn column_sort(&self, col: usize) -> Option<bool> {
+        self.sorts.iter().find(|(c, _)| *c == col).map(|&(_, d)| d)
+    }
+
+    pub fn is_sorted(&self) -> bool {
+        !self.sorts.is_empty()
+    }
+
+    /// Data rows (header excluded) the grid shows.
+    pub fn visible_data_rows(&self) -> usize {
+        self.num_rows().saturating_sub(1)
+    }
+
+    /// Data rows (header excluded) in the file.
+    pub fn file_data_rows(&self) -> usize {
+        self.rows.len().saturating_sub(1)
+    }
+
+    /// Show only rows whose value in `col` is in `allowed`; `None` drops the filter.
+    pub fn set_filter(&mut self, col: usize, allowed: Option<HashSet<String>>) {
+        match allowed {
+            Some(values) => {
+                self.filters.insert(col, values);
+            }
+            None => {
+                self.filters.remove(&col);
+            }
+        }
+        self.rebuild_view();
+    }
+
+    pub fn clear_filters(&mut self) {
+        self.filters.clear();
+        self.rebuild_view();
+    }
+
+    /// Sort the view by `col`, making it the primary key; earlier sorts break ties.
+    pub fn sort_by(&mut self, col: usize, descending: bool) {
+        self.sorts.retain(|(c, _)| *c != col);
+        self.sorts.push((col, descending));
+        self.rebuild_view();
+    }
+
+    /// Back to the file's row order (filters stay).
+    pub fn clear_sort(&mut self) {
+        self.sorts.clear();
+        self.rebuild_view();
+    }
+
+    /// Recompute the displayed rows from the filters and sort levels, keeping
+    /// the cursor on the same file row while that row is still shown.
+    fn rebuild_view(&mut self) {
+        let cursor_file_row = self.file_row(self.cursor.0);
+        if self.filters.is_empty() && self.sorts.is_empty() {
+            self.view = None;
+        } else {
+            let mut shown: Vec<usize> = (1..self.rows.len())
+                .filter(|&r| self.passes_filters(r, None))
+                .collect();
+            for &(col, descending) in &self.sorts {
+                let keys: Vec<SortKey> = shown
+                    .iter()
+                    .map(|&r| SortKey::of(self.file_cell(r, col), self.file_is_null(r, col)))
+                    .collect();
+                let mut order: Vec<usize> = (0..shown.len()).collect();
+                order.sort_by(|&a, &b| keys[a].cmp(&keys[b], descending)); // stable
+                shown = order.into_iter().map(|i| shown[i]).collect();
+            }
+            shown.insert(0, 0); // the header row always leads
+            self.view = Some(shown);
+        }
+        let last = self.num_rows().saturating_sub(1);
+        let new_row = match &self.view {
+            None => cursor_file_row.min(last),
+            Some(v) => v
+                .iter()
+                .position(|&r| r == cursor_file_row)
+                .unwrap_or(self.cursor.0.min(last)),
+        };
+        self.cursor.0 = new_row;
+        self.selection_anchor = None;
+        // Back to the top; the caller's ensure_cursor_visible then scrolls just
+        // far enough to show the cursor, so a short result fills the screen.
+        self.scroll_row = 0;
+    }
+
     pub fn cursor_label(&self) -> String {
-        format!("{}{}", col_letter(self.cursor.1), self.cursor.0 + 1)
+        // The file's row number, like Excel's row headers under a filter.
+        format!("{}{}", col_letter(self.cursor.1), self.file_row(self.cursor.0).saturating_add(1))
     }
 
     fn prepare_selection(&mut self, with_selection: bool) {
@@ -459,7 +678,10 @@ impl Spreadsheet {
 
     pub fn commit_edit(&mut self) {
         let Some(edit) = self.editing.take() else { return };
-        let (r, c) = self.cursor;
+        let (display_row, c) = self.cursor;
+        // Write to the file row shown there. The view isn't re-applied, so an
+        // edited row stays put until the filter or sort next changes (as in Excel).
+        let r = self.file_row(display_row);
         if let Some(row) = self.rows.get_mut(r) {
             if let Some(cell) = row.get_mut(c) {
                 // An edited cell holds a real value, never a null — even if the
@@ -480,7 +702,9 @@ impl Spreadsheet {
     pub fn clear_selection_content(&mut self) {
         let ((r0, c0), (r1, c1)) = self.selected_range();
         let mut changed = false;
-        for r in r0..=r1 {
+        // Display rows only: cells a filter hides are left alone, as in Excel.
+        for display_row in r0..=r1 {
+            let r = self.file_row(display_row);
             for c in c0..=c1 {
                 if let Some(row) = self.rows.get_mut(r) {
                     if let Some(cell) = row.get_mut(c) {
@@ -730,6 +954,11 @@ impl Spreadsheet {
     }
 
     pub fn move_to(&mut self, row: usize, col: usize, with_selection: bool) {
+        // An open edit belongs to the cell it started in: commit it there before
+        // the cursor leaves (the find pane can move the cursor mid-edit).
+        if self.is_editing() {
+            self.commit_edit();
+        }
         self.prepare_selection(with_selection);
         let last_row = self.num_rows().saturating_sub(1);
         let last_col = self.num_cols().saturating_sub(1);
@@ -814,14 +1043,16 @@ impl Spreadsheet {
         self.column_widths[col] = w.clamp(MIN_COL_WIDTH, MAX_RESIZE_WIDTH);
     }
 
-    /// Case-insensitive substring search across all cells. Returns matches in row-major order.
+    /// Case-insensitive substring search across the displayed cells (rows a
+    /// filter hides are skipped). Returns display (row, col) in row-major order.
     pub fn find_cells(&self, needle: &str) -> Vec<(usize, usize)> {
         if needle.is_empty() {
             return Vec::new();
         }
         let needle_lower = needle.to_lowercase();
         let mut out = Vec::new();
-        for (r, row) in self.rows.iter().enumerate() {
+        for r in 0..self.num_rows() {
+            let Some(row) = self.rows.get(self.file_row(r)) else { continue };
             for (c, cell) in row.iter().enumerate() {
                 if cell.to_lowercase().contains(&needle_lower) {
                     out.push((r, c));
@@ -1301,7 +1532,8 @@ fn split_timezone(s: &str) -> Option<(&str, Option<i64>)> {
     let body = &tz[1..];
     let (h, m) = match body.split_once(':') {
         Some((h, m)) => (h, m),
-        None if body.len() == 4 => (&body[0..2], &body[2..4]),
+        // ±HHMM. ASCII only: a 4-byte non-ASCII body (e.g. "1€") would split a char.
+        None if body.len() == 4 && body.is_ascii() => (&body[0..2], &body[2..4]),
         None => (body, "0"),
     };
     let oh: i64 = h.parse().ok()?;
@@ -2085,5 +2317,144 @@ mod tests {
         let out = render_cell_text("first\nsecond", 10);
         assert_eq!(out.chars().count(), 10);
         assert!(out.contains('…'));
+    }
+
+    // --- filter & sort (view-only) ---
+
+    fn grid(rows: &[&[&str]]) -> Spreadsheet {
+        let mut ss = Spreadsheet::new_empty(b',');
+        ss.rows = rows.iter().map(|r| r.iter().map(|s| s.to_string()).collect()).collect();
+        ss.null_mask = ss.rows.iter().map(|r| vec![false; r.len()]).collect();
+        ss
+    }
+
+    fn column(ss: &Spreadsheet, col: usize) -> Vec<String> {
+        (0..ss.num_rows()).map(|r| ss.cell(r, col).to_string()).collect()
+    }
+
+    fn set(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn filter_keeps_the_header_and_maps_reads_and_edits_to_file_rows() {
+        let mut ss = grid(&[&["gw", "n"], &["YYC", "3"], &["YYZ", "10"], &["YYC", "2"]]);
+        ss.set_filter(0, Some(set(&["YYC"])));
+        assert_eq!(column(&ss, 1), vec!["n", "3", "2"]);
+        assert_eq!(ss.file_row(2), 3);
+        assert_eq!((ss.visible_data_rows(), ss.file_data_rows()), (2, 3));
+
+        // Copy and the status-bar metrics see only the visible rows.
+        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (2, 1);
+        assert_eq!(ss.copy_selection_tsv(), "YYC\t3\nYYC\t2");
+        assert_eq!(ss.selection_metrics().numbers, vec![3.0, 2.0]);
+
+        // An edit lands on the file row shown there.
+        ss.selection_anchor = None;
+        ss.enter_edit_mode_replace('7');
+        ss.commit_edit();
+        assert_eq!(ss.rows[3][1], "7");
+        assert_eq!(ss.rows[1][1], "3");
+
+        // Save writes every row, in the file's order.
+        let tmp = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        ss.save(tmp.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "gw,n\nYYC,3\nYYZ,10\nYYC,7\n");
+
+        ss.clear_filters();
+        assert_eq!(column(&ss, 1), vec!["n", "3", "10", "7"]);
+    }
+
+    #[test]
+    fn sort_orders_numbers_then_text_with_blanks_last_and_never_touches_the_file() {
+        let mut ss = grid(&[&["v"], &["10"], &["b"], &[""], &["9"], &["A"]]);
+        ss.sort_by(0, false);
+        assert_eq!(column(&ss, 0), vec!["v", "9", "10", "A", "b", ""]);
+        ss.sort_by(0, true);
+        assert_eq!(column(&ss, 0), vec!["v", "b", "A", "10", "9", ""]);
+        assert_eq!(ss.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(), vec!["v", "10", "b", "", "9", "A"]);
+        assert!(!ss.is_modified());
+        ss.clear_sort();
+        assert_eq!(column(&ss, 0), vec!["v", "10", "b", "", "9", "A"]);
+    }
+
+    #[test]
+    fn sorting_twice_gives_a_two_level_sort() {
+        let mut ss = grid(&[&["k", "n"], &["x", "2"], &["y", "1"], &["x", "1"], &["y", "2"]]);
+        ss.sort_by(1, false); // secondary
+        ss.sort_by(0, false); // primary
+        let rows: Vec<(String, String)> = (1..ss.num_rows())
+            .map(|r| (ss.cell(r, 0).to_string(), ss.cell(r, 1).to_string()))
+            .collect();
+        let expected = [("x", "1"), ("x", "2"), ("y", "1"), ("y", "2")];
+        assert_eq!(rows, expected.map(|(a, b)| (a.to_string(), b.to_string())));
+    }
+
+    #[test]
+    fn sort_keeps_the_cursor_on_its_row_and_iso_dates_sort_as_dates() {
+        let mut ss = grid(&[&["d"], &["2026-10-01"], &["2025-12-31"], &["2026-01-15"]]);
+        ss.cursor = (1, 0); // on 2026-10-01
+        ss.sort_by(0, false);
+        assert_eq!(column(&ss, 0), vec!["d", "2025-12-31", "2026-01-15", "2026-10-01"]);
+        assert_eq!(ss.cell(ss.cursor.0, 0), "2026-10-01");
+    }
+
+    #[test]
+    fn column_values_follow_the_other_filters_with_blanks_last() {
+        let mut ss = grid(&[&["a", "b"], &["1", "x"], &["2", "x"], &["1", "y"], &["", "x"]]);
+        ss.null_mask[4][0] = true; // a null counts as a blank too
+        ss.set_filter(1, Some(set(&["x"])));
+        assert_eq!(
+            ss.column_values(0),
+            vec![("1".to_string(), 1), ("2".to_string(), 1), (String::new(), 1)]
+        );
+        // A column's own filter doesn't narrow its own list.
+        assert_eq!(ss.column_values(1), vec![("x".to_string(), 3), ("y".to_string(), 1)]);
+        // Filtering to blanks keeps the null row.
+        ss.set_filter(0, Some(set(&[""])));
+        assert_eq!(ss.visible_data_rows(), 1);
+        assert_eq!(ss.file_row(1), 4);
+    }
+
+    #[test]
+    fn non_ascii_timezone_suffix_is_rejected_not_a_panic() {
+        assert_eq!(parse_iso_datetime("2026-01-01 10:00-1\u{20ac}"), None);
+        let mut ss = grid(&[&["t"], &["2026-01-01 10:00-1\u{20ac}"], &["b"]]);
+        ss.sort_by(0, false);
+        assert_eq!(ss.column_values(0).len(), 2);
+    }
+
+    #[test]
+    fn a_cell_of_spaces_sorts_as_text_not_blank() {
+        let mut ss = grid(&[&["v"], &["b"], &[" "], &["a"], &[""]]);
+        ss.sort_by(0, false);
+        assert_eq!(column(&ss, 0), vec!["v", " ", "a", "b", ""]);
+    }
+
+    #[test]
+    fn a_filter_scrolls_back_to_the_top() {
+        let mut rows: Vec<Vec<&str>> = vec![vec!["k"]];
+        rows.extend((0..100).map(|i| vec![if i % 10 == 0 { "hit" } else { "miss" }]));
+        let refs: Vec<&[&str]> = rows.iter().map(|r| r.as_slice()).collect();
+        let mut ss = grid(&refs);
+        ss.cursor = (91, 0); // a "hit" row near the bottom
+        ss.scroll_row = 80;
+        ss.set_filter(0, Some(set(&["hit"])));
+        ss.ensure_cursor_visible(20, 200);
+        assert_eq!(ss.scroll_row, 0); // header plus all ten hits fit on screen
+        assert_eq!(ss.cell(ss.cursor.0, 0), "hit");
+    }
+
+    #[test]
+    fn find_and_clear_see_only_visible_rows() {
+        let mut ss = grid(&[&["c"], &["apple"], &["banana"], &["apricot"]]);
+        ss.set_filter(0, Some(set(&["apple", "apricot"])));
+        assert_eq!(ss.find_cells("ap"), vec![(1, 0), (2, 0)]);
+        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (2, 0);
+        ss.clear_selection_content();
+        assert_eq!(ss.rows[2][0], "banana");
+        assert_eq!((ss.rows[1][0].as_str(), ss.rows[3][0].as_str()), ("", ""));
     }
 }

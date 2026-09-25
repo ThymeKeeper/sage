@@ -61,6 +61,7 @@ impl HelpScreen {
                 ("Home / End", "Start / End of line"),
                 ("Page Up / Page Down", "Scroll page"),
                 ("Ctrl+W", "Toggle word wrap (plain text & Markdown)"),
+                ("Ctrl+T", "CSV/TSV: switch grid / read-only text view"),
             ]),
             ("SEARCH & REPLACE", vec![
                 ("Ctrl+F", "Find / Find next"),
@@ -99,6 +100,13 @@ impl HelpScreen {
                 ("Click + drag in table", "Select a rectangular cell range"),
                 ("Ctrl+C (multi-cell)", "Copy as TSV with column headers"),
                 ("Ctrl+Up / Ctrl+Down", "Jump between cell outputs (pane focused)"),
+                ("Shift+Arrow Keys", "Grow or shrink a table cell region (pane focused)"),
+            ]),
+            ("SPREADSHEET (CSV / TSV)", vec![
+                ("Alt+Down / right-click", "Filter & sort the column (row 1 is the header)"),
+                ("Ctrl+Shift+L", "Clear all filters"),
+                ("", "Filters and sorts change the view only, never the file"),
+                ("Ctrl+T", "Switch grid / read-only text view"),
             ]),
             ("LANGUAGE", vec![
                 ("Ctrl+Y", "Select language"),

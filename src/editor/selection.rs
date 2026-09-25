@@ -90,6 +90,9 @@ impl Editor {
     }
 
     pub fn replace_selection(&mut self, replacement: &str) -> bool {
+        if self.refuse_text_view_edit() {
+            return false;
+        }
         if let Some((start, end)) = self.get_selection() {
             self.replace_at(start, end, replacement);
             self.selection_start = None;
@@ -100,6 +103,9 @@ impl Editor {
     }
 
     pub fn replace_at(&mut self, start: usize, end: usize, replacement: &str) {
+        if self.refuse_text_view_edit() {
+            return;
+        }
         let cursor_before = self.cursor;
         let start_line = self.buffer.byte_to_line(start);
         let end_line = self.buffer.byte_to_line(end);

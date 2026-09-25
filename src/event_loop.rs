@@ -1,4 +1,4 @@
-use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, language_selector, commands, direct_kernel, syntax, help_screen, config, snippet_picker};
+use crate::{editor, renderer, find_replace, output_pane, kernel, autocomplete, prompt, exit_prompt, kernel_selector, language_selector, commands, direct_kernel, syntax, help_screen, config, snippet_picker, filter_menu};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
     execute,
@@ -48,6 +48,20 @@ fn text_key_char(event: &Event) -> Option<char> {
     None
 }
 
+/// Full-window re-render: clear the terminal and drop every line cache (editor
+/// rows, status bar, output pane) so the next draw repaints each row. Call when
+/// a pop-up (prompt, selector, find pane, help) opens or closes: it paints over
+/// rows the caches still think are current, and can move the status bar.
+fn full_redraw(
+    renderer: &mut renderer::Renderer,
+    output_pane: &mut output_pane::OutputPane,
+) -> io::Result<()> {
+    renderer.clear_screen()?;
+    renderer.force_redraw();
+    output_pane.invalidate_cache();
+    Ok(())
+}
+
 pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io::Result<()> {
     let mut find_replace: Option<find_replace::FindReplace> = None;
     let mut output_pane = output_pane::OutputPane::new();
@@ -76,6 +90,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     // Autocomplete
     let mut autocomplete = autocomplete::Autocomplete::new();
     let mut suppress_autocomplete_once = false; // Suppress after Tab completion
+    let mut autocomplete_was_visible = false; // Dropdown was painted last frame
 
     // Spreadsheet: track recent click for double-click detection
     let mut ss_last_click: Option<(std::time::Instant, crate::spreadsheet::GridHit)> = None;
@@ -201,13 +216,31 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     0
                 };
 
+                // The autocomplete dropdown paints over rows the caches think
+                // are current, and can move, shrink or vanish on any key or
+                // scroll. Repaint every row while it is up and on the frame it
+                // goes away, so no path can leave a piece of it behind.
+                let autocomplete_visible = autocomplete.is_visible();
+                if autocomplete_visible || autocomplete_was_visible {
+                    renderer.force_redraw();
+                    output_pane.invalidate_cache();
+                }
+                autocomplete_was_visible = autocomplete_visible;
+
                 // Draw the editor with bottom window if needed
                 let bottom_focused = output_pane_visible && output_pane.is_focused();
-                renderer.draw_with_bottom_window(editor, bottom_window_height, bottom_focused)?;
+                // The focused output pane owns the caret (and its shape) unless
+                // find/replace is drawn in its place.
+                let pane_selection = if bottom_focused && find_replace.is_none() {
+                    Some(output_pane.has_selection())
+                } else {
+                    None
+                };
+                renderer.draw_with_bottom_window(editor, bottom_window_height, bottom_focused, pane_selection)?;
 
                 // Draw the appropriate pane
                 if let Some(ref fr) = find_replace {
-                    fr.draw(&mut io::stdout())?;
+                    fr.draw(&mut io::stdout(), editor.is_spreadsheet_mode())?;
                 } else if output_pane_visible {
                     let (width, height) = crossterm::terminal::size()?;
                     // Output pane starts after the status bar
@@ -327,8 +360,35 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 // Check if shift is held for horizontal scrolling
                 let shift_held = mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
 
-                // Spreadsheet mode handles mouse itself
-                if editor.is_spreadsheet_mode() {
+                // Spreadsheet mode handles mouse itself (unless help is showing)
+                if editor.is_spreadsheet_mode() && help_screen.is_none() {
+                    // Right-click a cell or column letter: that column's filter & sort menu.
+                    if mouse_event.kind == MouseEventKind::Down(MouseButton::Right) && find_replace.is_none() {
+                        use crate::spreadsheet::GridHit;
+                        let (term_w, term_h) = crossterm::terminal::size()?;
+                        let hit = editor
+                            .spreadsheet()
+                            .map(|ss| ss.hit_test(mouse_event.column, mouse_event.row, term_w, term_h));
+                        let col = match hit {
+                            Some(GridHit::DataCell { row, col }) => {
+                                if let Some(ss) = editor.spreadsheet_mut() {
+                                    if ss.is_editing() {
+                                        ss.commit_edit(); // into its own cell, before the cursor moves
+                                    }
+                                    ss.move_to(row, col, false);
+                                }
+                                Some(col)
+                            }
+                            Some(GridHit::ColumnHeader { col }) => Some(col),
+                            _ => None,
+                        };
+                        if let Some(col) = col {
+                            open_filter_menu(editor, col, renderer, &mut output_pane)?;
+                            needs_redraw = true;
+                        }
+                        continue;
+                    }
+
                     // Double-click detection for auto-sizing columns
                     if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
                         let (term_w, term_h) = crossterm::terminal::size()?;
@@ -614,9 +674,35 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                 needs_redraw = true; // Key events usually need redraw
 
+                // Spreadsheet filter & sort: Alt+Down opens the cursor column's
+                // menu (Excel's shortcut for its filter dropdown); Ctrl+Shift+L
+                // clears every filter. Both are view-only.
+                if editor.is_spreadsheet_mode() && find_replace.is_none() && help_screen.is_none() {
+                    let alt = key.modifiers.contains(KeyModifiers::ALT);
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                    if key.code == KeyCode::Down && alt && !ctrl {
+                        if let Some(col) = editor.spreadsheet().map(|ss| ss.cursor.1) {
+                            open_filter_menu(editor, col, renderer, &mut output_pane)?;
+                        }
+                        continue;
+                    }
+                    if ctrl && shift && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+                        if let Some(ss) = editor.spreadsheet_mut() {
+                            if ss.is_editing() {
+                                ss.commit_edit();
+                            }
+                            ss.clear_filters();
+                        }
+                        ensure_ss_cursor_visible(editor)?;
+                        continue;
+                    }
+                }
+
                 // Spreadsheet mode: intercept most keys before any normal handling,
-                // except when the find pane is open — then input belongs to the find pane.
-                if editor.is_spreadsheet_mode() && find_replace.is_none() {
+                // except when the find pane is open — then input belongs to the find pane —
+                // or the help screen is, which takes its own keys (Esc, arrows, F1).
+                if editor.is_spreadsheet_mode() && find_replace.is_none() && help_screen.is_none() {
                     let cursor_before = editor.spreadsheet().map(|ss| ss.cursor);
                     if handle_spreadsheet_key(editor, &key, &mut needs_redraw) {
                         let cursor_after = editor.spreadsheet().map(|ss| ss.cursor);
@@ -638,11 +724,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     match action {
                         SsFindAction::Close => {
                             find_replace = None;
-                            execute!(io::stdout(),
-                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                crossterm::cursor::Hide
-                            )?;
-                            renderer.force_redraw();
+                            full_redraw(renderer, &mut output_pane)?;
                         }
                         SsFindAction::Handled => {
                             ensure_ss_cursor_visible_with_bottom(editor, 3)?;
@@ -756,12 +838,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 // Clear selection and find matches when closing find
                                 editor.selection_start = None;
                                 editor.clear_find_matches();
-                                // Force redraw
-                                execute!(io::stdout(), 
-                                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                    crossterm::cursor::Hide
-                                )?;
-                                renderer.force_redraw();
+                                full_redraw(renderer, &mut output_pane)?;
                             }
                             find_replace::InputResult::FindTextChanged => {
                                 // Update search results
@@ -808,11 +885,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     if help_screen.is_some() {
                         // Hide help screen
                         help_screen = None;
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                            crossterm::cursor::Hide
-                        )?;
-                        renderer.force_redraw();
+                        full_redraw(renderer, &mut output_pane)?;
                     } else {
                         // Show help screen
                         help_screen = Some(help_screen::HelpScreen::new());
@@ -830,11 +903,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         KeyCode::Esc => {
                             // Close help screen
                             help_screen = None;
-                            execute!(io::stdout(),
-                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                crossterm::cursor::Hide
-                            )?;
-                            renderer.force_redraw();
+                            full_redraw(renderer, &mut output_pane)?;
                             needs_redraw = true;
                         }
                         KeyCode::Up => {
@@ -883,14 +952,12 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             
                             // Run the prompt and get result
                             let result = exit_prompt.run(&mut io::stdout(), filename)?;
-                            
-                            // Clear the screen and force complete redraw
-                            execute!(io::stdout(), 
-                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                crossterm::cursor::Hide
-                            )?;
-                            renderer.force_redraw();
-                            
+
+                            // Every path that stays in sage below `continue`s with
+                            // needs_redraw set, so the loop repaints the full
+                            // layout (editor, status bar, output pane).
+                            full_redraw(renderer, &mut output_pane)?;
+
                             match result {
                                 exit_prompt::ExitOption::Save => {
                                     // Try to save
@@ -898,34 +965,22 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                         // Need Save As
                                         let initial_path = editor.get_save_as_initial_path();
                                         let mut prompt = prompt::Prompt::new("Save As", &initial_path);
-                                        
+
                                         if let Some(path) = prompt.run(&mut io::stdout())? {
                                             if editor.save_as(path).is_err() {
-                                                // Clear and redraw
-                                                execute!(io::stdout(), 
-                                                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                                    crossterm::cursor::Hide
-                                                )?;
-                                                renderer.force_redraw();
-                                                renderer.draw(editor)?;
+                                                full_redraw(renderer, &mut output_pane)?;
                                                 continue; // Don't exit if save failed
                                             } else {
                                                 return Ok(()); // Successfully saved, exit
                                             }
                                         } else {
                                             // User cancelled Save As, don't exit
-                                            execute!(io::stdout(), 
-                                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                                crossterm::cursor::Hide
-                                            )?;
-                                            renderer.force_redraw();
-                                            renderer.draw(editor)?;
+                                            full_redraw(renderer, &mut output_pane)?;
                                             continue;
                                         }
                                     } else {
                                         // Normal save
                                         if editor.save().is_err() {
-                                            renderer.draw(editor)?;
                                             continue; // Don't exit if save failed
                                         } else {
                                             return Ok(()); // Successfully saved, exit
@@ -936,8 +991,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                     return Ok(()); // Exit without saving
                                 }
                                 exit_prompt::ExitOption::Cancel => {
-                                    // Cancel exit, redraw and continue
-                                    renderer.draw(editor)?;
+                                    // Cancel exit; the loop redraws
                                     continue;
                                 }
                             }
@@ -977,7 +1031,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                     .map(|d| d.join(&filename).to_string_lossy().into_owned())
                                     .unwrap_or(filename);
                                 let mut p = prompt::Prompt::new("Export results to", &initial);
-                                if let Some(dest) = p.run(&mut io::stdout())? {
+                                let chosen = p.run(&mut io::stdout())?;
+                                full_redraw(renderer, &mut output_pane)?;
+                                if let Some(dest) = chosen {
                                     let dest_display = format!("{}", std::path::Path::new(&dest).display());
                                     match std::fs::copy(&src, &dest) {
                                         Ok(bytes) => {
@@ -994,7 +1050,6 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                         }
                                     }
                                 }
-                                renderer.force_redraw();
                                 needs_redraw = true;
                             }
                             None => {
@@ -1194,6 +1249,16 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         commands::Command::None
                     }
 
+                    // CSV/TSV: switch between the grid and a read-only text view (Ctrl+T)
+                    KeyCode::Char('t') | KeyCode::Char('T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        editor.toggle_grid_text_view();
+                        let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
+                        editor.update_viewport_for_cursor_with_bottom(bottom_height);
+                        full_redraw(renderer, &mut output_pane)?;
+                        needs_redraw = true;
+                        commands::Command::None
+                    }
+
                     // Execute Cell (Ctrl+E as alternative)
                     KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Only allow execution in REPL-mode languages (Python or SQL).
@@ -1244,6 +1309,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
                         editor.update_viewport_for_cursor_with_bottom(bottom_height);
                         renderer.force_redraw();
+                        // The pane's cache still matches its last frame, so a
+                        // re-shown pane would skip painting over the editor rows.
+                        output_pane.invalidate_cache();
                         commands::Command::None
                     }
 
@@ -1255,12 +1323,12 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             editor.status_message = Some(("Kernel selection only available in REPL mode (Python/SQL). Press Ctrl+Y to switch language.".to_string(), true));
                             commands::Command::None
                         } else {
-                        // Show loading message
+                        // Show loading message (status bar only: a full
+                        // renderer.draw() here would lay the editor out with no
+                        // output pane and paint over it)
                         editor.status_message = Some(("Discovering kernels...".to_string(), false));
-                        renderer.draw(editor)?;
-                        use std::io::Write;
-                        let mut stdout = io::stdout();
-                        stdout.flush()?;
+                        let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
+                        renderer.update_status_bar_only(editor, bottom_height)?;
 
                         // Create selector (this does the discovery)
                         let mut selector =
@@ -1277,14 +1345,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         };
 
                         // Clear and redraw - important to clear the entire screen
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                        )?;
-
-                        // Reset terminal state completely
-                        execute!(io::stdout(), crossterm::cursor::Hide)?;
-
-                        renderer.force_redraw();
+                        full_redraw(renderer, &mut output_pane)?;
 
                         if let Some(kernel_info) = result {
                             // Polymorphic dispatch — DirectKernel for Python interpreters,
@@ -1320,10 +1381,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
 
                         // Force full redraw after kernel selector
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                        )?;
-                        renderer.force_redraw();
+                        full_redraw(renderer, &mut output_pane)?;
                         needs_redraw = true;
 
                         commands::Command::None
@@ -1340,11 +1398,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         let result = picker.run(&mut io::stdout());
 
                         // Clear and redraw
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                        )?;
-                        execute!(io::stdout(), crossterm::cursor::Hide)?;
-                        renderer.force_redraw();
+                        full_redraw(renderer, &mut output_pane)?;
 
                         if let Ok(Some(text)) = result {
                             editor.paste_text(text);
@@ -1367,14 +1421,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         let result = selector.run(&mut io::stdout());
 
                         // Clear and redraw
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                        )?;
-
-                        // Reset terminal state
-                        execute!(io::stdout(), crossterm::cursor::Hide)?;
-
-                        renderer.force_redraw();
+                        full_redraw(renderer, &mut output_pane)?;
 
                         if let Ok(Some(language)) = result {
                             // Set the new language
@@ -1507,10 +1554,7 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
 
                         // Force full redraw
-                        execute!(io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                        )?;
-                        renderer.force_redraw();
+                        full_redraw(renderer, &mut output_pane)?;
                         needs_redraw = true;
 
                         commands::Command::None
@@ -1833,21 +1877,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             
                             // Run the prompt and get result
                             let result = prompt.run(&mut io::stdout())?;
-                            
-                            // Clear the entire screen and force complete redraw
-                            execute!(io::stdout(), 
-                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                                crossterm::cursor::Hide
-                            )?;
-                            renderer.force_redraw();
-                            
+
+                            // Clear the entire screen; the loop repaints the full layout
+                            full_redraw(renderer, &mut output_pane)?;
+
                             // Process the result
                             if let Some(path) = result {
                                 let _ = editor.save_as(path);
                             }
-                            
-                            // Redraw the editor
-                            renderer.draw(editor)?;
                         } else {
                             // Normal save
                             let _ = editor.execute(cmd);
@@ -1862,21 +1899,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         
                         // Run the prompt and get result
                         let result = prompt.run(&mut io::stdout())?;
-                        
-                        // Clear the entire screen and force complete redraw
-                        execute!(io::stdout(), 
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                            crossterm::cursor::Hide
-                        )?;
-                        renderer.force_redraw();
-                        
+
+                        // Clear the entire screen; the loop repaints the full layout
+                        full_redraw(renderer, &mut output_pane)?;
+
                         // Process the result
                         if let Some(path) = result {
                             let _ = editor.save_as(path);
                         }
-                        
-                        // Redraw the editor
-                        renderer.draw(editor)?;
                     }
                     commands::Command::FindReplace => {
                         // Open find/replace window. Spreadsheet mode uses a find-only pane
@@ -1891,6 +1921,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         } else {
                             find_replace = Some(find_replace::FindReplace::new());
                         }
+                        // The find pane takes the output pane's place and moves the status bar
+                        full_redraw(renderer, &mut output_pane)?;
                     }
                     commands::Command::None => {
                         // No command - don't override needs_redraw flag
@@ -1957,8 +1989,10 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 }
             }
             Event::Resize(_, _) => {
-                // Terminal was resized, force redraw
+                // Terminal was resized, force redraw. The renderer clears the
+                // whole screen on a size change, so the pane must repaint too.
                 renderer.force_redraw();
+                output_pane.invalidate_cache();
                 needs_redraw = true;
             }
             _ => {
@@ -2232,6 +2266,38 @@ fn run_and_capture(child: std::process::Child) -> (String, bool) {
 /// Number of visible data rows in the spreadsheet grid, for a full-screen page
 /// step. Mirrors the layout math in `ensure_ss_cursor_visible_with_bottom`
 /// (status bar + formula bar + divider + header above the data area).
+/// Open the filter & sort menu for spreadsheet column `col` and apply the
+/// choice. View-only: the file keeps its rows and order.
+fn open_filter_menu(
+    editor: &mut editor::Editor,
+    col: usize,
+    renderer: &mut renderer::Renderer,
+    output_pane: &mut output_pane::OutputPane,
+) -> io::Result<()> {
+    let menu = match editor.spreadsheet_mut() {
+        Some(ss) => {
+            if ss.is_editing() {
+                ss.commit_edit();
+            }
+            filter_menu::FilterMenu::for_column(ss, col)
+        }
+        None => return Ok(()),
+    };
+    let mut menu = menu;
+    let action = menu.run(&mut io::stdout())?;
+    if let (Some(action), Some(ss)) = (action, editor.spreadsheet_mut()) {
+        match action {
+            filter_menu::FilterAction::SortAscending => ss.sort_by(col, false),
+            filter_menu::FilterAction::SortDescending => ss.sort_by(col, true),
+            filter_menu::FilterAction::ClearSort => ss.clear_sort(),
+            filter_menu::FilterAction::ClearFilter => ss.set_filter(col, None),
+            filter_menu::FilterAction::Filter(allowed) => ss.set_filter(col, allowed),
+        }
+    }
+    ensure_ss_cursor_visible(editor)?;
+    full_redraw(renderer, output_pane)
+}
+
 fn spreadsheet_visible_rows() -> usize {
     use crate::spreadsheet::FORMULA_BAR_HEIGHT;
     let (_, height) = crossterm::terminal::size().unwrap_or((80, 25));
@@ -2479,6 +2545,11 @@ fn handle_spreadsheet_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // F1 opens the help screen from the grid too.
+    if key.code == KeyCode::F(1) {
+        return false;
+    }
+
     // Let save/quit go through the normal prompt dialogs
     if ctrl && !alt {
         match key.code {
@@ -2491,9 +2562,11 @@ fn handle_spreadsheet_key(
                 return false;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
+                // Commit a typed edit so it counts as unsaved: the exit prompt
+                // then offers Save / discard instead of losing it silently.
                 if let Some(ss) = editor.spreadsheet_mut() {
                     if ss.is_editing() {
-                        ss.cancel_edit();
+                        ss.commit_edit();
                     }
                 }
                 return false;
@@ -2506,6 +2579,8 @@ fn handle_spreadsheet_key(
                 }
                 return false;
             }
+            // Text view toggle: handled by the main key loop (it commits an edit)
+            KeyCode::Char('t') | KeyCode::Char('T') => return false,
             _ => {}
         }
     }
@@ -2780,4 +2855,125 @@ fn results_head_tempfile(
     // this process moves on (and after the parent eventually exits).
     let (_file, path) = tmp.keep()?;
     Ok((path, records.saturating_sub(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    const CSV: &str = "id,city,amt\n1,YYC,30\n2,YYZ,10\n3,YVR,20\n4,YYC,40\n";
+
+    fn load(contents: &str) -> (editor::Editor, tempfile::NamedTempFile) {
+        let mut tmp = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        tmp.write_all(contents.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let mut editor = editor::Editor::new();
+        editor.load_file(tmp.path().to_str().unwrap()).unwrap();
+        (editor, tmp)
+    }
+
+    /// Press keys through the grid's own key handler, as the event loop does.
+    fn press(editor: &mut editor::Editor, keys: &[(KeyCode, KeyModifiers)]) {
+        let mut redraw = false;
+        for &(code, mods) in keys {
+            assert!(handle_spreadsheet_key(editor, &event::KeyEvent::new(code, mods), &mut redraw));
+        }
+    }
+
+    const NONE: KeyModifiers = KeyModifiers::NONE;
+    const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+
+    #[test]
+    fn a_typed_edit_under_a_sort_saves_into_the_right_row() {
+        let (mut editor, tmp) = load(CSV);
+        editor.spreadsheet_mut().unwrap().sort_by(2, true); // amt, largest first: ids 4 1 3 2
+        press(&mut editor, &[
+            (KeyCode::Down, NONE), (KeyCode::Down, NONE), (KeyCode::Down, NONE), // id 3
+            (KeyCode::Right, NONE), (KeyCode::Right, NONE),                      // amt
+            (KeyCode::Char('2'), NONE), (KeyCode::Char('5'), NONE), (KeyCode::Enter, NONE),
+        ]);
+        let ss = editor.spreadsheet().unwrap();
+        assert_eq!((ss.cell(3, 0), ss.cell(3, 2)), ("3", "25")); // stays put, not re-sorted
+        editor.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "id,city,amt\n1,YYC,30\n2,YYZ,10\n3,YVR,25\n4,YYC,40\n"
+        );
+    }
+
+    #[test]
+    fn a_range_delete_under_a_filter_and_sort_clears_only_the_visible_cells() {
+        let (mut editor, tmp) = load(CSV);
+        {
+            let ss = editor.spreadsheet_mut().unwrap();
+            let keep: HashSet<String> = ["YYC", "YVR"].iter().map(|s| s.to_string()).collect();
+            ss.set_filter(1, Some(keep)); // hides id 2 (YYZ), which sits between ids 1 and 3 in the file
+            ss.sort_by(2, false);         // amt ascending: ids 3 1 4
+        }
+        press(&mut editor, &[
+            (KeyCode::Down, NONE),                        // id 3
+            (KeyCode::Right, NONE),                       // city
+            (KeyCode::Right, SHIFT), (KeyCode::Down, SHIFT), // to amt of id 1
+            (KeyCode::Delete, NONE),
+        ]);
+        editor.save().unwrap();
+        // ids 3 and 1 cleared (empty strings save quoted); hidden id 2 and id 4 untouched; file order kept.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "id,city,amt\n1,\"\",\"\"\n2,YYZ,10\n3,\"\",\"\"\n4,YYC,40\n"
+        );
+    }
+
+    #[test]
+    fn an_open_edit_commits_to_its_own_cell_when_find_moves_the_cursor() {
+        let (mut editor, tmp) = load(CSV);
+        {
+            let ss = editor.spreadsheet_mut().unwrap();
+            ss.move_to(1, 1, false); // B2 = YYC
+            ss.enter_edit_mode();
+            ss.edit_insert_char('!');
+            ss.move_to(3, 0, false); // what a find match does
+            assert!(!ss.is_editing());
+        }
+        editor.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "id,city,amt\n1,YYC!,30\n2,YYZ,10\n3,YVR,20\n4,YYC,40\n"
+        );
+    }
+
+    #[test]
+    fn quitting_mid_edit_keeps_the_edit_as_unsaved() {
+        let (mut editor, _tmp) = load(CSV);
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Char('9'), NONE)]);
+        let mut redraw = false;
+        let quit = event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(!handle_spreadsheet_key(&mut editor, &quit, &mut redraw)); // on to the exit prompt
+        let ss = editor.spreadsheet().unwrap();
+        assert_eq!(ss.cell(1, 0), "9");
+        assert!(editor.is_modified()); // so the exit prompt asks to save
+    }
+
+    #[test]
+    fn tab_commits_an_edit_to_its_own_cell_under_a_filter() {
+        let (mut editor, tmp) = load(CSV);
+        {
+            let ss = editor.spreadsheet_mut().unwrap();
+            let keep: HashSet<String> = ["YYC"].iter().map(|s| s.to_string()).collect();
+            ss.set_filter(1, Some(keep)); // ids 1 and 4
+        }
+        press(&mut editor, &[
+            (KeyCode::Down, NONE), (KeyCode::Down, NONE), // id 4
+            (KeyCode::Char('9'), NONE), (KeyCode::Tab, NONE),  // id -> 9, then move right
+            (KeyCode::Char('Y'), NONE), (KeyCode::Char('Q'), NONE), (KeyCode::Char('R'), NONE),
+            (KeyCode::Enter, NONE),
+        ]);
+        editor.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "id,city,amt\n1,YYC,30\n2,YYZ,10\n3,YVR,20\n9,YQR,40\n"
+        );
+    }
 }

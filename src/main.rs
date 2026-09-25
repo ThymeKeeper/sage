@@ -24,6 +24,7 @@ mod clipboard;
 mod config;
 mod snippet_picker;
 mod spreadsheet;
+mod filter_menu;
 
 use kernel::Kernel;
 

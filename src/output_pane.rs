@@ -221,9 +221,19 @@ struct OutputRenderState {
     cursor_line: usize,
     cursor_col: usize,
     selection_start: Option<(usize, usize)>,
+    cell_rect: Option<((usize, usize), (usize, usize))>,
     start_row: u16,
     height: usize,
     width: u16,
+}
+
+/// One Shift+arrow step of a table cell region's far corner.
+#[derive(Clone, Copy)]
+enum CellStep {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 impl OutputPane {
@@ -256,46 +266,133 @@ impl OutputPane {
         let was_focused = self.focused;
         self.focused = focused;
 
-        // Focus transitions clear any rectangular cell selection so the
-        // overlay doesn't ghost across mode changes.
-        self.cell_rect = None;
-
-        // When gaining focus, position cursor at a visible location and clear selection
+        // Losing focus leaves the selection alone: a cell region stays a region
+        // (dropping only cell_rect would decay it to a line selection).
         if self.focused && !was_focused {
-            let total_lines = self.count_total_lines();
-            if total_lines > 0 {
-                // Position cursor at the last line (same as auto-scroll position)
-                self.cursor_line = total_lines.saturating_sub(1);
-                self.cursor_col = 0;
-                self.horizontal_offset = 0;
-                self.auto_scroll = true; // Ensure we're showing the bottom
-            }
-            // Clear any selection when gaining focus
-            self.selection_start = None;
-            self.preferred_column = None;
+            self.take_focus();
         }
+    }
+
+    /// Focus just arrived. A highlight still on screen (text or cell region) is
+    /// kept, caret and all, scrolled into view. With nothing highlighted the
+    /// caret goes to the last line, following the newest output.
+    fn take_focus(&mut self) {
+        if self.has_selection() {
+            self.disable_auto_scroll();
+            self.ensure_cursor_visible();
+            return;
+        }
+        let total_lines = self.count_total_lines();
+        if total_lines > 0 {
+            // Position cursor at the last line (same as auto-scroll position)
+            self.cursor_line = total_lines.saturating_sub(1);
+            self.cursor_col = 0;
+            self.horizontal_offset = 0;
+            self.auto_scroll = true; // Ensure we're showing the bottom
+        }
+        self.cell_rect = None;
+        self.preferred_column = None;
     }
 
     pub fn is_focused(&self) -> bool {
         self.focused
     }
 
+    /// True while text or table cells are highlighted (the caret shows as an underline).
+    pub fn has_selection(&self) -> bool {
+        self.selection_start.is_some()
+    }
+
+    /// Leave rectangular cell-selection mode. A region spanning more than one
+    /// cell is dropped whole: its text anchor sits in the first cell, so keeping
+    /// it would decay the region into a multi-line text selection. A one-cell
+    /// region's text selection is that same cell, so it stays.
+    fn exit_cell_region(&mut self) {
+        if let Some((anchor, cursor)) = self.cell_rect.take() {
+            if anchor != cursor {
+                self.selection_start = None;
+            }
+        }
+    }
+
+    /// Shift+arrow over a table: grow or shrink the rectangular cell region,
+    /// the same region a mouse drag makes (Ctrl+C copies it as TSV). The anchor
+    /// cell stays put; the far corner moves one cell, skips border rows, and
+    /// stops at the table's edges. Returns false when there is no region and the
+    /// cursor isn't on a table row, so the caller does a text selection instead.
+    fn extend_cell_region(&mut self, step: CellStep) -> bool {
+        let lines = self.get_all_lines();
+        let stripped = |i: usize| lines.get(i).map(|l| strip_ansi(&l.0));
+        let data_row = |i: usize| stripped(i).filter(|s| Self::is_table_data_row(s));
+
+        // Start from the existing region, or open one on the cell under the cursor.
+        let (anchor, (line, cell)) = match self.cell_rect {
+            Some(rect) => rect,
+            None => {
+                let Some(s) = data_row(self.cursor_line) else { return false };
+                let bounds = Self::find_cell_boundaries(&s);
+                if bounds.is_empty() {
+                    return false;
+                }
+                let here = (self.cursor_line, Self::cursor_to_cell_index(&bounds, self.cursor_col));
+                (here, here)
+            }
+        };
+
+        // Nearest data row above/below in the same table, skipping ├ ╞ ┌ └ rows.
+        let adjacent_row = |from: usize, up: bool| -> Option<usize> {
+            let mut i = from;
+            loop {
+                i = if up { i.checked_sub(1)? } else { i + 1 };
+                let s = stripped(i)?;
+                if Self::is_table_data_row(&s) {
+                    return Some(i);
+                }
+                if !Self::is_table_separator_row(&s) {
+                    return None;
+                }
+            }
+        };
+        let (line, cell) = match step {
+            CellStep::Left => (line, cell.saturating_sub(1)),
+            CellStep::Right => (line, cell + 1),
+            CellStep::Up => (adjacent_row(line, true).unwrap_or(line), cell),
+            CellStep::Down => (adjacent_row(line, false).unwrap_or(line), cell),
+        };
+
+        let Some(corner_row) = data_row(line) else { return true };
+        let bounds = Self::find_cell_boundaries(&corner_row);
+        if bounds.is_empty() {
+            return true;
+        }
+        let cell = cell.min(bounds.len() - 1);
+        let (_, corner_end) = Self::cell_content_range(&corner_row, &bounds, cell);
+
+        // Text anchor at the anchor cell's start keeps has_selection() true, and
+        // makes a region shrunk back to one cell read as a clicked cell.
+        let anchor_start = data_row(anchor.0)
+            .map(|s| {
+                let b = Self::find_cell_boundaries(&s);
+                if anchor.1 < b.len() { Self::cell_content_range(&s, &b, anchor.1).0 } else { 0 }
+            })
+            .unwrap_or(0);
+
+        self.cell_rect = Some((anchor, (line, cell)));
+        self.selection_start = Some((anchor.0, anchor_start));
+        self.cursor_line = line;
+        self.cursor_col = corner_end;
+        self.preferred_column = None;
+        self.disable_auto_scroll();
+        self.ensure_cursor_visible();
+        true
+    }
+
     pub fn toggle_focus(&mut self) {
         self.focused = !self.focused;
 
-        // When gaining focus, position cursor at a visible location and clear selection
+        // Losing focus keeps the selection, as in set_focused.
         if self.focused {
-            let total_lines = self.count_total_lines();
-            if total_lines > 0 {
-                // Position cursor at the last line (same as auto-scroll position)
-                self.cursor_line = total_lines.saturating_sub(1);
-                self.cursor_col = 0;
-                self.horizontal_offset = 0;
-                self.auto_scroll = true; // Ensure we're showing the bottom
-            }
-            // Clear any selection when gaining focus
-            self.selection_start = None;
-            self.preferred_column = None;
+            self.take_focus();
         }
     }
 
@@ -382,7 +479,7 @@ impl OutputPane {
     /// Move cursor up by one page (viewport height)
     pub fn page_up(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -411,7 +508,7 @@ impl OutputPane {
     /// Move cursor down by one page (viewport height)
     pub fn page_down(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -450,8 +547,11 @@ impl OutputPane {
 
     /// Move cursor up one line
     pub fn move_cursor_up(&mut self, with_selection: bool) {
+        if with_selection && self.extend_cell_region(CellStep::Up) {
+            return;
+        }
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if self.cursor_line == 0 {
             return;
         }
@@ -522,8 +622,11 @@ impl OutputPane {
 
     /// Move cursor down one line
     pub fn move_cursor_down(&mut self, with_selection: bool) {
+        if with_selection && self.extend_cell_region(CellStep::Down) {
+            return;
+        }
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         let total_lines = self.count_total_lines();
         if self.cursor_line + 1 >= total_lines {
             return;
@@ -594,8 +697,11 @@ impl OutputPane {
 
     /// Move cursor left one character (or one table cell if on a table row)
     pub fn move_cursor_left(&mut self, with_selection: bool) {
+        if with_selection && self.extend_cell_region(CellStep::Left) {
+            return;
+        }
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if let Some(stripped) = self.get_stripped_line(self.cursor_line) {
             if Self::is_table_data_row(&stripped) {
                 let bounds = Self::find_cell_boundaries(&stripped);
@@ -644,8 +750,11 @@ impl OutputPane {
 
     /// Move cursor right one character (or one table cell if on a table row)
     pub fn move_cursor_right(&mut self, with_selection: bool) {
+        if with_selection && self.extend_cell_region(CellStep::Right) {
+            return;
+        }
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if let Some(stripped) = self.get_stripped_line(self.cursor_line) {
             if Self::is_table_data_row(&stripped) {
                 let bounds = Self::find_cell_boundaries(&stripped);
@@ -699,7 +808,7 @@ impl OutputPane {
     /// Move cursor to start of line
     pub fn move_cursor_home(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -714,7 +823,7 @@ impl OutputPane {
     /// Move cursor to end of line
     pub fn move_cursor_end(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -729,7 +838,7 @@ impl OutputPane {
     /// Move cursor to previous word boundary (stops at line start, doesn't cross lines)
     pub fn move_cursor_word_left(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -779,7 +888,7 @@ impl OutputPane {
     /// Move cursor to next word boundary (stops at line end, doesn't cross lines)
     pub fn move_cursor_word_right(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -833,7 +942,7 @@ impl OutputPane {
     /// Move cursor to previous paragraph (empty line boundary)
     pub fn move_cursor_paragraph_up(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -879,7 +988,7 @@ impl OutputPane {
     /// Move cursor to next paragraph (empty line boundary)
     pub fn move_cursor_paragraph_down(&mut self, with_selection: bool) {
         // Keyboard nav exits rectangular cell selection mode.
-        self.cell_rect = None;
+        self.exit_cell_region();
         if with_selection && self.selection_start.is_none() {
             self.selection_start = Some((self.cursor_line, self.cursor_col));
         } else if !with_selection {
@@ -1458,6 +1567,7 @@ impl OutputPane {
                 cursor_line: self.cursor_line,
                 cursor_col: self.cursor_col,
                 selection_start: self.selection_start,
+                cell_rect: self.cell_rect,
                 start_row,
                 height,
                 width,
@@ -1602,7 +1712,9 @@ impl OutputPane {
         // Draw lines starting from line_offset
         // On Windows, we build complete ANSI strings and use per-line caching to avoid flicker
         #[cfg(target_os = "windows")]
-        let mut screen_row_idx: usize = 1; // Start at 1 (row 0 is the separator/title)
+        // Cache slot = pane row, the same indexing the empty-pane hint uses, so
+        // the first output compares against what is really on screen.
+        let mut screen_row_idx: usize = 0;
 
         for (absolute_line_idx, (line_text, is_header, is_error)) in all_lines.iter().enumerate() {
             // Skip lines before line_offset
@@ -1877,17 +1989,10 @@ impl OutputPane {
             }
         }
 
-        // Show cursor if focused and visible
+        // Show cursor if focused and visible. The caret shape is set by the
+        // renderer from has_selection(), so its cache stays in step.
         if self.focused {
             if let (Some(row), Some(col)) = (cursor_screen_row, cursor_screen_col) {
-                // Set cursor style based on whether we have a selection
-                if self.selection_start.is_some() {
-                    // Underline cursor when selecting
-                    write!(writer, "\x1b[4 q")?;
-                } else {
-                    // Block cursor when not selecting
-                    write!(writer, "\x1b[2 q")?;
-                }
                 execute!(writer, cursor::MoveTo(col, row), crossterm::cursor::Show)?;
             }
         }
@@ -1997,13 +2102,18 @@ impl OutputPane {
             self.last_click_position = Some((line, col));
 
             match self.click_count {
+                // The first click of a double/triple click primed a one-cell
+                // region on table rows; drop it so the word or line selection
+                // is what shows and what Ctrl+C copies.
                 2 => {
                     // Double click - select word
+                    self.cell_rect = None;
                     self.select_word_at(line, col);
                     self.mouse_selecting = false;
                 }
                 3 => {
                     // Triple click - select line
+                    self.cell_rect = None;
                     self.select_line_at(line);
                     self.mouse_selecting = false;
                 }
@@ -2185,6 +2295,188 @@ impl OutputPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlight_and_caret_survive_a_focus_round_trip() {
+        let mut pane = table_pane();
+        pane.cursor_line = 4;
+        pane.cursor_col = 2;
+        pane.move_cursor_right(true);
+        pane.move_cursor_down(true);
+        let region = pane.cell_rect;
+        let caret = (pane.cursor_line, pane.cursor_col);
+        assert!(region.is_some());
+
+        // Clicking into the editor: the region stays a region.
+        pane.set_focused(false);
+        assert_eq!(pane.cell_rect, region);
+
+        // Esc back into the pane: highlight and caret untouched.
+        pane.toggle_focus();
+        assert!(pane.focused);
+        assert_eq!(pane.cell_rect, region);
+        assert_eq!((pane.cursor_line, pane.cursor_col), caret);
+
+        // Same through set_focused.
+        pane.set_focused(false);
+        pane.set_focused(true);
+        assert_eq!(pane.cell_rect, region);
+        assert_eq!((pane.cursor_line, pane.cursor_col), caret);
+    }
+
+    #[test]
+    fn focus_without_a_highlight_goes_to_the_last_line() {
+        let mut pane = table_pane();
+        pane.focused = false;
+        pane.cursor_line = 2;
+        pane.cursor_col = 3;
+        pane.toggle_focus();
+        assert_eq!(pane.cursor_line, pane.count_total_lines() - 1);
+        assert_eq!(pane.cursor_col, 0);
+        assert!(pane.auto_scroll);
+    }
+
+    #[test]
+    fn keyboard_exit_drops_multi_cell_region_instead_of_decaying() {
+        let mut pane = OutputPane::new();
+        pane.add_output(OutputEntry {
+            label: "Cell 1".to_string(),
+            output: "│ a │ b │\n│ 1 │ 2 │\n│ 3 │ 4 │".to_string(),
+            is_error: false,
+            elapsed_secs: 0.0,
+        });
+        pane.focused = true;
+        // Flattened line 0 is the cell header; table rows are lines 1-3.
+        // Column region over cell 0 of rows 2-3, cursor in row 3's first cell.
+        pane.cell_rect = Some(((2, 0), (3, 0)));
+        pane.selection_start = Some((2, 2));
+        pane.cursor_line = 3;
+        pane.cursor_col = 3;
+
+        // Left from the first column has no cell to move to.
+        pane.move_cursor_left(false);
+        assert_eq!(pane.cell_rect, None);
+        assert_eq!(pane.selection_start, None, "region must not decay into a line selection");
+
+        // A one-cell region keeps its (identical) text selection.
+        pane.cell_rect = Some(((3, 0), (3, 0)));
+        pane.selection_start = Some((3, 2));
+        pane.move_cursor_left(false);
+        assert_eq!(pane.cell_rect, None);
+        assert_eq!(pane.selection_start, Some((3, 2)));
+    }
+
+    fn table_pane() -> OutputPane {
+        let mut pane = OutputPane::new();
+        pane.add_output(OutputEntry {
+            label: "Cell 1".to_string(),
+            output: [
+                "┌─────┬─────┐",
+                "│ a   ┆ b   │",
+                "╞═════╪═════╡",
+                "│ 1   ┆ 2   │",
+                "│ 3   ┆ 4   │",
+                "└─────┴─────┘",
+            ]
+            .join("\n"),
+            is_error: false,
+            elapsed_secs: 0.0,
+        });
+        pane.focused = true;
+        pane
+    }
+
+    #[test]
+    fn shift_arrows_grow_a_cell_region_and_stop_at_table_edges() {
+        // Flattened lines: 0 cell header, 1 ┌, 2 column names, 3 ╞, 4-5 data, 6 └.
+        let mut pane = table_pane();
+        pane.cursor_line = 4;
+        pane.cursor_col = 2; // on "1"
+
+        pane.move_cursor_right(true);
+        assert_eq!(pane.cell_rect, Some(((4, 0), (4, 1))));
+        assert!(pane.has_selection());
+
+        pane.move_cursor_down(true);
+        assert_eq!(pane.cell_rect, Some(((4, 0), (5, 1))));
+
+        // Last column and last row: the corner stays put.
+        pane.move_cursor_right(true);
+        pane.move_cursor_down(true);
+        assert_eq!(pane.cell_rect, Some(((4, 0), (5, 1))));
+        assert_eq!(pane.get_selected_text().as_deref(), Some("a\tb\n1\t2\n3\t4"));
+
+        // Up skips the ╞ row onto the column names, then stops at the top.
+        pane.move_cursor_up(true);
+        pane.move_cursor_up(true);
+        assert_eq!(pane.cell_rect, Some(((4, 0), (2, 1))));
+        pane.move_cursor_up(true);
+        assert_eq!(pane.cell_rect, Some(((4, 0), (2, 1))));
+
+        // Shrinking back onto the anchor leaves a one-cell region.
+        pane.move_cursor_down(true);
+        pane.move_cursor_left(true);
+        pane.move_cursor_left(true);
+        assert_eq!(pane.cell_rect, Some(((4, 0), (4, 0))));
+        assert_eq!((pane.cursor_line, pane.cursor_col), (4, 3));
+
+        // A plain arrow leaves region mode.
+        pane.move_cursor_right(false);
+        assert_eq!(pane.cell_rect, None);
+    }
+
+    #[test]
+    fn double_and_triple_click_on_a_table_row_select_the_word_and_the_line() {
+        let mut pane = OutputPane::new();
+        pane.add_output(OutputEntry {
+            label: "Cell 1".to_string(),
+            output: ["┌──────────┬───┐", "│ New York ┆ 2 │", "└──────────┴───┘"].join("\n"),
+            is_error: false,
+            elapsed_secs: 0.0,
+        });
+        // Flattened line 2 is the data row; content is indented 4 columns.
+        let (col, row) = (4 + 7, 2); // on the "o" of "York"
+        pane.start_mouse_selection(col, row, 0, 10);
+        assert!(pane.cell_rect.is_some()); // one click selects the cell
+        pane.start_mouse_selection(col, row, 0, 10);
+        assert_eq!(pane.cell_rect, None);
+        assert_eq!(pane.get_selected_text().as_deref(), Some("York"));
+        pane.start_mouse_selection(col, row, 0, 10);
+        assert_eq!(pane.cell_rect, None);
+        assert!(pane.get_selected_text().unwrap().contains("New York ┆ 2"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn first_output_repaints_the_row_the_hint_was_on() {
+        let mut pane = OutputPane::new();
+        let mut screen = Vec::new();
+        pane.draw(&mut screen, 10, 5, 80).unwrap();
+        assert!(String::from_utf8_lossy(&screen).contains("No output yet"));
+
+        // Auto-scrolled to the bottom, the top visible line of this output is blank.
+        pane.add_output(OutputEntry {
+            label: "Cell 1".to_string(),
+            output: "\n\n\n\n\n\n\nlast".to_string(),
+            is_error: false,
+            elapsed_secs: 0.0,
+        });
+        let mut screen = Vec::new();
+        pane.draw(&mut screen, 10, 5, 80).unwrap();
+        // Pane row 0 (terminal row 11) is rewritten, so the hint is gone.
+        assert!(String::from_utf8_lossy(&screen).contains("\x1b[11;1H"));
+    }
+
+    #[test]
+    fn shift_arrow_off_a_table_is_a_text_selection() {
+        let mut pane = table_pane();
+        pane.cursor_line = 0; // the "Cell 1 (0.000s):" header
+        pane.cursor_col = 0;
+        pane.move_cursor_right(true);
+        assert_eq!(pane.cell_rect, None);
+        assert_eq!(pane.selection_start, Some((0, 0)));
+        assert_eq!(pane.cursor_col, 1);
+    }
 
     #[test]
     fn test_display_width_plain_text() {

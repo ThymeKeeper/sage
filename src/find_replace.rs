@@ -170,13 +170,15 @@ impl FindReplace {
         })
     }
     
-    /// Draw the find/replace window at bottom of screen
-    pub fn draw(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+    /// Draw the find/replace window at bottom of screen. `status_below` is true
+    /// when the status bar sits on the last row (spreadsheet view); the text
+    /// editor puts its status bar above the bottom pane, so the window takes
+    /// the last three rows there.
+    pub fn draw(&self, stdout: &mut io::Stdout, status_below: bool) -> io::Result<()> {
         let (width, height) = terminal::size()?;
-        
-        // Position at bottom, above status bar
+
         let window_height = 3;  // Still 3 lines but simpler
-        let window_y = height.saturating_sub(window_height + 1) as usize; // -1 for status bar
+        let window_y = height.saturating_sub(window_height + status_below as u16) as usize;
         
         // Calculate counter string first to know its actual length - we'll use this for both drawing and cursor positioning
         let counter_str = if self.total_matches > 0 || !self.find_text.is_empty() {

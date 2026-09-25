@@ -53,6 +53,9 @@ pub struct Editor {
     repl_mode: bool,                   // Whether we're in REPL mode
     executing_kernel_name: Option<String>, // Kernel name while executing (kernel is temporarily taken)
     spreadsheet: Option<Spreadsheet>,   // Active spreadsheet (CSV/TSV) grid, replaces buffer editing
+    // CSV/TSV shown as read-only plain text (Ctrl+T). The grid stays in
+    // `spreadsheet`, untouched, and remains what Save writes.
+    grid_text_view: bool,
 }
 
 impl Editor {
@@ -91,6 +94,7 @@ impl Editor {
             status_message_persistent: false,
             executing_kernel_name: None,
             spreadsheet: None,
+            grid_text_view: false,
         }
     }
 
@@ -102,12 +106,55 @@ impl Editor {
         self.spreadsheet.as_mut()
     }
 
+    /// True while a CSV/TSV is drawn and edited as a grid. False in the
+    /// read-only text view, where the text editor draws the file instead.
     pub fn is_spreadsheet_mode(&self) -> bool {
-        self.spreadsheet.is_some()
+        self.spreadsheet.is_some() && !self.grid_text_view
+    }
+
+    /// True while a CSV/TSV is shown as read-only plain text (Ctrl+T).
+    pub fn is_grid_text_view(&self) -> bool {
+        self.grid_text_view
+    }
+
+    /// The text view is read-only: say so and report whether to refuse an edit.
+    fn refuse_text_view_edit(&mut self) -> bool {
+        if self.grid_text_view {
+            self.status_message = Some((
+                "Text view is read-only. Ctrl+T returns to the grid to edit.".to_string(),
+                true,
+            ));
+        }
+        self.grid_text_view
     }
 
 
     pub fn execute(&mut self, cmd: Command) -> io::Result<()> {
+        // A CSV/TSV text view can't be edited: the buffer normalizes input
+        // (tabs to spaces, curly quotes to straight), which would alter data.
+        if matches!(
+            cmd,
+            Command::InsertChar(_)
+                | Command::InsertNewline
+                | Command::InsertTab
+                | Command::Indent
+                | Command::Dedent
+                | Command::Backspace
+                | Command::Delete
+                | Command::Cut
+                | Command::Paste
+                | Command::Undo
+                | Command::Redo
+                | Command::ToggleCase
+                | Command::MoveLineUp
+                | Command::MoveLineDown
+                | Command::Replace
+                | Command::ReplaceAll
+        ) && self.refuse_text_view_edit()
+        {
+            return Ok(());
+        }
+
         // Clear non-persistent status messages on user action
         if !self.status_message_persistent {
             if matches!(cmd,
@@ -1454,6 +1501,9 @@ impl Editor {
     
     /// Direct paste method for bracketed paste support
     pub fn paste_text(&mut self, text: String) {
+        if self.refuse_text_view_edit() {
+            return;
+        }
         // Delete selection first if any
         self.delete_selection();
         

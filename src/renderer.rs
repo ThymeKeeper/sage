@@ -168,7 +168,9 @@ pub struct Renderer {
     last_screen: Vec<String>,  // Store what we last rendered
     last_status: String,        // Store last status line
     last_title: String,         // Store last terminal title
-    last_cursor_style: CursorStyle, // Track cursor style to avoid redundant updates
+    // Caret shape the terminal is showing; None = unknown, re-send on next draw.
+    // Only apply_cursor_style() writes DECSCUSR, so this always matches the terminal.
+    last_cursor_style: Option<CursorStyle>,
     #[cfg(target_os = "windows")]
     needs_full_redraw: bool,
 }
@@ -177,6 +179,7 @@ pub struct Renderer {
 enum CursorStyle {
     Block,
     Underline,
+    Bar,
 }
 
 impl Renderer {
@@ -213,7 +216,7 @@ impl Renderer {
             last_screen: vec![String::new(); height as usize],
             last_status: String::new(),
             last_title: String::new(),
-            last_cursor_style: CursorStyle::Block,
+            last_cursor_style: Some(CursorStyle::Block),
             #[cfg(target_os = "windows")]
             needs_full_redraw: true,
         })
@@ -230,29 +233,11 @@ impl Renderer {
         Ok(())
     }
     
-    pub fn draw(&mut self, editor: &mut Editor) -> io::Result<()> {
-        self.draw_with_bottom_window(editor, 0, false)
-    }
-
-    pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize, bottom_window_focused: bool) -> io::Result<()> {
+    /// `pane_selection` is `Some(has_selection)` when the focused output pane owns
+    /// the caret; the caret shape then follows the pane's selection, not the editor's.
+    pub fn draw_with_bottom_window(&mut self, editor: &mut Editor, bottom_window_height: usize, bottom_window_focused: bool, pane_selection: Option<bool>) -> io::Result<()> {
         if editor.is_spreadsheet_mode() {
             return self.draw_spreadsheet(editor);
-        }
-        // Update cursor style based on selection
-        // Note: Output pane handles its own cursor style when focused
-        let desired_style = if editor.selection().is_some() {
-            CursorStyle::Underline
-        } else {
-            CursorStyle::Block
-        };
-
-        // Always write the cursor style to ensure it's correct
-        if self.last_cursor_style != desired_style {
-            match desired_style {
-                CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
-                CursorStyle::Underline => write!(self.stdout, "\x1b[4 q")?,
-            }
-            self.last_cursor_style = desired_style;
         }
 
         // Update terminal title with filename and modified indicator
@@ -276,7 +261,7 @@ impl Renderer {
             self.last_size = (width, height);
             self.last_screen = vec![String::new(); height as usize];
             self.last_status.clear();
-            self.last_cursor_style = CursorStyle::Block; // Force cursor style refresh on resize
+            self.last_cursor_style = None; // Re-send the caret shape after a resize
             // Maintain consistent background on resize
             write!(self.stdout, "\x1b[48;5;234m")?; // Background color RGB(30,30,30)
             execute!(self.stdout, Clear(ClearType::All))?;
@@ -286,6 +271,11 @@ impl Renderer {
                 self.needs_full_redraw = true;
             }
         }
+
+        // Caret shape: underline while the surface that owns the caret has a
+        // selection, block otherwise.
+        let selecting = pane_selection.unwrap_or_else(|| editor.selection().is_some());
+        self.apply_cursor_style(if selecting { CursorStyle::Underline } else { CursorStyle::Block })?;
 
         // Get viewport dimensions for rendering
         let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize; // Reserve for status and bottom window
@@ -751,7 +741,9 @@ impl Renderer {
             crate::syntax::Language::Csv => "CSV",
             crate::syntax::Language::Tsv => "TSV",
         };
-        let language_info = if editor.is_wrappable_language() {
+        let language_info = if editor.is_grid_text_view() {
+            format!(" [{} text, read-only] ", language_name)
+        } else if editor.is_wrappable_language() {
             if editor.is_wrap_active() {
                 format!(" [{} wrap] ", language_name)
             } else {
@@ -1132,7 +1124,17 @@ impl Renderer {
                 if remaining == 0 {
                     break;
                 }
-                let label = col_letter(col_idx);
+                // Column letter, then ↑/↓ for a sort level and ▼ for a filter.
+                let label = format!(
+                    "{}{}{}",
+                    col_letter(col_idx),
+                    match ss.column_sort(col_idx) {
+                        Some(true) => "\u{2193}",
+                        Some(false) => "\u{2191}",
+                        None => "",
+                    },
+                    if ss.column_filter(col_idx).is_some() { "\u{25bc}" } else { "" },
+                );
                 let is_focused = col_idx == cur_col;
                 if is_focused {
                     line.push_str("\x1b[48;5;24m\x1b[38;5;230m");
@@ -1178,13 +1180,16 @@ impl Renderer {
             }
 
             let is_current_row = row_idx == cur_row;
-            // Row-number column
+            // Row-number column: the file's row number (blue while a filter
+            // hides rows, as in Excel, so gaps in the numbering read as hidden rows).
             if is_current_row {
                 line.push_str("\x1b[48;5;24m\x1b[38;5;230m\x1b[1m");
+            } else if ss.is_filtered() {
+                line.push_str("\x1b[48;5;238m\x1b[38;5;75m");
             } else {
                 line.push_str("\x1b[48;5;238m\x1b[38;5;250m");
             }
-            let row_label = format!("{:>width$} ", row_idx + 1, width = row_num_width - 1);
+            let row_label = format!("{:>width$} ", ss.file_row(row_idx) + 1, width = row_num_width - 1);
             line.push_str(&row_label);
             line.push_str("\x1b[0m\x1b[48;5;234m\x1b[38;5;240m│\x1b[0m");
 
@@ -1267,7 +1272,7 @@ impl Renderer {
 
         // --- Status bar ---
         let pos_label = ss.cursor_label();
-        let num_rows = ss.num_rows();
+        let num_rows = ss.file_row_count();
         let num_cols = ss.num_cols();
         let ro = editor.is_read_only();
         let (status_msg, is_error) = if let Some((msg, is_err)) = &editor.status_message {
@@ -1283,7 +1288,18 @@ impl Renderer {
             format!(" {}{}{} ", file_name, mod_ind, ro_ind)
         };
         let lang_label = ss.delimiter_name();
-        let middle = format!(" [{}] ", lang_label);
+        let mut view_info = String::new();
+        if ss.is_filtered() {
+            view_info.push_str(&format!(
+                " \u{00b7} filtered {} of {} rows",
+                ss.visible_data_rows(),
+                ss.file_data_rows()
+            ));
+        }
+        if ss.is_sorted() {
+            view_info.push_str(" \u{00b7} sorted");
+        }
+        let middle = format!(" [{}{}] ", lang_label, view_info);
         let metrics = ss.selection_metrics().format();
         let metrics_display = if metrics.is_empty() {
             String::new()
@@ -1355,10 +1371,7 @@ impl Renderer {
                     MoveTo(screen_col as u16, screen_row as u16),
                     Show
                 )?;
-                if self.last_cursor_style != CursorStyle::Underline {
-                    write!(self.stdout, "\x1b[6 q")?; // steady bar
-                    self.last_cursor_style = CursorStyle::Underline;
-                }
+                self.apply_cursor_style(CursorStyle::Bar)?;
             }
         } else {
             // Keep cursor hidden in navigation mode
@@ -1396,6 +1409,19 @@ impl Renderer {
         Ok(())
     }
 
+    /// Wipe the terminal to sage's background and hide the cursor, so the next
+    /// draw (after force_redraw) repaints onto a clean window.
+    pub fn clear_screen(&mut self) -> io::Result<()> {
+        write!(self.stdout, "\x1b[48;5;234m")?; // Background color RGB(30,30,30)
+        execute!(self.stdout, Clear(ClearType::All))?;
+        write!(self.stdout, "\x1b[0m")?; // Reset after clear
+        #[cfg(target_os = "windows")]
+        write!(self.stdout, "\x1b[?25l")?;
+        #[cfg(not(target_os = "windows"))]
+        execute!(self.stdout, Hide)?;
+        self.stdout.flush()
+    }
+
     /// Force a complete redraw by clearing cached state
     pub fn force_redraw(&mut self) {
         self.last_screen = vec![String::new(); self.last_size.1 as usize];
@@ -1414,20 +1440,9 @@ impl Renderer {
         let (cursor_line, cursor_col) = editor.cursor_position();
         let (viewport_row, viewport_col) = editor.viewport_offset();
 
-        // Update cursor style based on editor selection
-        let desired_style = if editor.selection().is_some() {
-            CursorStyle::Underline
-        } else {
-            CursorStyle::Block
-        };
-
-        if self.last_cursor_style != desired_style {
-            match desired_style {
-                CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
-                CursorStyle::Underline => write!(self.stdout, "\x1b[4 q")?,
-            }
-            self.last_cursor_style = desired_style;
-        }
+        // Caret shape follows the editor selection (the editor owns the caret here)
+        let selecting = editor.selection().is_some();
+        self.apply_cursor_style(if selecting { CursorStyle::Underline } else { CursorStyle::Block })?;
 
         // Calculate content height (excluding status bar and bottom window)
         let content_height = height.saturating_sub(1 + bottom_window_height as u16) as usize;
@@ -1523,7 +1538,9 @@ impl Renderer {
             crate::syntax::Language::Csv => "CSV",
             crate::syntax::Language::Tsv => "TSV",
         };
-        let language_info = if editor.is_wrappable_language() {
+        let language_info = if editor.is_grid_text_view() {
+            format!(" [{} text, read-only] ", language_name)
+        } else if editor.is_wrappable_language() {
             if editor.is_wrap_active() {
                 format!(" [{} wrap] ", language_name)
             } else {
@@ -1625,6 +1642,20 @@ impl Renderer {
                     self.last_screen[screen_row] = line_content;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Send the caret shape (DECSCUSR) unless the terminal already shows it.
+    /// The only place sage writes a caret shape, so the cache can't drift.
+    fn apply_cursor_style(&mut self, style: CursorStyle) -> io::Result<()> {
+        if self.last_cursor_style != Some(style) {
+            match style {
+                CursorStyle::Block => write!(self.stdout, "\x1b[2 q")?,
+                CursorStyle::Underline => write!(self.stdout, "\x1b[4 q")?,
+                CursorStyle::Bar => write!(self.stdout, "\x1b[6 q")?,
+            }
+            self.last_cursor_style = Some(style);
         }
         Ok(())
     }

@@ -110,6 +110,12 @@ Autocomplete automatically shows:
 - `Ctrl+Home/End`: Jump to start/end of file
 - `Page Up/Down`: Scroll viewport
 - `Shift+Page Up/Down`: Scroll output pane
+- `Ctrl+T`: CSV/TSV files: switch between the grid and a read-only text view of the file
+
+### Spreadsheet (CSV/TSV)
+- `Alt+Down` or right-click: filter & sort menu for the column (Excel-style value checklist with search; row 1 is the header)
+- `Ctrl+Shift+L`: clear all filters
+- Filters and sorts change only what the grid shows: Save writes every row in the file's own order
 
 ### Search
 - `Ctrl+F`: Find
