@@ -164,6 +164,26 @@ pub struct Spreadsheet {
     /// order as a stable sort, so the latest is the primary key and earlier ones
     /// break its ties, as with successive sorts in Excel.
     sorts: Vec<(usize, bool)>,
+    /// Undo history, oldest first: one step per committed edit or range clear.
+    undo: Vec<UndoStep>,
+    redo: Vec<UndoStep>,
+    /// `undo.len()` at the last save (or load); `None` once that state can't
+    /// be reached again (a new change after undoing past it). Drives `modified`.
+    save_point: Option<usize>,
+}
+
+/// One cell of an undo step, addressed by file row so it holds under any
+/// filter or sort. `other` is the value on the far side of the step: undo and
+/// redo swap it with the cell, so neither copies the text.
+struct CellChange {
+    row: usize,
+    col: usize,
+    other: String,
+    other_null: bool,
+}
+
+struct UndoStep {
+    changes: Vec<CellChange>,
 }
 
 /// How a cell orders in a sort: numbers (and ISO dates, as epoch seconds)
@@ -271,6 +291,9 @@ impl Spreadsheet {
             view: None,
             filters: BTreeMap::new(),
             sorts: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            save_point: Some(0),
         };
         ss.recompute_column_widths();
         Ok(ss)
@@ -292,6 +315,9 @@ impl Spreadsheet {
             view: None,
             filters: BTreeMap::new(),
             sorts: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            save_point: Some(0),
         }
     }
 
@@ -321,6 +347,7 @@ impl Spreadsheet {
         }
         writer.flush()?;
         self.modified = false;
+        self.save_point = Some(self.undo.len());
         Ok(())
     }
 
@@ -682,50 +709,114 @@ impl Spreadsheet {
         // Write to the file row shown there. The view isn't re-applied, so an
         // edited row stays put until the filter or sort next changes (as in Excel).
         let r = self.file_row(display_row);
-        if let Some(row) = self.rows.get_mut(r) {
-            if let Some(cell) = row.get_mut(c) {
-                // An edited cell holds a real value, never a null — even if the
-                // committed text is empty (that's now an empty string).
-                let was_null = self.null_mask.get(r).and_then(|m| m.get(c)).copied().unwrap_or(false);
-                if *cell != edit.text || was_null {
-                    *cell = edit.text;
-                    self.modified = true;
-                }
-                if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
-                    *m = false;
-                }
+        // An edited cell holds a real value, never a null — even if the
+        // committed text is empty (that's now an empty string).
+        let was_null = self.file_is_null(r, c);
+        let mut before = None;
+        if let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) {
+            if *cell != edit.text || was_null {
+                before = Some(std::mem::replace(cell, edit.text));
             }
+        }
+        if let Some(before) = before {
+            if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
+                *m = false;
+            }
+            self.record(vec![CellChange { row: r, col: c, other: before, other_null: was_null }]);
         }
         self.recompute_col_width(c);
     }
 
     pub fn clear_selection_content(&mut self) {
         let ((r0, c0), (r1, c1)) = self.selected_range();
-        let mut changed = false;
+        let mut changes = Vec::new();
         // Display rows only: cells a filter hides are left alone, as in Excel.
         for display_row in r0..=r1 {
             let r = self.file_row(display_row);
             for c in c0..=c1 {
-                if let Some(row) = self.rows.get_mut(r) {
-                    if let Some(cell) = row.get_mut(c) {
-                        if !cell.is_empty() {
-                            cell.clear();
-                            changed = true;
-                        }
-                    }
-                }
                 // Clearing yields an empty string, not a null.
-                if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
-                    if *m {
-                        *m = false;
-                        changed = true;
-                    }
+                let was_null = self.file_is_null(r, c);
+                let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { continue };
+                if cell.is_empty() && !was_null {
+                    continue;
                 }
+                let before = std::mem::take(cell);
+                if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    *m = false;
+                }
+                changes.push(CellChange { row: r, col: c, other: before, other_null: was_null });
             }
         }
-        if changed {
-            self.modified = true;
+        self.record(changes);
+    }
+
+    // --- Undo / redo ---------------------------------------------------------
+
+    /// Push a change onto the undo history (nothing to record is a no-op).
+    fn record(&mut self, changes: Vec<CellChange>) {
+        if changes.is_empty() {
+            return;
         }
+        // A new change after undoing past the save point makes that point
+        // unreachable: the file on disk no longer matches any state here.
+        if self.save_point.map_or(false, |p| p > self.undo.len()) {
+            self.save_point = None;
+        }
+        self.redo.clear();
+        self.undo.push(UndoStep { changes });
+        self.modified = self.save_point != Some(self.undo.len());
+    }
+
+    /// Undo the last edit or range clear (Ctrl+Z). Returns false with nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some(mut step) = self.undo.pop() else { return false };
+        for change in step.changes.iter_mut().rev() {
+            self.swap_cell(change);
+        }
+        self.finish_step(&step);
+        self.redo.push(step);
+        self.modified = self.save_point != Some(self.undo.len());
+        true
+    }
+
+    /// Redo the last undone step (Ctrl+Shift+Z or Ctrl+Y). Returns false with nothing to redo.
+    pub fn redo(&mut self) -> bool {
+        let Some(mut step) = self.redo.pop() else { return false };
+        for change in step.changes.iter_mut() {
+            self.swap_cell(change);
+        }
+        self.finish_step(&step);
+        self.undo.push(step);
+        self.modified = self.save_point != Some(self.undo.len());
+        true
+    }
+
+    fn swap_cell(&mut self, change: &mut CellChange) {
+        if let Some(cell) = self.rows.get_mut(change.row).and_then(|r| r.get_mut(change.col)) {
+            std::mem::swap(cell, &mut change.other);
+        }
+        if let Some(m) = self.null_mask.get_mut(change.row).and_then(|r| r.get_mut(change.col)) {
+            std::mem::swap(m, &mut change.other_null);
+        }
+    }
+
+    /// After an undo/redo: refit the touched columns and put the cursor on the
+    /// step's first cell when a filter isn't hiding its row.
+    fn finish_step(&mut self, step: &UndoStep) {
+        let cols: std::collections::BTreeSet<usize> = step.changes.iter().map(|c| c.col).collect();
+        for col in cols {
+            self.recompute_col_width(col);
+        }
+        if let Some(first) = step.changes.first() {
+            let shown = match &self.view {
+                None => Some(first.row),
+                Some(v) => v.iter().position(|&r| r == first.row),
+            };
+            if let Some(display_row) = shown {
+                self.cursor = (display_row, first.col);
+            }
+        }
+        self.selection_anchor = None;
     }
 
     pub fn copy_selection_tsv(&self) -> String {
@@ -2444,6 +2535,75 @@ mod tests {
         ss.ensure_cursor_visible(20, 200);
         assert_eq!(ss.scroll_row, 0); // header plus all ten hits fit on screen
         assert_eq!(ss.cell(ss.cursor.0, 0), "hit");
+    }
+
+    #[test]
+    fn undo_and_redo_an_edit_track_the_save_point() {
+        let mut ss = grid(&[&["a", "b"], &["1", "2"]]);
+        ss.cursor = (1, 0);
+        ss.enter_edit_mode_replace('9');
+        ss.commit_edit();
+        assert_eq!(ss.cell(1, 0), "9");
+        assert!(ss.is_modified());
+        assert!(ss.undo());
+        assert_eq!(ss.cell(1, 0), "1");
+        assert!(!ss.is_modified()); // back to the file as loaded
+        assert!(ss.redo());
+        assert_eq!(ss.cell(1, 0), "9");
+        assert!(ss.is_modified());
+        assert!(!ss.redo());
+        assert!(ss.undo() && !ss.undo()); // one step only
+    }
+
+    #[test]
+    fn undo_restores_a_filtered_range_clear_nulls_included() {
+        let mut ss = grid(&[&["c", "d"], &["x", "1"], &["y", "7"], &["x", ""]]);
+        ss.null_mask[3][1] = true;
+        ss.set_filter(0, Some(set(&["x"]))); // file rows 1 and 3 shown
+        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (2, 1);
+        ss.clear_selection_content();
+        assert_eq!((ss.rows[1].clone(), ss.rows[3].clone()), (vec!["".to_string(), "".into()], vec!["".to_string(), "".into()]));
+        assert!(!ss.null_mask[3][1]);
+        assert!(ss.undo());
+        assert_eq!(ss.rows[1], vec!["x", "1"]);
+        assert_eq!(ss.rows[3], vec!["x", ""]);
+        assert!(ss.null_mask[3][1]); // the null comes back as a null
+        assert_eq!(ss.rows[2], vec!["y", "7"]); // the hidden row was never touched
+        assert!(ss.redo());
+        assert_eq!(ss.rows[1], vec!["", ""]);
+    }
+
+    #[test]
+    fn a_new_change_after_undoing_past_a_save_keeps_the_file_marked_unsaved() {
+        let tmp = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        let mut ss = grid(&[&["a", "b"], &["1", "2"]]);
+        ss.cursor = (1, 0);
+        ss.enter_edit_mode_replace('9');
+        ss.commit_edit();
+        ss.save(tmp.path()).unwrap(); // disk: 9
+        assert!(ss.undo());
+        assert!(ss.is_modified()); // grid: 1, disk: 9
+        ss.cursor = (1, 1);
+        ss.enter_edit_mode_replace('5');
+        ss.commit_edit();
+        assert!(!ss.redo()); // the new change dropped the redo branch
+        assert!(ss.undo());
+        assert!(ss.is_modified()); // grid 1,2 still differs from disk 9,2
+    }
+
+    #[test]
+    fn undo_under_a_sort_returns_the_cursor_to_the_changed_row() {
+        let mut ss = grid(&[&["n"], &["3"], &["1"], &["2"]]);
+        ss.sort_by(0, false); // display: header, 1, 2, 3 (file rows 2, 3, 1)
+        ss.cursor = (3, 0);
+        ss.enter_edit_mode_replace('9');
+        ss.commit_edit();
+        assert_eq!(ss.rows[1][0], "9");
+        ss.cursor = (1, 0);
+        assert!(ss.undo());
+        assert_eq!(ss.cursor, (3, 0));
+        assert_eq!(ss.cell(3, 0), "3");
     }
 
     #[test]

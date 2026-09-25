@@ -2581,6 +2581,30 @@ fn handle_spreadsheet_key(
             }
             // Text view toggle: handled by the main key loop (it commits an edit)
             KeyCode::Char('t') | KeyCode::Char('T') => return false,
+            // Undo / redo: Ctrl+Z, Ctrl+Shift+Z (as in the text editor) or Ctrl+Y
+            // (as in Excel). Mid-edit, Ctrl+Z drops the edit in progress instead.
+            KeyCode::Char('z') | KeyCode::Char('Z') => {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    if ss.is_editing() {
+                        ss.cancel_edit();
+                    } else if shift {
+                        ss.redo();
+                    } else {
+                        ss.undo();
+                    }
+                }
+                *needs_redraw = true;
+                return true;
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    if !ss.is_editing() {
+                        ss.redo();
+                    }
+                }
+                *needs_redraw = true;
+                return true;
+            }
             _ => {}
         }
     }
@@ -2924,6 +2948,31 @@ mod tests {
             std::fs::read_to_string(tmp.path()).unwrap(),
             "id,city,amt\n1,\"\",\"\"\n2,YYZ,10\n3,\"\",\"\"\n4,YYC,40\n"
         );
+    }
+
+    #[test]
+    fn ctrl_z_undoes_and_ctrl_y_or_ctrl_shift_z_redoes_in_the_grid() {
+        let (mut editor, tmp) = load(CSV);
+        let ctrl = KeyModifiers::CONTROL;
+        let cell = |e: &editor::Editor| e.spreadsheet().unwrap().cell(1, 0).to_string();
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Char('9'), NONE), (KeyCode::Enter, NONE)]);
+        assert_eq!(cell(&editor), "9");
+        press(&mut editor, &[(KeyCode::Char('z'), ctrl)]);
+        assert_eq!(cell(&editor), "1");
+        press(&mut editor, &[(KeyCode::Char('y'), ctrl)]);
+        assert_eq!(cell(&editor), "9");
+        press(&mut editor, &[(KeyCode::Char('z'), ctrl), (KeyCode::Char('Z'), ctrl | SHIFT)]);
+        assert_eq!(cell(&editor), "9");
+
+        // Mid-edit, Ctrl+Z drops the typing; it never becomes an undo step.
+        press(&mut editor, &[(KeyCode::Char('5'), NONE), (KeyCode::Char('z'), ctrl)]);
+        assert!(!editor.spreadsheet().unwrap().is_editing());
+        assert_eq!(cell(&editor), "9");
+        press(&mut editor, &[(KeyCode::Char('z'), ctrl)]);
+        assert_eq!(cell(&editor), "1");
+        assert!(!editor.is_modified());
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), CSV);
     }
 
     #[test]

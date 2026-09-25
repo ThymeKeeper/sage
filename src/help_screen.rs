@@ -105,6 +105,8 @@ impl HelpScreen {
             ("SPREADSHEET (CSV / TSV)", vec![
                 ("Alt+Down / right-click", "Filter & sort the column (row 1 is the header)"),
                 ("Ctrl+Shift+L", "Clear all filters"),
+                ("Ctrl+Z", "Undo the last edit or clear"),
+                ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
                 ("", "Filters and sorts change the view only, never the file"),
                 ("Ctrl+T", "Switch grid / read-only text view"),
             ]),

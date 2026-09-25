@@ -115,6 +115,7 @@ Autocomplete automatically shows:
 ### Spreadsheet (CSV/TSV)
 - `Alt+Down` or right-click: filter & sort menu for the column (Excel-style value checklist with search; row 1 is the header)
 - `Ctrl+Shift+L`: clear all filters
+- `Ctrl+Z` / `Ctrl+Shift+Z` or `Ctrl+Y`: undo / redo cell edits and range clears (works while filtered or sorted)
 - Filters and sorts change only what the grid shows: Save writes every row in the file's own order
 
 ### Search
