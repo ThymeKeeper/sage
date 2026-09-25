@@ -185,7 +185,8 @@ Or use the `--python` flag in headless mode.
 ### SQL mode autocomplete
 In SQL mode (with or without a Snowflake connection) typing a name opens suggestions; `Tab` accepts, `Up`/`Down` choose, `Esc` closes. Nothing pops up inside a string or comment.
 - **Snowflake's words:** keywords, commands, data types, date parts, common parameters and COPY/file-format options, every built-in function (taken from `SHOW FUNCTIONS`, in `src/sql_functions.rs`) and the table functions (`FLATTEN`, `RESULT_SCAN`, `QUERY_HISTORY`, ...).
-- **Names from your queries:** each statement that runs without error adds every table, alias, CTE, column and other name in its text, and its result's column names. They are kept in memory until sage closes, never saved, and come first in the list. After a dot, the parts seen after that prefix come first (`DM_FPS_PRD.PRIV.` offers the tables used under it).
+- **Names from your queries:** each statement that runs without error adds every table, alias, CTE, column and other name in its text, and its result's column names. They are kept in memory until sage closes, never saved, and come first in the list. After a dot, the parts seen after that prefix come first (`DM_FPS_PRD.PRIV.SU` offers the tables used under it that start with `SU`).
+- Suggestions start with the first letter of a name, never straight after a dot (this holds for Python completion too).
 - **Case-sensitive:** every word is offered in upper, lower and title case, and matches what you type exactly: `sel` offers `select`, `Sel` offers `Select`, `SEL` offers `SELECT` (`date_t` offers `date_trunc`, `Date_T` offers `Date_Trunc`). A name you wrote in mixed case is also offered as written. A quoted name (`"Fare Class"`) is offered only as written, since its case is part of the name; type its letters without the quote to find it.
 
 ### SQL inside Python

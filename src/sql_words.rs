@@ -561,9 +561,6 @@ impl SessionWords {
                     out.push(part);
                 }
             }
-            if prefix.is_empty() {
-                return out; // just typed the dot: only what's known to follow it
-            }
         }
         let mut words: Vec<String> = self
             .words
@@ -645,7 +642,7 @@ mod tests {
             "PAX_COUNT".into(),
             "PAX_TYPE".into(),
         ]);
-        assert_eq!(s.matches(Some("dm_fps_prd.priv"), ""), vec!["SUPER_COUPONS", "Super_Coupons", "super_coupons"]);
+        assert_eq!(s.matches(Some("dm_fps_prd.priv"), "SU"), vec!["SUPER_COUPONS"]);
         assert_eq!(s.matches(Some("dm_fps_prd.priv"), "sup"), vec!["super_coupons"]);
         assert_eq!(s.matches(Some("SC"), "pax"), vec!["pax_count", "pax_type"]);
         assert_eq!(s.matches(Some("sc"), "PAX"), vec!["PAX_COUNT", "PAX_TYPE"]);

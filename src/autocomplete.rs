@@ -86,15 +86,15 @@ impl Autocomplete {
         self.show_sql(Some(c), Some(suggestions));
     }
 
-    /// Show SQL suggestions, matched case-sensitively. Hidden when nothing is
-    /// typed yet (unless a dot has names known to follow it), and when the
-    /// only suggestion is what's already typed.
+    /// Show SQL suggestions, matched case-sensitively. Hidden until a letter
+    /// of the name is typed (so not straight after a dot), and when the only
+    /// suggestion is what's already typed.
     fn show_sql(&mut self, completion: Option<&crate::sql_words::SqlCompletion>, suggestions: Option<Vec<String>>) {
         let (Some(c), Some(mut suggestions)) = (completion, suggestions) else {
             self.hide();
             return;
         };
-        if c.prefix.is_empty() && c.qualifier.is_none() {
+        if c.prefix.is_empty() {
             self.hide();
             return;
         }
@@ -173,7 +173,9 @@ impl Autocomplete {
             }
         }
 
-        if prefix.is_empty() && base_callable.is_none() {
+        // Nothing until a letter is typed: not on an empty word, and not
+        // straight after a dot (`df.`, `db.sql(...).`).
+        if prefix.is_empty() || prefix.ends_with('.') {
             self.suggestions.clear();
             self.visible = false;
             return;
