@@ -2285,13 +2285,26 @@ fn open_filter_menu(
     };
     let mut menu = menu;
     let action = menu.run(&mut io::stdout())?;
-    if let (Some(action), Some(ss)) = (action, editor.spreadsheet_mut()) {
+    if action == Some(filter_menu::FilterAction::ConvertDates) {
+        // Repaint the grid under the dialog so the menu's box doesn't linger.
+        full_redraw(renderer, output_pane)?;
+        renderer.draw_with_bottom_window(editor, 0, false, None)?;
+        let dialog = editor.spreadsheet().map(|ss| filter_menu::DateDialog::for_column(ss, col));
+        if let Some(mut dialog) = dialog {
+            if let Some(plan) = dialog.run(&mut io::stdout())? {
+                if let Some(ss) = editor.spreadsheet_mut() {
+                    ss.convert_dates(col, plan);
+                }
+            }
+        }
+    } else if let (Some(action), Some(ss)) = (action, editor.spreadsheet_mut()) {
         match action {
             filter_menu::FilterAction::SortAscending => ss.sort_by(col, false),
             filter_menu::FilterAction::SortDescending => ss.sort_by(col, true),
             filter_menu::FilterAction::ClearSort => ss.clear_sort(),
             filter_menu::FilterAction::ClearFilter => ss.set_filter(col, None),
             filter_menu::FilterAction::Filter(allowed) => ss.set_filter(col, allowed),
+            filter_menu::FilterAction::ConvertDates => {}
         }
     }
     ensure_ss_cursor_visible(editor)?;

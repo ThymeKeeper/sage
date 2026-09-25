@@ -114,6 +114,7 @@ Autocomplete automatically shows:
 
 ### Spreadsheet (CSV/TSV)
 - `Alt+Down` or right-click: filter & sort menu for the column (Excel-style value checklist with search; row 1 is the header)
+- The same menu offers **Convert dates to ISO 8601** on a date column: `25/04/26` becomes `2026-04-25` and `03-25-2026 02:15 PM` becomes `2026-03-25 14:15:00`. Day/month order is proven per column from the data (a part over 12), never guessed; a column that can't be settled asks, and a column mixing both orders is refused. Year-first dates are year-month-day unless a middle part over 12 proves year-day-month (`2023-31-12` becomes `2023-12-31`). Values that can't be a date in any reading (`20/20/2000`) are listed and left as they are. Hidden rows convert too; `Ctrl+Z` undoes it
 - `Ctrl+Shift+L`: clear all filters
 - `Ctrl+Z` / `Ctrl+Shift+Z` or `Ctrl+Y`: undo / redo cell edits and range clears (works while filtered or sorted)
 - Filters and sorts change only what the grid shows: Save writes every row in the file's own order

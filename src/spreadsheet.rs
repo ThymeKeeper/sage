@@ -184,6 +184,10 @@ struct CellChange {
 
 struct UndoStep {
     changes: Vec<CellChange>,
+    /// A column filter the step rewrote (date conversion maps its values so it
+    /// keeps matching the same rows), held like `CellChange::other`: the filter
+    /// on the far side of the step, swapped in by undo/redo.
+    filter: Option<(usize, Option<HashSet<String>>)>,
 }
 
 /// How a cell orders in a sort: numbers (and ISO dates, as epoch seconds)
@@ -465,7 +469,7 @@ impl Spreadsheet {
 
     /// Distinct values in column `col` with how many rows hold each, over the
     /// data rows the other columns' filters leave (what Excel's dropdown lists).
-    /// Ordered as an ascending sort would order them, "" (blanks) last.
+    /// "" (blanks: empty or null) first, then as an ascending sort orders them.
     pub fn column_values(&self, col: usize) -> Vec<(String, usize)> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for r in 1..self.rows.len() {
@@ -477,7 +481,13 @@ impl Spreadsheet {
             .into_iter()
             .map(|(v, n)| (SortKey::of(v, false), v.to_string(), n))
             .collect();
-        values.sort_by(|a, b| a.0.cmp(&b.0, false).then_with(|| a.1.cmp(&b.1)));
+        values.sort_by(|a, b| {
+            // Blanks lead the list (true sorts before false here).
+            b.1.is_empty()
+                .cmp(&a.1.is_empty())
+                .then_with(|| a.0.cmp(&b.0, false))
+                .then_with(|| a.1.cmp(&b.1))
+        });
         values.into_iter().map(|(_, v, n)| (v, n)).collect()
     }
 
@@ -754,7 +764,11 @@ impl Spreadsheet {
 
     /// Push a change onto the undo history (nothing to record is a no-op).
     fn record(&mut self, changes: Vec<CellChange>) {
-        if changes.is_empty() {
+        self.record_step(UndoStep { changes, filter: None });
+    }
+
+    fn record_step(&mut self, step: UndoStep) {
+        if step.changes.is_empty() {
             return;
         }
         // A new change after undoing past the save point makes that point
@@ -763,8 +777,68 @@ impl Spreadsheet {
             self.save_point = None;
         }
         self.redo.clear();
-        self.undo.push(UndoStep { changes });
+        self.undo.push(step);
         self.modified = self.save_point != Some(self.undo.len());
+    }
+
+    fn swap_filter(&mut self, col: usize, stored: &mut Option<HashSet<String>>) {
+        let current = self.filters.remove(&col);
+        if let Some(filter) = stored.take() {
+            self.filters.insert(col, filter);
+        }
+        *stored = current;
+    }
+
+    // --- Date conversion (a data change, unlike sort and filter) ---------------
+
+    /// Whether column `col` holds any date the conversion would rewrite. Stops
+    /// at the first, so the column menu stays quick on big date columns.
+    pub fn has_dates_to_convert(&self, col: usize) -> bool {
+        (1..self.rows.len())
+            .any(|r| !self.file_is_null(r, col) && crate::dates::needs_conversion(self.file_cell(r, col)))
+    }
+
+    /// How column `col`'s values (data rows, hidden ones included, nulls
+    /// skipped) would convert to ISO 8601.
+    pub fn analyze_dates(&self, col: usize) -> crate::dates::Analysis {
+        let values: Vec<&str> = (1..self.rows.len())
+            .filter(|&r| !self.file_is_null(r, col))
+            .map(|r| self.file_cell(r, col))
+            .collect();
+        crate::dates::analyze(&values)
+    }
+
+    /// Rewrite column `col`'s dates as ISO 8601 in every data row, rows a
+    /// filter hides included, as one undo step. `plan` says how to read d/m/y
+    /// and year-first values. Returns how many cells changed.
+    pub fn convert_dates(&mut self, col: usize, plan: crate::dates::Plan) -> usize {
+        let mut changes = Vec::new();
+        for r in 1..self.rows.len() {
+            if self.file_is_null(r, col) {
+                continue;
+            }
+            let Some(iso) = crate::dates::to_iso(self.file_cell(r, col), plan) else { continue };
+            if let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(col)) {
+                let before = std::mem::replace(cell, iso);
+                changes.push(CellChange { row: r, col, other: before, other_null: false });
+            }
+        }
+        let converted = changes.len();
+        if converted == 0 {
+            return 0;
+        }
+        // A filter on this column lists the old spellings; map them the same way
+        // so it keeps matching the same rows the next time the view is rebuilt.
+        let filter = self.filters.get(&col).map(|allowed| {
+            allowed
+                .iter()
+                .map(|v| crate::dates::to_iso(v, plan).unwrap_or_else(|| v.clone()))
+                .collect::<HashSet<String>>()
+        });
+        let filter = filter.map(|mapped| (col, self.filters.insert(col, mapped)));
+        self.record_step(UndoStep { changes, filter });
+        self.recompute_col_width(col);
+        converted
     }
 
     /// Undo the last edit or range clear (Ctrl+Z). Returns false with nothing to undo.
@@ -772,6 +846,9 @@ impl Spreadsheet {
         let Some(mut step) = self.undo.pop() else { return false };
         for change in step.changes.iter_mut().rev() {
             self.swap_cell(change);
+        }
+        if let Some((col, stored)) = step.filter.as_mut() {
+            self.swap_filter(*col, stored);
         }
         self.finish_step(&step);
         self.redo.push(step);
@@ -784,6 +861,9 @@ impl Spreadsheet {
         let Some(mut step) = self.redo.pop() else { return false };
         for change in step.changes.iter_mut() {
             self.swap_cell(change);
+        }
+        if let Some((col, stored)) = step.filter.as_mut() {
+            self.swap_filter(*col, stored);
         }
         self.finish_step(&step);
         self.undo.push(step);
@@ -2492,13 +2572,13 @@ mod tests {
     }
 
     #[test]
-    fn column_values_follow_the_other_filters_with_blanks_last() {
+    fn column_values_follow_the_other_filters_with_blanks_first() {
         let mut ss = grid(&[&["a", "b"], &["1", "x"], &["2", "x"], &["1", "y"], &["", "x"]]);
         ss.null_mask[4][0] = true; // a null counts as a blank too
         ss.set_filter(1, Some(set(&["x"])));
         assert_eq!(
             ss.column_values(0),
-            vec![("1".to_string(), 1), ("2".to_string(), 1), (String::new(), 1)]
+            vec![(String::new(), 1), ("1".to_string(), 1), ("2".to_string(), 1)]
         );
         // A column's own filter doesn't narrow its own list.
         assert_eq!(ss.column_values(1), vec![("x".to_string(), 3), ("y".to_string(), 1)]);
@@ -2604,6 +2684,41 @@ mod tests {
         assert!(ss.undo());
         assert_eq!(ss.cursor, (3, 0));
         assert_eq!(ss.cell(3, 0), "3");
+    }
+
+    #[test]
+    fn converting_dates_covers_hidden_rows_keeps_the_filter_and_undoes_in_one_step() {
+        use crate::dates::{Order, Plan};
+        let mut ss = grid(&[
+            &["d", "k"],
+            &["25/04/26", "a"],
+            &["03/05/2026 2:15 PM", "b"],
+            &["TBD", "a"],
+            &["", "a"],
+        ]);
+        ss.null_mask[4][0] = true;
+        ss.set_filter(1, Some(set(&["a"]))); // hides file row 2
+        ss.set_filter(0, Some(set(&["25/04/26", "TBD", ""]))); // a filter on the date column itself
+        assert_eq!(ss.visible_data_rows(), 3);
+
+        assert_eq!(ss.convert_dates(0, Plan { dmy: Some(Order::DayFirst), ydm: false }), 2);
+        assert_eq!(ss.rows[1][0], "2026-04-25");
+        assert_eq!(ss.rows[2][0], "2026-05-03 14:15:00"); // the hidden row converts too
+        assert_eq!(ss.rows[3][0], "TBD");
+        assert!(ss.null_mask[4][0]); // nulls stay null
+        assert!(ss.is_modified());
+        // The date column's filter follows the new spelling, so rebuilding the
+        // view keeps the same rows.
+        ss.set_filter(1, Some(set(&["a"])));
+        assert_eq!(ss.visible_data_rows(), 3);
+
+        // One Ctrl+Z restores every cell and the filter.
+        assert!(ss.undo());
+        assert_eq!(ss.rows[1][0], "25/04/26");
+        assert_eq!(ss.rows[2][0], "03/05/2026 2:15 PM");
+        ss.set_filter(1, Some(set(&["a"])));
+        assert_eq!(ss.visible_data_rows(), 3);
+        assert!(!ss.is_modified());
     }
 
     #[test]

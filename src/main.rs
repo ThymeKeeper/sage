@@ -25,6 +25,7 @@ mod config;
 mod snippet_picker;
 mod spreadsheet;
 mod filter_menu;
+mod dates;
 
 use kernel::Kernel;
 

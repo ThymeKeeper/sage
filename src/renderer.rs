@@ -1125,21 +1125,27 @@ impl Renderer {
                     break;
                 }
                 // Column letter, then ↑/↓ for a sort level and ▼ for a filter.
+                let sort = ss.column_sort(col_idx);
+                let filtered = ss.column_filter(col_idx).is_some();
                 let label = format!(
                     "{}{}{}",
                     col_letter(col_idx),
-                    match ss.column_sort(col_idx) {
+                    match sort {
                         Some(true) => "\u{2193}",
                         Some(false) => "\u{2191}",
                         None => "",
                     },
-                    if ss.column_filter(col_idx).is_some() { "\u{25bc}" } else { "" },
+                    if filtered { "\u{25bc}" } else { "" },
                 );
+                // A sorted or filtered column's letter cell is amber (brighter
+                // when it is also the cursor's column); others grey, cursor blue.
                 let is_focused = col_idx == cur_col;
-                if is_focused {
-                    line.push_str("\x1b[48;5;24m\x1b[38;5;230m");
-                } else {
-                    line.push_str("\x1b[48;5;238m\x1b[38;5;252m");
+                let active = sort.is_some() || filtered;
+                match (active, is_focused) {
+                    (true, true) => line.push_str("\x1b[48;5;172m\x1b[38;5;16m"),
+                    (true, false) => line.push_str("\x1b[48;5;136m\x1b[38;5;16m"),
+                    (false, true) => line.push_str("\x1b[48;5;24m\x1b[38;5;230m"),
+                    (false, false) => line.push_str("\x1b[48;5;238m\x1b[38;5;252m"),
                 }
                 if remaining >= col_width + 1 {
                     line.push_str(&render_centered(&label, col_width));
