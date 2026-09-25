@@ -53,9 +53,18 @@ pub struct Editor {
     repl_mode: bool,                   // Whether we're in REPL mode
     executing_kernel_name: Option<String>, // Kernel name while executing (kernel is temporarily taken)
     spreadsheet: Option<Spreadsheet>,   // Active spreadsheet (CSV/TSV) grid, replaces buffer editing
-    // CSV/TSV shown as read-only plain text (Ctrl+Y, a text language). The grid stays in
-    // `spreadsheet`, untouched, and remains what Save writes.
+    // CSV/TSV data shown as editable text (Ctrl+Y, a text language). The text
+    // is raw: typing and pasting insert exactly what was typed (tabs and curly
+    // quotes are data), Tab types a tab, and Save writes the text. The grid is
+    // parked in `spreadsheet` to come back to if the text isn't changed.
     grid_text_view: bool,
+    // The text as the view opened (or last saved), to tell whether Spreadsheet
+    // can bring back the parked grid or must read the text again.
+    text_view_origin: Option<String>,
+    // Fingerprint of the text as it is on disk (as loaded or last saved), so
+    // undo and redo can tell whether the text is back to the saved state.
+    // None when the text never matched the disk (built from unsaved edits).
+    clean_text_hash: Option<u64>,
 }
 
 impl Editor {
@@ -95,7 +104,20 @@ impl Editor {
             executing_kernel_name: None,
             spreadsheet: None,
             grid_text_view: false,
+            text_view_origin: None,
+            clean_text_hash: Some(Buffer::new().content_hash()),
         }
+    }
+
+    /// Record that the buffer's text now matches the file on disk.
+    pub(super) fn mark_text_clean(&mut self) {
+        self.modified = false;
+        self.clean_text_hash = Some(self.buffer.content_hash());
+    }
+
+    /// Whether the text differs from the file on disk (after undo or redo).
+    fn text_differs_from_saved(&self) -> bool {
+        self.clean_text_hash != Some(self.buffer.content_hash())
     }
 
     pub fn spreadsheet(&self) -> Option<&Spreadsheet> {
@@ -106,54 +128,45 @@ impl Editor {
         self.spreadsheet.as_mut()
     }
 
-    /// True while a CSV/TSV is drawn and edited as a grid. False in the
-    /// read-only text view, where the text editor draws the file instead.
+    /// True while a CSV/TSV is drawn and edited as a grid. False in its text
+    /// view, where the text editor shows the data instead.
     pub fn is_spreadsheet_mode(&self) -> bool {
         self.spreadsheet.is_some() && !self.grid_text_view
     }
 
-    /// True while a CSV/TSV is shown as read-only plain text.
+    /// True while CSV/TSV data is shown as (raw, editable) text.
     pub fn is_grid_text_view(&self) -> bool {
         self.grid_text_view
     }
 
-    /// The text view is read-only: say so and report whether to refuse an edit.
-    fn refuse_text_view_edit(&mut self) -> bool {
-        if self.grid_text_view {
-            self.status_message = Some((
-                "Text view is read-only. Ctrl+Y, Spreadsheet returns to the grid to edit.".to_string(),
-                true,
+    /// Text on its way into the buffer from typing or pasting. Normally it
+    /// goes through the input policy (tabs to spaces, curly quotes folded,
+    /// invisibles dropped); CSV/TSV data shown as text is kept exactly, since
+    /// its tabs and quotes are data, with only line ends made LF. There a
+    /// character the editor would break the line on but the data reads as
+    /// part of a field (U+2028, say) is refused, since the lines shown would
+    /// no longer be the records.
+    fn input_text(&self, text: String) -> Result<String, String> {
+        if !self.grid_text_view {
+            return Ok(Self::normalize_text(text));
+        }
+        if let Some(ch) = text.chars().find(|&c| crate::dsv::is_foreign_line_break(c)) {
+            return Err(format!(
+                "Not pasted: the text holds U+{:04X}, a line break the data would read as part of a value",
+                ch as u32
             ));
         }
-        self.grid_text_view
+        Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
     }
 
-
     pub fn execute(&mut self, cmd: Command) -> io::Result<()> {
-        // A CSV/TSV text view can't be edited: the buffer normalizes input
-        // (tabs to spaces, curly quotes to straight), which would alter data.
-        if matches!(
-            cmd,
-            Command::InsertChar(_)
-                | Command::InsertNewline
-                | Command::InsertTab
-                | Command::Indent
-                | Command::Dedent
-                | Command::Backspace
-                | Command::Delete
-                | Command::Cut
-                | Command::Paste
-                | Command::Undo
-                | Command::Redo
-                | Command::ToggleCase
-                | Command::MoveLineUp
-                | Command::MoveLineDown
-                | Command::Replace
-                | Command::ReplaceAll
-        ) && self.refuse_text_view_edit()
-        {
-            return Ok(());
-        }
+        // Delimited data shown as text: Tab types a tab (a TSV delimiter), and
+        // indenting lines of data means nothing, so Shift+Tab does nothing.
+        let cmd = match cmd {
+            Command::Indent if self.grid_text_view => Command::InsertTab,
+            Command::Dedent if self.grid_text_view => Command::None,
+            other => other,
+        };
 
         // Clear non-persistent status messages on user action
         if !self.status_message_persistent {
@@ -208,7 +221,12 @@ impl Editor {
                 // confusables (NBSP, curly quotes, Unicode dashes) fold to ASCII,
                 // tabs become spaces. Shared with paste and file load via
                 // crate::normalize so all input paths behave identically.
-                let text = crate::normalize::fold_char_to_str(c);
+                // (Not for CSV/TSV data shown as text: that is typed as is.)
+                let text = if self.grid_text_view {
+                    c.to_string()
+                } else {
+                    crate::normalize::fold_char_to_str(c)
+                };
                 if text.is_empty() {
                     return Ok(()); // Dropped character (invisible / zero-width)
                 }
@@ -235,7 +253,8 @@ impl Editor {
                 let mut new_text = String::from("\n");
                 
                 // Only add indentation if cursor is NOT at the start of the line
-                if !is_at_line_start {
+                // (and never in CSV/TSV data, where leading spaces are data)
+                if !is_at_line_start && !self.grid_text_view {
                     let line_text = self.buffer.line(current_line);
                     
                     // Count leading spaces
@@ -266,8 +285,10 @@ impl Editor {
 
                 let cursor_before = self.cursor;
                 let line = self.buffer.byte_to_line(self.cursor);
-                self.buffer.insert(self.cursor, "    ", cursor_before, self.cursor + 4);
-                self.cursor += 4;
+                // A real tab in CSV/TSV data shown as text; spaces elsewhere.
+                let tab = if self.grid_text_view { "\t" } else { "    " };
+                self.buffer.insert(self.cursor, tab, cursor_before, self.cursor + tab.len());
+                self.cursor += tab.len();
                 self.modified = true;
                 self.preferred_column = None; // Clear preferred column
 
@@ -949,28 +970,7 @@ impl Editor {
             
             Command::Paste => {
                 match self.clipboard.get_text() {
-                    Ok(text) => {
-                        // Delete selection first if any
-                        self.delete_selection();
-
-                        // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
-                        let text = Self::normalize_text(text);
-
-                        let line_before = self.buffer.byte_to_line(self.cursor);
-                        let cursor_before = self.cursor;
-                        self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());
-                        self.cursor += text.len();
-                        self.modified = true;
-                        self.preferred_column = None; // Clear preferred column
-
-                        // Update syntax - check if we added newlines
-                        let line_after = self.buffer.byte_to_line(self.cursor);
-                        if line_after > line_before {
-                            let lines_added = line_after - line_before;
-                            self.syntax.lines_inserted(line_before + 1, lines_added);
-                        }
-                        self.syntax.line_modified(line_before);
-                    }
+                    Ok(text) => self.paste_text(text),
                     Err(e) => {
                         self.status_message = Some((format!("Paste failed: {}", e), true));
                     }
@@ -981,7 +981,10 @@ impl Editor {
                 if let Some(cursor) = self.buffer.undo() {
                     let cursor = cursor.min(self.buffer.len_bytes());
                     self.cursor = self.ensure_char_boundary(cursor);
-                    self.modified = self.buffer.can_undo();
+                    // Unsaved unless the text is back to what's on disk (undo
+                    // can pass the last save, and a view built from unsaved
+                    // edits never matched the disk).
+                    self.modified = self.text_differs_from_saved();
                     cursor_moved = true;
 
                     // Reinitialize syntax highlighting after undo
@@ -993,7 +996,7 @@ impl Editor {
                 if let Some(cursor) = self.buffer.redo() {
                     let cursor = cursor.min(self.buffer.len_bytes());
                     self.cursor = self.ensure_char_boundary(cursor);
-                    self.modified = true;
+                    self.modified = self.text_differs_from_saved();
                     cursor_moved = true;
 
                     // Reinitialize syntax highlighting after redo
@@ -1467,7 +1470,8 @@ impl Editor {
     }
     
     pub fn is_modified(&self) -> bool {
-        if let Some(ss) = self.spreadsheet.as_ref() {
+        // In a grid's text view the text is the document, so its own flag counts.
+        if let Some(ss) = self.spreadsheet.as_ref().filter(|_| !self.grid_text_view) {
             return ss.is_modified();
         }
         self.modified
@@ -1501,15 +1505,19 @@ impl Editor {
     
     /// Direct paste method for bracketed paste support
     pub fn paste_text(&mut self, text: String) {
-        if self.refuse_text_view_edit() {
-            return;
-        }
+        // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
+        // (CSV/TSV data shown as text: kept as is, or refused)
+        let text = match self.input_text(text) {
+            Ok(text) => text,
+            Err(why) => {
+                self.status_message = Some((why, true));
+                return;
+            }
+        };
+
         // Delete selection first if any
         self.delete_selection();
-        
-        // Normalize: CRLF → LF, tabs → spaces, remove invisible characters
-        let text = Self::normalize_text(text);
-        
+
         let line_before = self.buffer.byte_to_line(self.cursor);
         let cursor_before = self.cursor;
         self.buffer.insert(self.cursor, &text, cursor_before, self.cursor + text.len());

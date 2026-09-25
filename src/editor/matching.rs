@@ -202,52 +202,39 @@ impl Editor {
         }
 
         let buffer_text = self.buffer.to_string();
-        let search_lower = search_text.to_lowercase();
-        let buffer_lower = buffer_text.to_lowercase();
+        // Lowercased one character at a time, the search text the same way
+        // (str::to_lowercase picks Greek final sigma by context, which would
+        // make the two disagree).
+        let search_lower: String = search_text.chars().flat_map(char::to_lowercase).collect();
         let mut matches = Vec::new();
 
-        // Build a mapping from lowercase byte positions to original byte positions.
-        // This is needed because lowercasing can change byte lengths (e.g. 'İ' 2 bytes -> 'i̇' 3 bytes).
-        let mut lower_to_orig: Vec<usize> = Vec::with_capacity(buffer_lower.len() + 1);
-        {
-            let mut orig_chars = buffer_text.char_indices().peekable();
-            for (_lower_idx, lower_ch) in buffer_lower.char_indices() {
-                if let Some(&(orig_idx, _orig_ch)) = orig_chars.peek() {
-                    // Map each byte of this lowercase char to the original byte position
-                    for _ in 0..lower_ch.len_utf8() {
-                        lower_to_orig.push(orig_idx);
-                    }
-                    // Only advance the original iterator when we've consumed a full original character.
-                    // A single original char may map to multiple lowercase chars (rare), but for
-                    // the common case (same number of chars), advance one-to-one.
-                    orig_chars.next();
-                }
+        // The lowercased buffer, and for each of its bytes the byte where the
+        // original character it came from starts. One character can lowercase
+        // to several ('İ', 2 bytes, becomes 'i' plus a combining dot, 3 bytes),
+        // so every byte of its lowercase form points back to that character.
+        let mut buffer_lower = String::with_capacity(buffer_text.len());
+        let mut lower_to_orig: Vec<usize> = Vec::with_capacity(buffer_text.len());
+        for (orig_idx, orig_ch) in buffer_text.char_indices() {
+            for lower_ch in orig_ch.to_lowercase() {
+                buffer_lower.push(lower_ch);
+                lower_to_orig.resize(buffer_lower.len(), orig_idx);
             }
-            // Sentinel for end position
-            lower_to_orig.push(buffer_text.len());
         }
 
         let mut pos = 0;
-        while pos < buffer_lower.len() {
-            if !buffer_lower.is_char_boundary(pos) {
-                pos += 1;
-                continue;
-            }
-
-            if let Some(found) = buffer_lower[pos..].find(&search_lower) {
-                let lower_start = pos + found;
-                let lower_end = lower_start + search_lower.len();
-                let orig_start = lower_to_orig[lower_start];
-                let orig_end = if lower_end < lower_to_orig.len() {
-                    lower_to_orig[lower_end]
-                } else {
-                    buffer_text.len()
-                };
+        while let Some(found) = buffer_lower[pos..].find(&search_lower) {
+            let lower_start = pos + found;
+            let lower_end = lower_start + search_lower.len();
+            let orig_start = lower_to_orig[lower_start];
+            // The match ends after the original character its last byte came from.
+            let last = lower_to_orig[lower_end - 1];
+            let orig_end = last + buffer_text[last..].chars().next().map_or(0, char::len_utf8);
+            // Two matches can't share an original character (one ending, the
+            // next starting, inside the same character's lowercase form).
+            if matches.last().map_or(true, |&(_, prev_end)| orig_start >= prev_end) {
                 matches.push((orig_start, orig_end));
-                pos = lower_end;
-            } else {
-                break;
             }
+            pos = lower_end;
         }
 
         matches

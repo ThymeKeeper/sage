@@ -109,7 +109,7 @@ impl HelpScreen {
                 ("Ctrl+Shift+Z", "Redo"),
                 ("", "Filters and sorts change the view only, never the file"),
                 ("Past the last row/column", "Ghost cells: type a value to add rows/columns"),
-                ("Ctrl+Y, Plain Text", "Show the file as text (read-only)"),
+                ("Ctrl+Y, Plain Text", "Edit the data as raw text (tabs show as \u{2192})"),
                 ("Ctrl+Y, Spreadsheet", "Show text as a grid (CSV or TSV), or return to it"),
             ]),
             ("LANGUAGE", vec![

@@ -1443,13 +1443,20 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                 }
                             }
                         } else if let (Ok(Some(language)), true) = (&result, editor.spreadsheet().is_some()) {
-                            // A text language on a grid shows the file as text, read-only:
-                            // the text editor would rewrite its tabs and curly quotes. The
-                            // language only sets the highlighting (no kernel for a CSV).
-                            // Ctrl+Y, Spreadsheet returns to the grid.
-                            editor.show_grid_text_view();
-                            editor.set_language(*language);
-                            editor.reset_wrap_view();
+                            // A text language on a grid shows its data as raw, editable
+                            // text. The language only sets the highlighting (no kernel for
+                            // a CSV). Ctrl+Y, Spreadsheet returns to the grid. Refused
+                            // (staying in the grid) when the data can't be lines as is.
+                            match editor.show_grid_text_view() {
+                                Ok(()) => {
+                                    editor.set_language(*language);
+                                    editor.reset_wrap_view();
+                                }
+                                Err(why) => {
+                                    editor.status_message =
+                                        Some((format!("Can't show this as text: {}", why), true));
+                                }
+                            }
                         } else if let Ok(Some(language)) = result {
                             // Set the new language
                             editor.set_language(language);

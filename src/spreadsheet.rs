@@ -402,41 +402,60 @@ impl Spreadsheet {
 
     pub fn save(&mut self, path: &Path) -> io::Result<()> {
         use std::io::Write;
-        // Write through the null-aware serializer so null cells round-trip as
-        // unquoted-empty fields and empty strings as quoted "" (see crate::dsv).
-        // Every row is written out to the header's width: a short row's missing
-        // cells are nulls, so they go out as empty fields and loaders see one
-        // column count throughout.
         let mut writer = io::BufWriter::new(File::create(path)?);
         let mut line = String::new();
-        let width = self.num_cols();
-        // An empty grid (no columns yet) is an empty file.
-        let rows_to_write = if width == 0 { 0 } else { self.rows.len() };
-        for (r, row) in self.rows.iter().enumerate().take(rows_to_write) {
+        for r in 0..self.rows_to_write() {
             line.clear();
-            for c in 0..width {
-                if c > 0 {
-                    line.push(self.delimiter as char);
-                }
-                let field = match row.get(c) {
-                    Some(cell) if !self.file_is_null(r, c) => Some(cell.as_str()),
-                    _ => None,
-                };
-                crate::dsv::serialize_field(&mut line, field, self.delimiter);
-            }
-            // In a one-column file an empty row would be a blank line, which
-            // readers (sage's included) skip, shifting every later row up.
-            // Write it as an empty string so the row survives a reload.
-            if line.is_empty() {
-                line.push_str("\"\"");
-            }
-            line.push('\n');
+            self.serialize_row(r, &mut line);
             writer.write_all(line.as_bytes())?;
         }
         writer.flush()?;
         self.modified = false;
         self.save_point = Some(self.undo.len());
         Ok(())
+    }
+
+    /// The grid as the text Save writes (for showing it as editable text).
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        for r in 0..self.rows_to_write() {
+            self.serialize_row(r, &mut out);
+        }
+        out
+    }
+
+    /// Rows Save writes: all of them, or none for an empty grid (no columns
+    /// yet), which is an empty file.
+    fn rows_to_write(&self) -> usize {
+        if self.num_cols() == 0 { 0 } else { self.rows.len() }
+    }
+
+    /// Append file row `r` as a line of delimited text. The null-aware
+    /// serializer keeps null cells as unquoted-empty fields and empty strings
+    /// as quoted "" (see crate::dsv). Every row goes out to the header's width:
+    /// a short row's missing cells are nulls, so they become empty fields and
+    /// loaders see one column count throughout.
+    fn serialize_row(&self, r: usize, out: &mut String) {
+        let start = out.len();
+        let empty: Vec<String> = Vec::new();
+        let row = self.rows.get(r).unwrap_or(&empty);
+        for c in 0..self.num_cols() {
+            if c > 0 {
+                out.push(self.delimiter as char);
+            }
+            let field = match row.get(c) {
+                Some(cell) if !self.file_is_null(r, c) => Some(cell.as_str()),
+                _ => None,
+            };
+            crate::dsv::serialize_field(out, field, self.delimiter);
+        }
+        // In a one-column file an empty row would be a blank line, which
+        // readers (sage's included) skip, shifting every later row up.
+        // Write it as an empty string so the row survives a reload.
+        if out.len() == start {
+            out.push_str("\"\"");
+        }
+        out.push('\n');
     }
 
     /// Rows in the grid as displayed (the header plus the rows a filter leaves).

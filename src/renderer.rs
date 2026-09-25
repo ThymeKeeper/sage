@@ -530,7 +530,7 @@ impl Renderer {
                                             }
                                         }
                                     }
-                                    formatted_line.push(ch);
+                                    formatted_line.push(shown_char(ch));
                                     if is_selected || is_current_find_match || is_find_match {
                                         formatted_line.push_str("\x1b[0m");
                                         formatted_line.push_str(line_bg_color); // Reset and restore line background
@@ -621,7 +621,7 @@ impl Renderer {
                                             }
                                         }
                                     }
-                                    formatted_line.push(ch);
+                                    formatted_line.push(shown_char(ch));
                                     if is_selected || is_current_find_match || is_find_match {
                                         formatted_line.push_str("\x1b[0m");
                                         formatted_line.push_str(line_bg_color); // Reset and restore line background
@@ -742,7 +742,8 @@ impl Renderer {
             crate::syntax::Language::Tsv => "TSV",
         };
         let language_info = if editor.is_grid_text_view() {
-            format!(" [{} text, read-only] ", language_name)
+            let kind = editor.spreadsheet().map_or("CSV", |ss| ss.delimiter_name());
+            format!(" [{} \u{00b7} {} data] ", language_name, kind)
         } else if editor.is_wrappable_language() {
             if editor.is_wrap_active() {
                 format!(" [{} wrap] ", language_name)
@@ -1545,7 +1546,8 @@ impl Renderer {
             crate::syntax::Language::Tsv => "TSV",
         };
         let language_info = if editor.is_grid_text_view() {
-            format!(" [{} text, read-only] ", language_name)
+            let kind = editor.spreadsheet().map_or("CSV", |ss| ss.delimiter_name());
+            format!(" [{} \u{00b7} {} data] ", language_name, kind)
         } else if editor.is_wrappable_language() {
             if editor.is_wrap_active() {
                 format!(" [{} wrap] ", language_name)
@@ -1685,6 +1687,14 @@ impl Renderer {
     }
 }
 
+/// A character as the text editor draws it. A tab (only CSV/TSV data shown as
+/// text holds real tabs) is a one-column →, matching the width every cursor,
+/// mouse and wrap calculation already gives it; a raw tab would jump the
+/// terminal to its next tab stop.
+fn shown_char(ch: char) -> char {
+    if ch == '\t' { '\u{2192}' } else { ch }
+}
+
 /// Append one character to `out` with selection / find / bracket / matching-text
 /// / syntax styling. Shared by the word-wrap renderer; mirrors the per-character
 /// styling of the non-wrapped path.
@@ -1733,7 +1743,7 @@ fn push_styled_char(
             SyntaxState::Normal => out.push_str(syntax_colors::NORMAL),
         }
     }
-    out.push(ch);
+    out.push(shown_char(ch));
     if is_selected || is_current_find_match || is_find_match {
         out.push_str("\x1b[0m");
         out.push_str(line_bg_color);

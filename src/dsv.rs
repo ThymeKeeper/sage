@@ -119,6 +119,70 @@ pub fn open_quote_line(input: &str) -> Option<usize> {
     in_quotes.then_some(opened_at)
 }
 
+/// Characters the text editor breaks lines on (it follows Unicode) that
+/// delimited data reads as part of a field: vertical tab, form feed, NEL, and
+/// the line and paragraph separators.
+pub fn is_foreign_line_break(ch: char) -> bool {
+    matches!(ch, '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
+/// Delimited data made ready for the text editor, whose lines must be the
+/// data's records: every record end outside quotes (`\r\n`, a lone `\r`)
+/// becomes `\n`, which reads the same. Returns the 1-based line and the
+/// character when the text can't be shown that way without changing a value:
+/// a carriage return inside a quoted value, or a character the editor breaks
+/// lines on but the data reads as part of a field (see
+/// [`is_foreign_line_break`]). Follows `parse`'s quoting.
+pub fn records_to_lf(input: &str) -> Result<String, (usize, char)> {
+    let mut out = String::with_capacity(input.len());
+    let mut in_quotes = false;
+    let mut line = 1;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if is_foreign_line_break(ch) {
+            return Err((line, ch));
+        }
+        if in_quotes {
+            match ch {
+                '"' if chars.peek() == Some(&'"') => {
+                    out.push_str("\"\"");
+                    chars.next();
+                }
+                '"' => {
+                    in_quotes = false;
+                    out.push('"');
+                }
+                '\r' => return Err((line, ch)),
+                '\n' => {
+                    line += 1;
+                    out.push('\n');
+                }
+                _ => out.push(ch),
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_quotes = true;
+                out.push('"');
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                line += 1;
+                out.push('\n');
+            }
+            '\n' => {
+                line += 1;
+                out.push('\n');
+            }
+            _ => out.push(ch),
+        }
+    }
+    Ok(out)
+}
+
 fn make_field(content: &str, quoted: bool) -> Field {
     if !quoted && content.is_empty() {
         None
@@ -231,6 +295,23 @@ mod tests {
         rdr.records()
             .map(|r| r.unwrap().iter().map(|s| s.to_string()).collect())
             .collect()
+    }
+
+    #[test]
+    fn records_to_lf_rewrites_record_ends_only() {
+        // CRLF and lone CR between records read the same as LF.
+        assert_eq!(records_to_lf("a,b\r\n1,2\r3,4\r\n").unwrap(), "a,b\n1,2\n3,4\n");
+        // An LF inside a quoted value is data the editor can show as is.
+        assert_eq!(records_to_lf("a\n\"x\ny\"\n").unwrap(), "a\n\"x\ny\"\n");
+        // An escaped quote doesn't close the value.
+        assert_eq!(records_to_lf("\"a\"\"b\"\r\nc").unwrap(), "\"a\"\"b\"\nc");
+        // Rewriting either of these would change the value.
+        assert_eq!(records_to_lf("h\r\n\"x\r\ny\"\r\n"), Err((2, '\r')));
+        assert_eq!(records_to_lf("h\n1,a\u{2028}b\n"), Err((2, '\u{2028}')));
+        assert_eq!(records_to_lf("h\u{000C}\n"), Err((1, '\u{000C}')));
+        // Every record end reads the same after the rewrite.
+        let input = "a,b\r\n\"1\n2\",3\r4,5\r\n";
+        assert_eq!(parse(&records_to_lf(input).unwrap(), b','), parse(input, b','));
     }
 
     #[test]

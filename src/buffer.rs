@@ -47,6 +47,21 @@ impl Buffer {
         }
     }
     
+    /// Text kept exactly as given: delimited data shown as text, whose tabs and
+    /// quotes are data, so none of the input folding applies. The caller makes
+    /// the line ends `\n` first (`dsv::records_to_lf`), since only it knows
+    /// which carriage returns are data.
+    pub fn from_raw(s: &str) -> Self {
+        Self {
+            rope: Rope::from_str(s),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            current_group: None,
+            last_edit_time: None,
+            group_timeout: Duration::from_millis(300),
+        }
+    }
+
     pub fn from_string(s: String) -> Self {
         // Apply the shared WYSIWYG input policy (drop invisibles, fold visible
         // confusables to ASCII, CRLF -> LF) so an opened file matches what
@@ -253,9 +268,15 @@ impl Buffer {
         self.rope.to_string()
     }
     
-    /// Check if there are undo operations available
-    pub fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty() || self.current_group.is_some()
+    /// A fingerprint of the text, to tell whether it matches what was last
+    /// loaded or saved (undo can land on the saved text, or pass it).
+    pub fn content_hash(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for chunk in self.rope.chunks() {
+            hasher.write(chunk.as_bytes());
+        }
+        hasher.finish()
     }
 
 }
