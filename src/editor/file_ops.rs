@@ -456,17 +456,35 @@ impl Editor {
     /// editor turns tabs into spaces and folds curly quotes, which would change
     /// the data), else the text as shown. Refuses, with the reason, text that
     /// doesn't read as delimited data (see `Spreadsheet::from_text`).
+    ///
+    /// On a grid already: the same delimiter returns from its text view; the
+    /// other one reads the file again with it, unless the grid has unsaved
+    /// edits (they would be lost). The grid is only replaced once the new
+    /// reading succeeds.
     pub fn enter_grid_mode(&mut self, delimiter: u8) -> Result<(), String> {
-        if self.spreadsheet.is_some() {
-            // Already a grid (perhaps showing its text view): back to the grid.
-            if self.grid_text_view {
-                self.toggle_grid_text_view();
+        let language = if delimiter == b'\t' { crate::syntax::Language::Tsv } else { crate::syntax::Language::Csv };
+        let kind = if delimiter == b'\t' { "TSV" } else { "CSV" };
+        let had_grid = match &self.spreadsheet {
+            Some(ss) if ss.delimiter == delimiter => {
+                if self.grid_text_view {
+                    self.toggle_grid_text_view();
+                }
+                self.syntax.set_language(language);
+                return Ok(());
             }
-            return Ok(());
-        }
-        let on_disk = self.file_path.clone().filter(|p| !self.modified && p.exists());
+            Some(ss) if ss.is_modified() => {
+                return Err(format!(
+                    "the grid has unsaved edits; save (Ctrl+S) or undo them before reading the file as {}",
+                    kind
+                ));
+            }
+            Some(_) => true,
+            None => false,
+        };
+        // A grid is re-read from its file; text from the file unless it has unsaved edits.
+        let on_disk = self.file_path.clone().filter(|p| (had_grid || !self.modified) && p.exists());
         // (An empty buffer has no tabs to lose: it becomes an empty grid.)
-        if on_disk.is_none() && delimiter == b'\t' && !self.buffer.to_string().trim().is_empty() {
+        if !had_grid && on_disk.is_none() && delimiter == b'\t' && !self.buffer.to_string().trim().is_empty() {
             // The text editor turned any tabs into spaces as they were typed,
             // pasted or loaded, so unsaved text can't hold TSV. Saving first
             // would write the spaces over the file's tabs, so say so.
@@ -482,10 +500,12 @@ impl Editor {
         }
         let text = match &on_disk {
             Some(path) => fs::read_to_string(path).map_err(|e| format!("the file couldn't be read ({})", e))?,
+            // A grid never saved to disk (and unmodified) is empty.
+            None if had_grid => String::new(),
             None => self.buffer.to_string(),
         };
         let mut ss = Spreadsheet::from_text(&text, delimiter, true)?;
-        if on_disk.is_none() && self.modified {
+        if !had_grid && on_disk.is_none() && self.modified {
             ss.mark_unsaved(); // the text had unsaved edits; so does the grid
         }
         self.spreadsheet = Some(ss);
@@ -499,23 +519,24 @@ impl Editor {
         self.find_matches.clear();
         self.current_find_match = None;
         self.syntax = SyntaxHighlighter::new();
-        self.syntax.set_language(if delimiter == b'\t' {
-            crate::syntax::Language::Tsv
-        } else {
-            crate::syntax::Language::Csv
-        });
+        self.syntax.set_language(language);
         Ok(())
     }
 
-    /// Ctrl+T on a CSV/TSV: switch between the grid and a read-only plain-text
-    /// view of the file as it is on disk. The grid is kept, untouched, so
-    /// switching back restores it exactly, unsaved edits and cursor included.
+    /// Ctrl+Y → a text language (Plain Text, say) on a grid: show the file as
+    /// read-only text. Already in the text view, this does nothing.
+    pub fn show_grid_text_view(&mut self) {
+        if self.spreadsheet.is_some() && !self.grid_text_view {
+            self.toggle_grid_text_view();
+        }
+    }
+
+    /// Switch between a CSV/TSV's grid and a read-only plain-text view of the
+    /// file as it is on disk (Ctrl+Y: a text language one way, Spreadsheet the
+    /// other). The grid is kept, untouched, so switching back restores it
+    /// exactly, unsaved edits and cursor included.
     pub fn toggle_grid_text_view(&mut self) {
         let Some(ss) = self.spreadsheet.as_mut() else {
-            self.status_message = Some((
-                "Ctrl+T switches a CSV/TSV file between grid and text view".to_string(),
-                false,
-            ));
             return;
         };
         if self.grid_text_view {
@@ -533,9 +554,9 @@ impl Editor {
         let loaded = self.load_grid_text_view();
         self.status_message = Some((
             match (loaded, unsaved) {
-                (false, _) => "Text view: nothing saved on disk yet. Ctrl+T returns to the grid.",
-                (true, true) => "Text view of the file on disk (read-only); unsaved grid edits are not shown, Ctrl+S saves them. Ctrl+T returns to the grid.",
-                (true, false) => "Text view (read-only). Ctrl+T returns to the grid.",
+                (false, _) => "Text view: nothing saved on disk yet. Ctrl+Y, Spreadsheet returns to the grid.",
+                (true, true) => "Text view of the file on disk (read-only); unsaved grid edits are not shown, Ctrl+S saves them. Ctrl+Y, Spreadsheet returns to the grid.",
+                (true, false) => "Text view (read-only). Ctrl+Y, Spreadsheet returns to the grid.",
             }
             .to_string(),
             false,
@@ -716,10 +737,49 @@ mod tests {
     }
 
     #[test]
+    fn a_text_language_shows_the_grid_as_text_and_spreadsheet_brings_it_back() {
+        let (mut editor, _tmp) = csv_editor("a,b\n1,2\n");
+        editor.show_grid_text_view();
+        assert!(editor.is_grid_text_view());
+        editor.set_language(crate::syntax::Language::PlainText); // what Ctrl+Y, Plain Text does
+        editor.show_grid_text_view(); // already there: nothing changes
+        assert!(editor.is_grid_text_view());
+        editor.enter_grid_mode(b',').unwrap();
+        assert!(editor.is_spreadsheet_mode());
+        assert_eq!(*editor.get_language(), crate::syntax::Language::Csv);
+    }
+
+    #[test]
+    fn choosing_the_other_delimiter_rereads_the_file_unless_the_grid_has_edits() {
+        let (mut editor, _tmp) = csv_editor("a\tb,c\n1\t2,3\n");
+        assert_eq!(editor.spreadsheet().unwrap().cell(0, 1), "c"); // as CSV
+        editor.enter_grid_mode(b'\t').unwrap();
+        assert_eq!(editor.spreadsheet().unwrap().cell(0, 1), "b,c"); // as TSV
+        assert_eq!(*editor.get_language(), crate::syntax::Language::Tsv);
+        {
+            let ss = editor.spreadsheet_mut().unwrap();
+            ss.cursor = (1, 0);
+            ss.enter_edit_mode_replace('9');
+            ss.commit_edit();
+        }
+        let why = editor.enter_grid_mode(b',').unwrap_err();
+        assert!(why.contains("unsaved edits"), "{why}");
+        assert_eq!(editor.spreadsheet().unwrap().cell(1, 0), "9"); // the edit is kept
+    }
+
+    #[test]
+    fn a_rereading_that_fails_keeps_the_grid() {
+        let (mut editor, _tmp) = csv_editor("x,y\n1,2\n");
+        assert!(editor.enter_grid_mode(b'\t').is_err()); // no tabs in the file
+        assert!(editor.is_spreadsheet_mode());
+        assert_eq!(editor.spreadsheet().unwrap().cell(1, 1), "2");
+    }
+
+    #[test]
     fn text_view_toggle_is_a_no_op_outside_csv() {
         let mut editor = Editor::new();
         editor.toggle_grid_text_view();
+        editor.show_grid_text_view();
         assert!(!editor.is_grid_text_view());
-        assert!(editor.status_message.is_some());
     }
 }

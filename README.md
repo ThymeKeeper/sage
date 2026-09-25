@@ -110,17 +110,17 @@ Autocomplete automatically shows:
 - `Ctrl+Home/End`: Jump to start/end of file
 - `Page Up/Down`: Scroll viewport
 - `Shift+Page Up/Down`: Scroll output pane
-- `Ctrl+T`: CSV/TSV files: switch between the grid and a read-only text view of the file
 
 ### Spreadsheet (CSV/TSV)
 - `.csv` / `.tsv` files open as a grid. Any other text can be shown as one with `Ctrl+Y` → **Spreadsheet (CSV)** or **Spreadsheet (TSV)**; sage refuses (and says why) when the text isn't delimited data: no commas/tabs, an unclosed quote, or a row with more fields than the header row (row 1). Short rows are fine; their missing cells are nulls. Without unsaved edits the file's own bytes are read (the text editor turns tabs into spaces), so TSV works from a file but not from text typed into sage
+- On a grid, `Ctrl+Y` → **Plain Text** (or any text language) shows the file as text, read-only (the text editor would rewrite its tabs and curly quotes); `Ctrl+Y` → **Spreadsheet** returns to the grid. Choosing the other of CSV/TSV re-reads the file with that delimiter (not while the grid has unsaved edits)
 - An empty buffer or file is an empty grid: every row and column is a ghost cell until you type
 - Ghost cells: empty cells continue past the last row and column. Arrow or click into them and type a value to grow the data to that cell (other new cells are nulls, saved as empty fields); `Ctrl+Z` undoes it
 - Save writes every row to the header's width, filling missing cells with empty fields
 - `Alt+Down` or right-click: filter & sort menu for the column (Excel-style value checklist with search; row 1 is the header)
 - The same menu offers **Convert dates to ISO 8601** on a date column: `25/04/26` becomes `2026-04-25` and `03-25-2026 02:15 PM` becomes `2026-03-25 14:15:00`. Day/month order is proven per column from the data (a part over 12), never guessed; a column that can't be settled asks, and a column mixing both orders is refused. Year-first dates are year-month-day unless a middle part over 12 proves year-day-month (`2023-31-12` becomes `2023-12-31`). Values that can't be a date in any reading (`20/20/2000`) are listed and left as they are. Hidden rows convert too; `Ctrl+Z` undoes it
 - `Ctrl+Shift+L`: clear all filters
-- `Ctrl+Z` / `Ctrl+Shift+Z` or `Ctrl+Y`: undo / redo cell edits and range clears (works while filtered or sorted)
+- `Ctrl+Z` / `Ctrl+Shift+Z`: undo / redo cell edits and range clears (works while filtered or sorted)
 - Filters and sorts change only what the grid shows: Save writes every row in the file's own order
 
 ### Search

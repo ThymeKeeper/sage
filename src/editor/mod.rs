@@ -53,7 +53,7 @@ pub struct Editor {
     repl_mode: bool,                   // Whether we're in REPL mode
     executing_kernel_name: Option<String>, // Kernel name while executing (kernel is temporarily taken)
     spreadsheet: Option<Spreadsheet>,   // Active spreadsheet (CSV/TSV) grid, replaces buffer editing
-    // CSV/TSV shown as read-only plain text (Ctrl+T). The grid stays in
+    // CSV/TSV shown as read-only plain text (Ctrl+Y, a text language). The grid stays in
     // `spreadsheet`, untouched, and remains what Save writes.
     grid_text_view: bool,
 }
@@ -112,7 +112,7 @@ impl Editor {
         self.spreadsheet.is_some() && !self.grid_text_view
     }
 
-    /// True while a CSV/TSV is shown as read-only plain text (Ctrl+T).
+    /// True while a CSV/TSV is shown as read-only plain text.
     pub fn is_grid_text_view(&self) -> bool {
         self.grid_text_view
     }
@@ -121,7 +121,7 @@ impl Editor {
     fn refuse_text_view_edit(&mut self) -> bool {
         if self.grid_text_view {
             self.status_message = Some((
-                "Text view is read-only. Ctrl+T returns to the grid to edit.".to_string(),
+                "Text view is read-only. Ctrl+Y, Spreadsheet returns to the grid to edit.".to_string(),
                 true,
             ));
         }

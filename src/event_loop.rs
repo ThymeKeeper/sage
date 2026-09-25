@@ -1257,16 +1257,6 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         commands::Command::None
                     }
 
-                    // CSV/TSV: switch between the grid and a read-only text view (Ctrl+T)
-                    KeyCode::Char('t') | KeyCode::Char('T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        editor.toggle_grid_text_view();
-                        let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
-                        editor.update_viewport_for_cursor_with_bottom(bottom_height);
-                        full_redraw(renderer, &mut output_pane)?;
-                        needs_redraw = true;
-                        commands::Command::None
-                    }
-
                     // Execute Cell (Ctrl+E as alternative)
                     KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Only allow execution in REPL-mode languages (Python or SQL).
@@ -1452,6 +1442,14 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                         Some((format!("Can't show this as a spreadsheet: {}", why), true));
                                 }
                             }
+                        } else if let (Ok(Some(language)), true) = (&result, editor.spreadsheet().is_some()) {
+                            // A text language on a grid shows the file as text, read-only:
+                            // the text editor would rewrite its tabs and curly quotes. The
+                            // language only sets the highlighting (no kernel for a CSV).
+                            // Ctrl+Y, Spreadsheet returns to the grid.
+                            editor.show_grid_text_view();
+                            editor.set_language(*language);
+                            editor.reset_wrap_view();
                         } else if let Ok(Some(language)) = result {
                             // Set the new language
                             editor.set_language(language);
@@ -2621,10 +2619,8 @@ fn handle_spreadsheet_key(
                 }
                 return false;
             }
-            // Text view toggle: handled by the main key loop (it commits an edit)
-            KeyCode::Char('t') | KeyCode::Char('T') => return false,
-            // Undo / redo: Ctrl+Z, Ctrl+Shift+Z (as in the text editor) or Ctrl+Y
-            // (as in Excel). Mid-edit, Ctrl+Z drops the edit in progress instead.
+            // Undo / redo: Ctrl+Z and Ctrl+Shift+Z, as in the text editor.
+            // Mid-edit, Ctrl+Z drops the edit in progress instead.
             KeyCode::Char('z') | KeyCode::Char('Z') => {
                 if let Some(ss) = editor.spreadsheet_mut() {
                     if ss.is_editing() {
@@ -2638,14 +2634,15 @@ fn handle_spreadsheet_key(
                 *needs_redraw = true;
                 return true;
             }
+            // Ctrl+Y: the syntax selector, handled by the main key loop. A text
+            // language shows the file as read-only text; Spreadsheet returns.
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(ss) = editor.spreadsheet_mut() {
-                    if !ss.is_editing() {
-                        ss.redo();
+                    if ss.is_editing() {
+                        ss.commit_edit();
                     }
                 }
-                *needs_redraw = true;
-                return true;
+                return false;
             }
             _ => {}
         }
@@ -2993,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_z_undoes_and_ctrl_y_or_ctrl_shift_z_redoes_in_the_grid() {
+    fn ctrl_z_undoes_and_ctrl_shift_z_redoes_in_the_grid() {
         let (mut editor, tmp) = load(CSV);
         let ctrl = KeyModifiers::CONTROL;
         let cell = |e: &editor::Editor| e.spreadsheet().unwrap().cell(1, 0).to_string();
@@ -3001,9 +2998,14 @@ mod tests {
         assert_eq!(cell(&editor), "9");
         press(&mut editor, &[(KeyCode::Char('z'), ctrl)]);
         assert_eq!(cell(&editor), "1");
-        press(&mut editor, &[(KeyCode::Char('y'), ctrl)]);
+        press(&mut editor, &[(KeyCode::Char('Z'), ctrl | SHIFT)]);
         assert_eq!(cell(&editor), "9");
-        press(&mut editor, &[(KeyCode::Char('z'), ctrl), (KeyCode::Char('Z'), ctrl | SHIFT)]);
+        // Ctrl+Y is the syntax selector now: the grid hands it on (committing any edit).
+        let mut redraw = false;
+        press(&mut editor, &[(KeyCode::Char('7'), NONE)]);
+        assert!(!handle_spreadsheet_key(&mut editor, &event::KeyEvent::new(KeyCode::Char('y'), ctrl), &mut redraw));
+        assert_eq!(cell(&editor), "7");
+        press(&mut editor, &[(KeyCode::Char('z'), ctrl)]);
         assert_eq!(cell(&editor), "9");
 
         // Mid-edit, Ctrl+Z drops the typing; it never becomes an undo step.

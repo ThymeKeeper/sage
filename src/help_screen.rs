@@ -61,7 +61,6 @@ impl HelpScreen {
                 ("Home / End", "Start / End of line"),
                 ("Page Up / Page Down", "Scroll page"),
                 ("Ctrl+W", "Toggle word wrap (plain text & Markdown)"),
-                ("Ctrl+T", "CSV/TSV: switch grid / read-only text view"),
             ]),
             ("SEARCH & REPLACE", vec![
                 ("Ctrl+F", "Find / Find next"),
@@ -107,11 +106,11 @@ impl HelpScreen {
                 ("", "The same menu converts a date column to ISO 8601"),
                 ("Ctrl+Shift+L", "Clear all filters"),
                 ("Ctrl+Z", "Undo the last edit or clear"),
-                ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
+                ("Ctrl+Shift+Z", "Redo"),
                 ("", "Filters and sorts change the view only, never the file"),
-                ("Ctrl+T", "Switch grid / read-only text view"),
                 ("Past the last row/column", "Ghost cells: type a value to add rows/columns"),
-                ("Ctrl+Y (in text)", "Spreadsheet (CSV/TSV): show the text as a grid"),
+                ("Ctrl+Y, Plain Text", "Show the file as text (read-only)"),
+                ("Ctrl+Y, Spreadsheet", "Show text as a grid (CSV or TSV), or return to it"),
             ]),
             ("LANGUAGE", vec![
                 ("Ctrl+Y", "Select language"),

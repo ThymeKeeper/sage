@@ -1048,7 +1048,7 @@ impl Spreadsheet {
         true
     }
 
-    /// Redo the last undone step (Ctrl+Shift+Z or Ctrl+Y). Returns false with nothing to redo.
+    /// Redo the last undone step (Ctrl+Shift+Z). Returns false with nothing to redo.
     pub fn redo(&mut self) -> bool {
         let Some(mut step) = self.redo.pop() else { return false };
         if step.growth.is_some() {
