@@ -50,6 +50,10 @@ import tempfile
 # Get platform-independent temp directory for debug log
 _sage_debug_file = os.path.join(tempfile.gettempdir(), 'sage_python_debug.txt')
 
+# The debug log is UTF-8: cell text reaches it and may hold anything.
+def _sage_dbg_open():
+    return open(_sage_debug_file, 'a', encoding='utf-8')
+
 # Ensure we're not in interactive mode
 sys.ps1 = sys.ps2 = ''
 
@@ -84,7 +88,7 @@ while True:
         code = '\n'.join(code_lines)
 
         # Debug: Mark code received
-        with open(_sage_debug_file, 'a') as debug_f:
+        with _sage_dbg_open() as debug_f:
             debug_f.write(f'>>> RECEIVED CODE ({len(code)} chars): {code[:50]}...\n')
 
         # Execute code with stdout capture
@@ -98,13 +102,13 @@ while True:
             with contextlib.redirect_stdout(stdout_capture):
                 _sage_result = eval(code, globals())
             _sage_evaluated = True
-            with open(_sage_debug_file, 'a') as debug_f:
+            with _sage_dbg_open() as debug_f:
                 debug_f.write(f'>>> EVAL succeeded\n')
         except SyntaxError:
             # If eval fails, just exec the entire code block
             with contextlib.redirect_stdout(stdout_capture):
                 exec(code, globals())
-            with open(_sage_debug_file, 'a') as debug_f:
+            with _sage_dbg_open() as debug_f:
                 debug_f.write(f'>>> EXEC succeeded\n')
 
         # Send captured stdout if any
@@ -189,7 +193,7 @@ while True:
         # IMPORTANT: Send completions BEFORE the success/result marker
 
         # Debug marker - write directly to file
-        with open(_sage_debug_file, 'a') as debug_f:
+        with _sage_dbg_open() as debug_f:
             debug_f.write('=== INTROSPECTION START ===\n')
 
         try:
@@ -201,7 +205,7 @@ while True:
             sql_functions = [] # SQL function names
 
             # Debug: Check what's in globals
-            with open(_sage_debug_file, 'a') as debug_f:
+            with _sage_dbg_open() as debug_f:
                 all_names = list(globals().keys())
                 debug_f.write(f'Globals count: {len(all_names)}\n')
                 debug_f.write(f'Has db: {"db" in globals()}\n')
@@ -267,7 +271,7 @@ while True:
 
                                             # Debug: Log type discovery
                                             if name == 'db':  # Only for duckdb module
-                                                with open(_sage_debug_file, 'a') as debug_f:
+                                                with _sage_dbg_open() as debug_f:
                                                     debug_f.write(f'Found type in db: {member} (member_type={member_type}, type_name={type_name})\n')
 
                                             if type_name not in type_methods:
@@ -278,7 +282,7 @@ while True:
                                                 if class_methods:
                                                     type_methods[type_name] = class_methods
                                                     if name == 'db':
-                                                        with open(_sage_debug_file, 'a') as debug_f:
+                                                        with _sage_dbg_open() as debug_f:
                                                             debug_f.write(f'  -> Added {len(class_methods)} methods for {type_name}\n')
 
                                             # For callable classes, try to determine what they return
@@ -288,7 +292,7 @@ while True:
                                                 return_types[full_name] = type_name
                                         except Exception as e:
                                             if name == 'db':
-                                                with open(_sage_debug_file, 'a') as debug_f:
+                                                with _sage_dbg_open() as debug_f:
                                                     debug_f.write(f'Error introspecting {member}: {e}\n')
                                 except:
                                     pass
@@ -364,7 +368,7 @@ while True:
                         pass
 
             # Debug: Write completion summary to file
-            with open(_sage_debug_file, 'a') as debug_f:
+            with _sage_dbg_open() as debug_f:
                 debug_f.write(f'Completions collected: {len(completions)}\n')
                 if completions:
                     sample = [c['name'] for c in completions[:5]]
@@ -388,13 +392,13 @@ while True:
                     # Check if this is the duckdb module itself
                     if obj_type == 'module' and hasattr(obj, '__name__') and obj.__name__ == 'duckdb':
                         try:
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'Found duckdb module: {name}\n')
 
                             # Use the module's default connection via execute()
                             try:
                                 tables_result = obj.execute("SHOW TABLES").fetchall()
-                                with open(_sage_debug_file, 'a') as debug_f:
+                                with _sage_dbg_open() as debug_f:
                                     debug_f.write(f'SHOW TABLES returned: {tables_result}\n')
                                 for row in tables_result:
                                     table_name = row[0]
@@ -414,10 +418,10 @@ while True:
                                             if col_name not in sql_columns:
                                                 sql_columns.append(col_name)
                                     except Exception as col_e:
-                                        with open(_sage_debug_file, 'a') as debug_f:
+                                        with _sage_dbg_open() as debug_f:
                                             debug_f.write(f'Error getting columns for {table_name}: {str(col_e)}\n')
                             except Exception as table_e:
-                                with open(_sage_debug_file, 'a') as debug_f:
+                                with _sage_dbg_open() as debug_f:
                                     debug_f.write(f'Error with SHOW TABLES: {str(table_e)}\n')
 
                             # Get functions (only once)
@@ -427,15 +431,15 @@ while True:
                                     for func_row in functions_result:
                                         sql_functions.append(func_row[0])
                                 except Exception as func_e:
-                                    with open(_sage_debug_file, 'a') as debug_f:
+                                    with _sage_dbg_open() as debug_f:
                                         debug_f.write(f'Error getting functions: {str(func_e)}\n')
 
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'DuckDB module SQL metadata: {len(sql_tables)} tables, {len(sql_columns)} columns, {len(sql_functions)} functions\n')
                                 if sql_tables:
                                     debug_f.write(f'Tables: {sql_tables}\n')
                         except Exception as e:
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'Error harvesting from duckdb module: {str(e)}\n')
                                 import traceback
                                 debug_f.write(f'Traceback: {traceback.format_exc()}\n')
@@ -443,13 +447,13 @@ while True:
                     # Check for DuckDB connection object
                     elif obj_type == 'DuckDBPyConnection':
                         try:
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'Found DuckDB connection: {name}\n')
 
                             # Get tables - use SHOW TABLES which is more reliable
                             try:
                                 tables_result = obj.execute("SHOW TABLES").fetchall()
-                                with open(_sage_debug_file, 'a') as debug_f:
+                                with _sage_dbg_open() as debug_f:
                                     debug_f.write(f'SHOW TABLES returned: {tables_result}\n')
                                 for row in tables_result:
                                     table_name = row[0]
@@ -469,10 +473,10 @@ while True:
                                             if col_name not in sql_columns:
                                                 sql_columns.append(col_name)
                                     except Exception as col_e:
-                                        with open(_sage_debug_file, 'a') as debug_f:
+                                        with _sage_dbg_open() as debug_f:
                                             debug_f.write(f'Error getting columns for {table_name}: {str(col_e)}\n')
                             except Exception as table_e:
-                                with open(_sage_debug_file, 'a') as debug_f:
+                                with _sage_dbg_open() as debug_f:
                                     debug_f.write(f'Error with SHOW TABLES: {str(table_e)}\n')
 
                             # Get functions (only once, not per table)
@@ -482,15 +486,15 @@ while True:
                                     for func_row in functions_result:
                                         sql_functions.append(func_row[0])
                                 except Exception as func_e:
-                                    with open(_sage_debug_file, 'a') as debug_f:
+                                    with _sage_dbg_open() as debug_f:
                                         debug_f.write(f'Error getting functions: {str(func_e)}\n')
 
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'DuckDB SQL metadata: {len(sql_tables)} tables, {len(sql_columns)} columns, {len(sql_functions)} functions\n')
                                 if sql_tables:
                                     debug_f.write(f'Tables: {sql_tables}\n')
                         except Exception as e:
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'Error harvesting DuckDB metadata: {str(e)}\n')
                                 import traceback
                                 debug_f.write(f'Traceback: {traceback.format_exc()}\n')
@@ -526,15 +530,15 @@ while True:
                             except:
                                 pass
 
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'Spark SQL metadata: {len(sql_tables)} tables, {len(sql_columns)} columns, {len(sql_functions)} functions\n')
                         except Exception as e:
-                            with open(_sage_debug_file, 'a') as debug_f:
+                            with _sage_dbg_open() as debug_f:
                                 debug_f.write(f'Error harvesting Spark metadata: {str(e)}\n')
                 except:
                     pass
 
-            with open(_sage_debug_file, 'a') as debug_f:
+            with _sage_dbg_open() as debug_f:
                 debug_f.write('=== INTROSPECTION END ===\n\n')
 
             # Send completions
@@ -787,6 +791,12 @@ impl Kernel for DirectKernel {
             // off-screen (Agg) and handed to detached viewer windows instead of
             // blocking the REPL thread on a GUI show().
             .env("MPLBACKEND", "Agg")
+            // Cell source goes in and JSON comes out as UTF-8. A piped stdin/stdout
+            // otherwise uses the ANSI code page (cp1252), which garbles non-ASCII
+            // and turns bytes cp1252 leaves undefined (0x81 0x8D 0x8F 0x90 0x9D)
+            // into lone surrogates. Not PYTHONUTF8 / -X utf8: those also change
+            // open()'s default inside cells, and cells must behave as under `py`.
+            .env("PYTHONIOENCODING", "utf-8")
             .spawn()
             .map_err(|e| format!("Failed to spawn Python process: {}", e))?;
 

@@ -2178,7 +2178,10 @@ fn spawn_app_process(python_path: &str, source: &str) -> io::Result<std::process
     cmd.arg(&path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // The pipes are decoded as UTF-8 below; without this Python writes them in
+        // the ANSI code page and print() raises on anything outside cp1252.
+        .env("PYTHONIOENCODING", "utf-8");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
