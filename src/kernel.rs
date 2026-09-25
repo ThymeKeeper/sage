@@ -86,6 +86,10 @@ pub struct ExecutionResult {
     pub completions: Vec<CompletionItem>,
     pub type_relationships: TypeRelationships,
     pub sql_metadata: SqlMetadata,
+    /// Column names of the statement's result set (SQL kernels; empty for a
+    /// zero-row result or a kernel that doesn't report them). Feed SQL-mode
+    /// autocomplete.
+    pub result_columns: Vec<String>,
 }
 
 /// Information about an available Python kernel

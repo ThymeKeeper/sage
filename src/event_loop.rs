@@ -21,6 +21,9 @@ enum ExecMsg {
         completions: Vec<kernel::CompletionItem>,
         type_relationships: kernel::TypeRelationships,
         sql_metadata: kernel::SqlMetadata,
+        /// SQL mode: each statement that ran without error, with its result's
+        /// column names, for autocomplete to remember.
+        sql_ran: Vec<(String, Vec<String>)>,
     },
 }
 
@@ -137,8 +140,12 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         completions,
                         type_relationships,
                         sql_metadata,
+                        sql_ran,
                     } => {
                         editor.set_kernel(kernel);
+                        for (sql, columns) in &sql_ran {
+                            autocomplete.remember_sql(sql, columns);
+                        }
                         if !completions.is_empty() {
                             let completion_names: Vec<String> =
                                 completions.iter().map(|c| c.name.clone()).collect();
@@ -1858,9 +1865,17 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         if autocomplete.is_visible() && !key.modifiers.contains(KeyModifiers::SHIFT) {
                             // Accept autocomplete suggestion
                             if let Some(suggestion) = autocomplete.get_selected() {
-                                let prefix = editor.get_word_at_cursor();
-                                // Delete the prefix and insert the full suggestion
-                                for _ in 0..prefix.len() {
+                                // Delete the prefix and insert the full suggestion. In
+                                // SQL mode the prefix is only the part after any dot
+                                // (`pa` in `sc.pa`), so the qualifier stays.
+                                let typed = if *editor.get_language() == syntax::Language::Sql {
+                                    editor.sql_completion_context().map_or(0, |c| c.prefix.chars().count())
+                                } else if let Some(embedded) = editor.embedded_sql_context() {
+                                    embedded.completion.prefix.chars().count()
+                                } else {
+                                    editor.get_word_at_cursor().len()
+                                };
+                                for _ in 0..typed {
                                     editor.execute(commands::Command::Backspace)?;
                                 }
                                 for ch in suggestion.chars() {
@@ -1980,39 +1995,38 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         };
                         editor.update_viewport_for_cursor_with_bottom(bottom_height);
 
-                        // Apply autocomplete updates based on command type
-                        // Only enable autocomplete in REPL mode (Python)
+                        // Apply autocomplete updates based on command type:
+                        // SQL mode always (Snowflake's words need no kernel),
+                        // other languages in REPL mode only.
+                        let sql_mode = *editor.get_language() == syntax::Language::Sql;
                         if suppress_autocomplete_once {
                             // Skip autocomplete update this cycle (after Tab completion)
                             suppress_autocomplete_once = false;
-                        } else if should_update_autocomplete && editor.is_repl_mode() {
-                            let (base_callable, prefix, is_sql_context) = editor.get_completion_context();
-                            // Debug logging
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
-                                use std::io::Write;
-                                let _ = writeln!(f, "DEBUG event_loop: should_update_autocomplete, base_callable={:?}, prefix='{}', is_sql={}", base_callable, prefix, is_sql_context);
-                            }
-                            autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
+                        } else if sql_mode && (should_update_autocomplete || should_check_backspace_delete) {
+                            autocomplete.update_sql(editor.sql_completion_context().as_ref());
                             renderer.force_redraw(); // Clear artifacts when menu changes
                             if output_pane_visible {
                                 output_pane.invalidate_cache();
                             }
-                        } else if should_check_backspace_delete && editor.is_repl_mode() {
-                            let (base_callable, prefix, is_sql_context) = editor.get_completion_context();
-                            if prefix.is_empty() && base_callable.is_none() && !is_sql_context {
-                                autocomplete.hide();
-                                renderer.force_redraw();
-                                if output_pane_visible {
-                                    output_pane.invalidate_cache();
-                                }
+                        } else if (should_update_autocomplete || should_check_backspace_delete) && editor.is_repl_mode() {
+                            // SQL in a Python string (sf.sql, db.sql, ...) has its own
+                            // path; everything else is Python.
+                            if let Some(embedded) = editor.embedded_sql_context() {
+                                autocomplete.update_embedded_sql(&embedded);
                             } else {
-                                autocomplete.update_with_context(base_callable, &prefix, is_sql_context);
-                                renderer.force_redraw(); // Clear artifacts when menu changes
-                                if output_pane_visible {
-                                    output_pane.invalidate_cache();
+                                let (base_callable, prefix) = editor.get_completion_context();
+                                // Debug logging
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
+                                    use std::io::Write;
+                                    let _ = writeln!(f, "DEBUG event_loop: update autocomplete, base_callable={:?}, prefix='{}'", base_callable, prefix);
                                 }
+                                autocomplete.update_with_context(base_callable, &prefix);
                             }
-                        } else if should_hide_autocomplete || !editor.is_repl_mode() {
+                            renderer.force_redraw(); // Clear artifacts when menu changes
+                            if output_pane_visible {
+                                output_pane.invalidate_cache();
+                            }
+                        } else if should_hide_autocomplete || !(editor.is_repl_mode() || sql_mode) {
                             autocomplete.hide();
                             renderer.force_redraw();
                             if output_pane_visible {
@@ -2150,6 +2164,7 @@ fn spawn_background_execution(
                         completions: Vec::new(),
                         type_relationships: kernel::TypeRelationships::default(),
                         sql_metadata: kernel::SqlMetadata::default(),
+                        sql_ran: Vec::new(),
                     });
                 });
                 // preserves_session = true → soft cancel: Ctrl+Backspace kills
@@ -2174,6 +2189,7 @@ fn spawn_background_execution(
         let mut all_completions = Vec::new();
         let mut type_relationships = crate::kernel::TypeRelationships::default();
         let mut sql_metadata = crate::kernel::SqlMetadata::default();
+        let mut sql_ran: Vec<(String, Vec<String>)> = Vec::new();
 
         for (label, code) in cells {
             let start_time = std::time::Instant::now();
@@ -2183,6 +2199,18 @@ fn spawn_background_execution(
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let output_text = crate::cell::format_output(&result);
                     let is_error = !result.success;
+                    // Only a statement that ran feeds autocomplete: a failed
+                    // one may hold a misspelt name. A Python cell that ran
+                    // feeds the Snowflake SQL it sent through abp (sf.sql).
+                    if !is_error {
+                        if is_sql {
+                            sql_ran.push((code.clone(), result.result_columns.clone()));
+                        } else {
+                            for sql in crate::sql_context::snowflake_sql_in(&code) {
+                                sql_ran.push((sql, Vec::new()));
+                            }
+                        }
+                    }
 
                     all_completions.extend(result.completions);
                     type_relationships = result.type_relationships;
@@ -2217,6 +2245,7 @@ fn spawn_background_execution(
             completions: all_completions,
             type_relationships,
             sql_metadata,
+            sql_ran,
         });
     });
 

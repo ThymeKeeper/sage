@@ -76,6 +76,7 @@ impl HelpScreen {
             ]),
             ("PYTHON REPL MODE", vec![
                 ("Ctrl+E / Ctrl+Enter", "Execute cell/code"),
+                ("Tab in sf.sql(\"...\")", "Snowflake autocomplete, as in SQL mode (db.sql: DuckDB names)"),
                 ("Ctrl+Backspace", "Cancel execution (resets kernel)"),
                 ("Ctrl+K", "Select kernel"),
                 ("Ctrl+L", "Clear output pane"),
@@ -85,6 +86,8 @@ impl HelpScreen {
             ]),
             ("SNOWFLAKE REPL MODE", vec![
                 ("Ctrl+E / Ctrl+Enter", "Execute statement (cells split on semicolons)"),
+                ("Tab", "Accept autocomplete: Snowflake words, and names from queries run"),
+                ("", "Case-sensitive: sel -> select, Sel -> Select, SEL -> SELECT"),
                 ("Ctrl+Backspace", "Cancel query (server-side abort, session preserved)"),
                 ("Ctrl+K", "Select kernel"),
                 ("F9", "Export full result to CSV (Downloads folder)"),

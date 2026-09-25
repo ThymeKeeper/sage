@@ -182,6 +182,18 @@ Or use the `--python` flag in headless mode.
 
 ## SQL Support
 
+### SQL mode autocomplete
+In SQL mode (with or without a Snowflake connection) typing a name opens suggestions; `Tab` accepts, `Up`/`Down` choose, `Esc` closes. Nothing pops up inside a string or comment.
+- **Snowflake's words:** keywords, commands, data types, date parts, common parameters and COPY/file-format options, every built-in function (taken from `SHOW FUNCTIONS`, in `src/sql_functions.rs`) and the table functions (`FLATTEN`, `RESULT_SCAN`, `QUERY_HISTORY`, ...).
+- **Names from your queries:** each statement that runs without error adds every table, alias, CTE, column and other name in its text, and its result's column names. They are kept in memory until sage closes, never saved, and come first in the list. After a dot, the parts seen after that prefix come first (`DM_FPS_PRD.PRIV.` offers the tables used under it).
+- **Case-sensitive:** every word is offered in upper, lower and title case, and matches what you type exactly: `sel` offers `select`, `Sel` offers `Select`, `SEL` offers `SELECT` (`date_t` offers `date_trunc`, `Date_T` offers `Date_Trunc`). A name you wrote in mixed case is also offered as written. A quoted name (`"Fare Class"`) is offered only as written, since its case is part of the name; type its letters without the quote to find it.
+
+### SQL inside Python
+With a Python kernel connected, the caret inside the SQL string of a call gets SQL suggestions, matched the same case-sensitive way:
+- **`sf.sql("...")` and `sf.submit("...")`** (abp, Snowflake) get everything SQL mode gets, and share its list of names: a Python cell that runs without error adds the names in the SQL it passed to `sf.sql`/`sf.submit`, and a query run in SQL mode is offered here too (and the other way round).
+- **`db.sql(...)`, `.execute(...)`, `.query(...)`, `read_sql*(...)`, `spark.sql(...)`** get the tables, columns and functions the kernel finds in DuckDB or Spark after each run, and the common SQL words.
+- Only the string passed straight to the call counts (`sf.sql(q)` with `q` built elsewhere doesn't). In an f-string, the `{...}` fields are Python. Python comments, raw strings and triple quotes are read as Python reads them.
+
 ### DuckDB
 ```python
 import duckdb as db

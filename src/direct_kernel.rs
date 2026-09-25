@@ -993,6 +993,7 @@ impl Kernel for DirectKernel {
             completions,
             type_relationships,
             sql_metadata,
+            result_columns: Vec::new(),
         })
     }
 

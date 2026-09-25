@@ -275,8 +275,12 @@ impl Kernel for SnowflakeKernel {
                 }
             });
 
+        let mut result_columns: Vec<String> = Vec::new();
         let outputs = match outcome {
             Ok(out) => {
+                if let Some(cols) = &out.columns {
+                    result_columns = cols.iter().map(|c| c.name.clone()).collect();
+                }
                 if let Some(tmp) = out.spool {
                     self.last_result_file = Some(tmp);
                 }
@@ -333,6 +337,7 @@ impl Kernel for SnowflakeKernel {
             completions: Vec::<CompletionItem>::new(),
             type_relationships: TypeRelationships::default(),
             sql_metadata: SqlMetadata::default(),
+            result_columns,
         })
     }
 

@@ -1,193 +1,238 @@
-use ropey::Rope;
+//! SQL written inside Python: whether the caret is in the SQL string of a
+//! call such as `sf.sql("...")` or `db.sql("...")`, which dialect it is, and
+//! the Snowflake SQL a cell sends through abp (`sf.sql`, `sf.submit`).
+//!
+//! Python is scanned from the top, so comments (`# don't`), string prefixes
+//! (`f`, `r`, `rb`), triple quotes and escapes are read as Python reads them.
 
-/// Detect if the cursor is inside a SQL string context
-/// Returns true if we're inside a string that's an argument to a SQL function
-pub fn is_in_sql_context(rope: &Rope, cursor_pos: usize) -> bool {
-    // Common SQL function patterns to detect
-    const SQL_PATTERNS: &[&str] = &[
-        ".sql(",
-        ".execute(",
-        ".query(",
-        ".read_sql(",
-        ".read_sql_query(",
-        ".read_sql_table(",
-        "spark.sql(",
-    ];
+use crate::sql_words::SqlCompletion;
 
-    // First, check if we're inside a string at all
-    if !is_in_string(rope, cursor_pos) {
-        return false;
-    }
-
-    // Look backwards from cursor to find the opening quote of the string
-    let mut pos = cursor_pos;
-    let mut in_string = false;
-    let mut string_start = cursor_pos;
-    let mut is_triple_quote = false;
-
-    while pos > 0 {
-        pos -= 1;
-        let char_idx = rope.byte_to_char(pos);
-        if let Some(ch) = rope.get_char(char_idx) {
-            if ch == '"' || ch == '\'' {
-                // Check if it's escaped
-                let mut escape_count = 0;
-                let mut check_pos = pos;
-                while check_pos > 0 {
-                    check_pos -= 1;
-                    let check_idx = rope.byte_to_char(check_pos);
-                    if let Some(check_ch) = rope.get_char(check_idx) {
-                        if check_ch == '\\' {
-                            escape_count += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                // If even number of escapes, this quote is not escaped
-                if escape_count % 2 == 0 {
-                    // Check for triple quotes
-                    if pos >= 2 {
-                        let idx1 = rope.byte_to_char(pos.saturating_sub(1));
-                        let idx2 = rope.byte_to_char(pos.saturating_sub(2));
-                        if let (Some(ch1), Some(ch2)) = (rope.get_char(idx1), rope.get_char(idx2)) {
-                            if ch1 == ch && ch2 == ch {
-                                // Found triple quote
-                                is_triple_quote = true;
-                                in_string = !in_string;
-                                if in_string {
-                                    string_start = pos.saturating_sub(2);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Regular single/double quote
-                    if !is_triple_quote {
-                        in_string = !in_string;
-                        if in_string {
-                            string_start = pos;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if !in_string {
-        return false;
-    }
-
-    // Check if this is an f-string (f"..." or F"...")
-    let mut check_start = string_start;
-    if string_start > 0 {
-        let char_before_quote_idx = rope.byte_to_char(string_start.saturating_sub(1));
-        if let Some(ch_before) = rope.get_char(char_before_quote_idx) {
-            if ch_before == 'f' || ch_before == 'F' {
-                // This is an f-string, adjust search start to before the 'f'
-                check_start = string_start.saturating_sub(1);
-            }
-        }
-    }
-
-    // Now look backwards from check_start to find if there's a SQL function call
-    // We need to look for patterns like: .sql( or .execute( etc.
-    // Increased from 200 to 1000 bytes to handle longer multiline strings
-    let search_start = check_start.saturating_sub(1000);
-    // `search_start`/`check_start` are BYTE offsets. ropey's slice() is
-    // CHAR-indexed and would panic once a multi-byte char precedes check_start
-    // (byte offset > len_chars()). Convert to char indices; byte_to_char rounds
-    // the (possibly mid-char) search_start down to a boundary and clamps.
-    let len_bytes = rope.len_bytes();
-    let cstart = rope.byte_to_char(search_start.min(len_bytes));
-    let cend = rope.byte_to_char(check_start.min(len_bytes));
-    let search_text = rope.slice(cstart..cend).to_string();
-
-    // Check if any SQL pattern appears near the string start
-    for pattern in SQL_PATTERNS {
-        if search_text.ends_with(pattern) {
-            return true;
-        }
-
-        // Also check with whitespace between pattern and quote
-        if let Some(trimmed_pos) = search_text.trim_end().rfind(pattern) {
-            let after_pattern = &search_text[trimmed_pos + pattern.len()..];
-            if after_pattern.trim().is_empty() {
-                return true;
-            }
-        }
-    }
-
-    false
+/// Which SQL the string holds, from the call it is passed to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SqlDialect {
+    /// abp's `sf.sql(...)` or `sf.submit(...)`: Snowflake.
+    Snowflake,
+    /// `db.sql`, `.execute`, `.query`, `read_sql*` and the like: DuckDB, Spark
+    /// or another database.
+    Other,
 }
 
-/// Check if cursor is inside any string (helper function)
-fn is_in_string(rope: &Rope, cursor_pos: usize) -> bool {
-    let mut pos = 0;
-    let mut in_double_quote = false;
-    let mut in_single_quote = false;
+/// The caret inside an SQL string in Python: the dialect, and the name being
+/// typed there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddedSql {
+    pub dialect: SqlDialect,
+    pub completion: SqlCompletion,
+}
 
-    while pos < cursor_pos && pos < rope.len_bytes() {
-        let char_idx = rope.byte_to_char(pos);
-        if let Some(ch) = rope.get_char(char_idx) {
-            // Check for escape sequences
-            if ch == '\\' && pos + 1 < rope.len_bytes() {
-                pos += ch.len_utf8();
-                if let Ok(next_char_idx) = rope.try_byte_to_char(pos) {
-                    if let Some(next_ch) = rope.get_char(next_char_idx) {
-                        pos += next_ch.len_utf8();
-                    }
+/// One string literal in Python source.
+struct PyString {
+    /// Where the literal starts, prefix included (`f` of `f"..."`).
+    start: usize,
+    /// Where its text starts and ends (end is None when the source ends inside it).
+    text_start: usize,
+    text_end: Option<usize>,
+    is_f: bool,
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Walk Python source, calling `on_string` for each string literal outside
+/// comments. A literal the source ends inside comes last, with no end.
+fn python_strings(code: &str, mut on_string: impl FnMut(&PyString)) {
+    let b = code.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'#' => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
                 }
-                continue;
             }
-
-            if ch == '"' && !in_single_quote {
-                in_double_quote = !in_double_quote;
-            } else if ch == '\'' && !in_double_quote {
-                in_single_quote = !in_single_quote;
+            q @ (b'"' | b'\'') => {
+                // A prefix: up to two of r, b, u, f right before the quote,
+                // not the tail of a longer name.
+                let mut start = i;
+                while start > 0 && i - start < 2 && b"rRbBuUfF".contains(&b[start - 1]) {
+                    start -= 1;
+                }
+                if start > 0 && is_ident_byte(b[start - 1]) {
+                    start = i; // e.g. `elif'...'` can't happen; a name ending in f isn't a prefix
+                }
+                let is_f = b[start..i].iter().any(|&c| c == b'f' || c == b'F');
+                let triple = i + 2 < n && b[i + 1] == q && b[i + 2] == q;
+                let text_start = if triple { i + 3 } else { i + 1 };
+                let mut j = text_start;
+                let text_end = loop {
+                    if j >= n {
+                        break None;
+                    }
+                    match b[j] {
+                        b'\\' => j += 2,
+                        c if c == q && (!triple || (j + 2 < n && b[j + 1] == q && b[j + 2] == q)) => {
+                            break Some(j);
+                        }
+                        b'\n' if !triple => break Some(j), // an unclosed one-line string ends here
+                        _ => j += 1,
+                    }
+                };
+                on_string(&PyString { start, text_start, text_end, is_f });
+                match text_end {
+                    None => return,
+                    Some(e) if b[e] == b'\n' => i = e,
+                    Some(e) => i = e + if triple { 3 } else { 1 },
+                }
             }
-
-            pos += ch.len_utf8();
-        } else {
-            break;
+            _ => i += 1,
         }
     }
+}
 
-    in_double_quote || in_single_quote
+/// The dotted name of the call whose first argument starts at `start`:
+/// `sf.sql` for `sf.sql(  "...`. None when the literal isn't right after `(`.
+fn callee_before(code: &str, start: usize) -> Option<&str> {
+    let before = code[..start].trim_end();
+    let before = before.strip_suffix('(')?.trim_end();
+    let name_start = before
+        .bytes()
+        .rev()
+        .take_while(|&c| is_ident_byte(c) || c == b'.')
+        .count();
+    let name = &before[before.len() - name_start..];
+    (!name.is_empty()).then_some(name)
+}
+
+/// The SQL dialect a call takes, or None when it isn't an SQL call.
+fn sql_call(callee: &str) -> Option<SqlDialect> {
+    let (object, method) = callee.rsplit_once('.')?;
+    match method {
+        "sql" | "submit" if object == "sf" => Some(SqlDialect::Snowflake),
+        "sql" | "execute" | "query" | "read_sql" | "read_sql_query" | "read_sql_table" => {
+            Some(SqlDialect::Other)
+        }
+        _ => None,
+    }
+}
+
+/// An f-string's text with its `{...}` fields blanked, as SQL to read.
+/// None when the text ends inside a field (that part is Python, not SQL).
+fn without_fields(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if depth == 0 && chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push('{');
+            }
+            '}' if depth == 0 && chars.peek() == Some(&'}') => {
+                chars.next();
+                out.push('}');
+            }
+            '{' => depth += 1,
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(' ');
+                }
+            }
+            _ if depth > 0 => {}
+            _ => out.push(c),
+        }
+    }
+    (depth == 0).then_some(out)
+}
+
+/// The caret at the end of `before` (the source up to it), inside the SQL
+/// string passed to an SQL call: its dialect and the name being typed. None
+/// anywhere else, including inside an SQL string literal or comment within
+/// the SQL, and inside an f-string's `{...}` field.
+pub fn embedded_sql_at(before: &str) -> Option<EmbeddedSql> {
+    let mut last: Option<(usize, usize, bool, bool)> = None;
+    python_strings(before, |s| last = Some((s.start, s.text_start, s.is_f, s.text_end.is_none())));
+    let (start, text_start, is_f, open) = last?;
+    if !open {
+        return None;
+    }
+    let dialect = sql_call(callee_before(before, start)?)?;
+    let text = &before[text_start..];
+    let sql = if is_f { without_fields(text)? } else { text.to_string() };
+    let completion = crate::sql_words::completion_context(&sql)?;
+    Some(EmbeddedSql { dialect, completion })
+}
+
+/// The Snowflake SQL a Python cell sends through abp: the text of each
+/// string literal passed to `sf.sql(...)` or `sf.submit(...)`, with an
+/// f-string's `{...}` fields blanked.
+pub fn snowflake_sql_in(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    python_strings(code, |s| {
+        let Some(end) = s.text_end else { return };
+        let is_snowflake = callee_before(code, s.start)
+            .and_then(sql_call)
+            .map_or(false, |d| d == SqlDialect::Snowflake);
+        if !is_snowflake {
+            return;
+        }
+        let text = &code[s.text_start..end];
+        let sql = if s.is_f { without_fields(text) } else { Some(text.to_string()) };
+        if let Some(sql) = sql {
+            out.push(sql);
+        }
+    });
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_sql_context_detection() {
-        // Test basic SQL context
-        let rope = Rope::from_str("db.sql(\"SELECT * FROM \")");
-        assert!(is_in_sql_context(&rope, 20)); // Inside the SQL string
-
-        // Test not in SQL context
-        let rope = Rope::from_str("print(\"hello\")");
-        assert!(!is_in_sql_context(&rope, 8)); // Inside a regular string
-
-        // Test Spark SQL context
-        let rope = Rope::from_str("spark.sql(\"SELECT \")");
-        assert!(is_in_sql_context(&rope, 15));
+    fn at(code: &str) -> Option<(SqlDialect, Option<String>, String)> {
+        embedded_sql_at(code).map(|e| (e.dialect, e.completion.qualifier, e.completion.prefix))
     }
 
     #[test]
-    fn multibyte_before_quote_does_not_panic() {
-        // Regression: a byte cursor offset was passed straight into ropey's
-        // char-indexed slice(). Multi-byte chars before the opening quote push
-        // the quote's BYTE offset past len_chars(), so the old slice(a..b)
-        // panicked at ropey rope.rs:952. Five 'é' (2 bytes each) before the
-        // quote, and only a couple of chars after it, guarantees byte offset >
-        // len_chars. Must not panic — and should still detect the .sql( pattern.
-        let rope = Rope::from_str("ééééé.sql(\"a");
-        assert!(rope.len_bytes() > rope.len_chars());
-        assert!(is_in_sql_context(&rope, rope.len_bytes()));
+    fn the_call_decides_the_dialect() {
+        assert_eq!(at("sf.sql(\"SELECT pa"), Some((SqlDialect::Snowflake, None, "pa".into())));
+        assert_eq!(at("qid = sf.submit('SELECT sc.pa"), Some((SqlDialect::Snowflake, Some("sc".into()), "pa".into())));
+        assert_eq!(at("db.sql(\"SELECT pa"), Some((SqlDialect::Other, None, "pa".into())));
+        assert_eq!(at("spark.sql(\"SELECT pa"), Some((SqlDialect::Other, None, "pa".into())));
+        assert_eq!(at("con.execute(\"\"\"\nSELECT pa"), Some((SqlDialect::Other, None, "pa".into())));
+        assert_eq!(at("print(\"SELECT pa"), None);
+        assert_eq!(at("x = \"SELECT pa"), None);
+    }
+
+    #[test]
+    fn python_is_read_as_python() {
+        // An apostrophe in a comment doesn't open a string.
+        assert_eq!(at("# don't\nsf.sql(\"SELECT pa"), Some((SqlDialect::Snowflake, None, "pa".into())));
+        // A closed string before the caret: not inside SQL.
+        assert_eq!(at("sf.sql(\"SELECT 1\")\nx = pa"), None);
+        // Triple quotes span lines and hold quotes of the other kind.
+        assert_eq!(at("sf.sql(f\"\"\"\nSELECT \"A\" FROM {tbl} t\nWHERE t.co"),
+                   Some((SqlDialect::Snowflake, Some("t".into()), "co".into())));
+        // Inside an f-string field is Python.
+        assert_eq!(at("sf.sql(f\"SELECT * FROM {tab"), None);
+        // Inside an SQL literal or comment within the SQL.
+        assert_eq!(at("sf.sql(\"SELECT * FROM t WHERE a = 'x"), None);
+        assert_eq!(at("sf.sql(\"\"\"SELECT 1 -- pa"), None);
+        // Multi-byte text before the call.
+        assert_eq!(at("x = 'ééé'\nsf.sql(\"SELECT pa"), Some((SqlDialect::Snowflake, None, "pa".into())));
+    }
+
+    #[test]
+    fn a_cells_snowflake_sql_is_found() {
+        let code = "sf.sql(\"ALTER SESSION SET QUERY_TAG = 'x'\", show=False)\n\
+                    db.sql(\"SELECT * FROM result\")\n\
+                    # sf.sql(\"SELECT dead FROM comment\")\n\
+                    qid = sf.submit(f\"\"\"SELECT a FROM {src} s\n  WHERE s.b = 1\"\"\")\n";
+        assert_eq!(
+            snowflake_sql_in(code),
+            vec!["ALTER SESSION SET QUERY_TAG = 'x'".to_string(), "SELECT a FROM   s\n  WHERE s.b = 1".to_string()]
+        );
     }
 }

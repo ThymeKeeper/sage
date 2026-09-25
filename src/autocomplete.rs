@@ -5,6 +5,25 @@ use crossterm::{
 };
 use std::io::{self, Write};
 
+/// SQL suggestions for the name being typed: the names known for this SQL
+/// first, then the dialect's stock words (not after a dot, where only names
+/// make sense). Case-sensitive.
+fn sql_suggestions(
+    c: &crate::sql_words::SqlCompletion,
+    names: &crate::sql_words::SessionWords,
+    stock: fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let mut suggestions = names.matches(c.qualifier.as_deref(), &c.prefix);
+    if c.qualifier.is_none() && !c.prefix.is_empty() {
+        for word in stock(&c.prefix) {
+            if !suggestions.contains(&word) {
+                suggestions.push(word);
+            }
+        }
+    }
+    suggestions
+}
+
 /// Autocomplete suggestions dropdown
 pub struct Autocomplete {
     suggestions: Vec<String>,
@@ -14,7 +33,12 @@ pub struct Autocomplete {
     dynamic_completions: Vec<String>, // Completions from Python namespace
     viewport_offset: usize, // Scroll offset for the visible window
     type_relationships: crate::kernel::TypeRelationships, // Type information for intelligent completion
-    sql_metadata: crate::kernel::SqlMetadata, // SQL metadata for SQL autocomplete
+    /// Snowflake SQL (SQL mode, and `sf.sql` strings in Python): names from
+    /// this session's queries (in memory only).
+    sql_session: crate::sql_words::SessionWords,
+    /// Other SQL in Python (`db.sql` and the like): the tables, columns and
+    /// functions the Python kernel reported after the last run.
+    other_sql_names: crate::sql_words::SessionWords,
 }
 
 impl Autocomplete {
@@ -27,8 +51,61 @@ impl Autocomplete {
             dynamic_completions: Vec::new(),
             viewport_offset: 0,
             type_relationships: crate::kernel::TypeRelationships::default(),
-            sql_metadata: crate::kernel::SqlMetadata::default(),
+            sql_session: crate::sql_words::SessionWords::default(),
+            other_sql_names: crate::sql_words::SessionWords::keep_all(),
         }
+    }
+
+    /// Remember the names in a Snowflake query that ran, and its result's
+    /// column names, for the rest of this sage session.
+    pub fn remember_sql(&mut self, sql: &str, result_columns: &[String]) {
+        self.sql_session.add_query(sql, result_columns);
+    }
+
+    /// SQL mode: suggestions for the name being typed (see `show_sql`).
+    pub fn update_sql(&mut self, completion: Option<&crate::sql_words::SqlCompletion>) {
+        let suggestions = completion.map(|c| {
+            sql_suggestions(c, &self.sql_session, crate::sql_words::stock_matches)
+        });
+        self.show_sql(completion, suggestions);
+    }
+
+    /// The caret in an SQL string in Python. Snowflake SQL (`sf.sql`) gets
+    /// what SQL mode gets; other SQL (`db.sql`) gets the tables, columns and
+    /// functions the kernel reported and the generic SQL words.
+    pub fn update_embedded_sql(&mut self, embedded: &crate::sql_context::EmbeddedSql) {
+        let c = &embedded.completion;
+        let suggestions = match embedded.dialect {
+            crate::sql_context::SqlDialect::Snowflake => {
+                sql_suggestions(c, &self.sql_session, crate::sql_words::stock_matches)
+            }
+            crate::sql_context::SqlDialect::Other => {
+                sql_suggestions(c, &self.other_sql_names, crate::sql_words::generic_matches)
+            }
+        };
+        self.show_sql(Some(c), Some(suggestions));
+    }
+
+    /// Show SQL suggestions, matched case-sensitively. Hidden when nothing is
+    /// typed yet (unless a dot has names known to follow it), and when the
+    /// only suggestion is what's already typed.
+    fn show_sql(&mut self, completion: Option<&crate::sql_words::SqlCompletion>, suggestions: Option<Vec<String>>) {
+        let (Some(c), Some(mut suggestions)) = (completion, suggestions) else {
+            self.hide();
+            return;
+        };
+        if c.prefix.is_empty() && c.qualifier.is_none() {
+            self.hide();
+            return;
+        }
+        self.filter_text = c.prefix.clone();
+        if suggestions.len() == 1 && suggestions[0] == c.prefix {
+            suggestions.clear();
+        }
+        self.visible = !suggestions.is_empty();
+        self.suggestions = suggestions;
+        self.selected_index = 0;
+        self.viewport_offset = 0;
     }
 
     /// Add dynamic completions from Python namespace
@@ -41,40 +118,15 @@ impl Autocomplete {
         self.type_relationships = type_relationships;
     }
 
-    /// Set SQL metadata for SQL autocomplete
+    /// The tables, columns (`table.column` and bare) and functions the Python
+    /// kernel found (DuckDB, Spark), offered for SQL in Python that isn't
+    /// Snowflake's. Replaces what the last run reported.
     pub fn set_sql_metadata(&mut self, sql_metadata: crate::kernel::SqlMetadata) {
-        self.sql_metadata = sql_metadata;
-    }
-
-    /// Get SQL keywords
-    fn get_sql_keywords() -> Vec<&'static str> {
-        vec![
-            // Core keywords
-            "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "EXISTS",
-            "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON", "USING",
-            "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
-            "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "TRUNCATE",
-            "CREATE", "ALTER", "DROP", "TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA",
-            "AS", "DISTINCT", "ALL", "UNION", "INTERSECT", "EXCEPT",
-            "CASE", "WHEN", "THEN", "ELSE", "END",
-            "IS", "NULL", "BETWEEN", "LIKE", "ILIKE", "SIMILAR", "TO",
-            "WITH", "RECURSIVE", "CTE",
-            // Aggregates
-            "COUNT", "SUM", "AVG", "MIN", "MAX", "STDDEV", "VARIANCE",
-            "STRING_AGG", "ARRAY_AGG", "BOOL_AND", "BOOL_OR",
-            // Window functions
-            "OVER", "PARTITION", "ROW_NUMBER", "RANK", "DENSE_RANK",
-            "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE",
-            // Types (common)
-            "INTEGER", "INT", "BIGINT", "SMALLINT", "DECIMAL", "NUMERIC",
-            "FLOAT", "DOUBLE", "REAL", "VARCHAR", "CHAR", "TEXT",
-            "DATE", "TIME", "TIMESTAMP", "INTERVAL", "BOOLEAN", "BOOL",
-            "JSON", "JSONB", "ARRAY", "STRUCT", "MAP",
-            // Cast/convert
-            "CAST", "TRY_CAST", "CONVERT",
-            // Conditional
-            "COALESCE", "NULLIF", "IFNULL", "NVL",
-        ]
+        let mut names = crate::sql_words::SessionWords::keep_all();
+        for name in sql_metadata.tables.iter().chain(&sql_metadata.columns).chain(&sql_metadata.functions) {
+            names.add_name(name);
+        }
+        self.other_sql_names = names;
     }
 
     /// Get Python keywords and built-in functions
@@ -103,70 +155,31 @@ impl Autocomplete {
         ]
     }
 
-    /// Update suggestions with method chain context
+    /// Update suggestions for Python, with method chain context (SQL strings
+    /// go through `update_embedded_sql`).
     /// base_callable: Optional base function/method (e.g., "duckdb.sql" from "duckdb.sql(...).p")
     /// prefix: The prefix to filter by (e.g., "p" from "duckdb.sql(...).p")
-    /// is_sql_context: Whether we're inside a SQL string
-    pub fn update_with_context(&mut self, base_callable: Option<String>, prefix: &str, is_sql_context: bool) {
+    pub fn update_with_context(&mut self, base_callable: Option<String>, prefix: &str) {
         self.filter_text = prefix.to_string();
 
         // Debug output to file
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
-            let _ = writeln!(f, "DEBUG autocomplete: base_callable={:?}, prefix='{}', is_sql={}, dynamic_completions_count={}",
-                      base_callable, prefix, is_sql_context, self.dynamic_completions.len());
+            let _ = writeln!(f, "DEBUG autocomplete: base_callable={:?}, prefix='{}', dynamic_completions_count={}",
+                      base_callable, prefix, self.dynamic_completions.len());
             if !self.dynamic_completions.is_empty() {
                 let _ = writeln!(f, "DEBUG autocomplete: first 5 completions: {:?}",
                           &self.dynamic_completions[..self.dynamic_completions.len().min(5)]);
             }
         }
 
-        if prefix.is_empty() && base_callable.is_none() && !is_sql_context {
+        if prefix.is_empty() && base_callable.is_none() {
             self.suggestions.clear();
             self.visible = false;
             return;
         }
 
         let mut all_suggestions = Vec::new();
-
-        // If we're in SQL context, use SQL completions
-        if is_sql_context {
-            // Add SQL keywords
-            let sql_keywords = Self::get_sql_keywords();
-            for keyword in sql_keywords {
-                let keyword_str = keyword.to_string();
-                if prefix.is_empty() || keyword.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                    all_suggestions.push(keyword_str);
-                }
-            }
-
-            // Add SQL tables
-            for table in &self.sql_metadata.tables {
-                if prefix.is_empty() || table.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                    all_suggestions.push(table.clone());
-                }
-            }
-
-            // Add SQL columns
-            for column in &self.sql_metadata.columns {
-                if prefix.is_empty() || column.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                    all_suggestions.push(column.clone());
-                }
-            }
-
-            // Add SQL functions
-            for function in &self.sql_metadata.functions {
-                if prefix.is_empty() || function.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                    all_suggestions.push(function.clone());
-                }
-            }
-
-            self.suggestions = all_suggestions;
-            self.visible = !self.suggestions.is_empty();
-            self.selected_index = 0;
-            self.viewport_offset = 0;
-            return;
-        }
 
         // If we have a base callable, try to use type information
         if let Some(ref base) = base_callable {

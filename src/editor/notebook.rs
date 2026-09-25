@@ -93,16 +93,30 @@ impl Editor {
         }
     }
 
-    /// Get completion context for method chaining and SQL
-    /// Returns (base_callable, prefix, is_sql_context) for cases like:
-    /// - "duckdb.sql(...).p" -> (Some("duckdb.sql"), "p", false)
-    /// - db.sql("SELECT * FROM u") -> (None, "u", true)  [inside SQL string]
-    pub fn get_completion_context(&self) -> (Option<String>, String, bool) {
+    /// SQL mode: the name being typed at the caret (see
+    /// `sql_words::completion_context`); None inside a string or comment.
+    pub fn sql_completion_context(&self) -> Option<crate::sql_words::SqlCompletion> {
+        let rope = self.buffer.rope();
+        let end = self.cursor.min(rope.len_bytes());
+        let before = rope.byte_slice(..end).to_string();
+        crate::sql_words::completion_context(&before)
+    }
+
+    /// Python: the caret inside the SQL string of a call such as
+    /// `sf.sql("...")` or `db.sql("...")` (see `sql_context::embedded_sql_at`).
+    pub fn embedded_sql_context(&self) -> Option<crate::sql_context::EmbeddedSql> {
+        let rope = self.buffer.rope();
+        let end = self.cursor.min(rope.len_bytes());
+        let before = rope.byte_slice(..end).to_string();
+        crate::sql_context::embedded_sql_at(&before)
+    }
+
+    /// Get completion context for Python method chaining (SQL strings: see
+    /// `embedded_sql_context`). Returns (base_callable, prefix), e.g.
+    /// "duckdb.sql(...).p" -> (Some("duckdb.sql"), "p").
+    pub fn get_completion_context(&self) -> (Option<String>, String) {
         let rope = self.buffer.rope();
         let cursor_pos = self.cursor;
-
-        // Check if we're in a SQL string context
-        let is_sql_context = crate::sql_context::is_in_sql_context(rope, cursor_pos);
 
         // First, get the simple word at cursor
         let simple_word = self.get_word_at_cursor();
@@ -201,9 +215,9 @@ impl Editor {
                             // Debug logging
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
                                 use std::io::Write;
-                                let _ = writeln!(f, "DEBUG get_completion_context: FOUND METHOD CHAIN - base_callable='{}', prefix='{}', is_sql={}", base_callable, prefix, is_sql_context);
+                                let _ = writeln!(f, "DEBUG get_completion_context: FOUND METHOD CHAIN - base_callable='{}', prefix='{}'", base_callable, prefix);
                             }
-                            return (Some(base_callable), prefix.clone(), is_sql_context);
+                            return (Some(base_callable), prefix.clone());
                         }
                     }
                 }
@@ -214,9 +228,9 @@ impl Editor {
         // Debug logging
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sage_debug.log") {
             use std::io::Write;
-            let _ = writeln!(f, "DEBUG get_completion_context: NO METHOD CHAIN - base_callable=None, prefix='{}', is_sql={}", prefix, is_sql_context);
+            let _ = writeln!(f, "DEBUG get_completion_context: NO METHOD CHAIN - base_callable=None, prefix='{}'", prefix);
         }
-        (None, prefix, is_sql_context)
+        (None, prefix)
     }
 
     /// Update cells by parsing the buffer. Dispatch by language:
@@ -317,7 +331,7 @@ mod tests {
         let word = editor.get_word_at_cursor();
         assert_eq!(word, "café");
 
-        let (_base, prefix, _is_sql) = editor.get_completion_context();
+        let (_base, prefix) = editor.get_completion_context();
         assert_eq!(prefix, "café");
     }
 }

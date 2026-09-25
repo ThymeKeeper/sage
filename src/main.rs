@@ -18,6 +18,8 @@ mod output_pane;
 mod autocomplete;
 mod event_loop;
 mod sql_context;
+mod sql_words;
+mod sql_functions;
 mod normalize;
 mod help_screen;
 mod clipboard;
