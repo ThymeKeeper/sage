@@ -27,3 +27,6 @@ flate2 = "1.1.9"
 thiserror = "2.0.18"
 http = "1.4.1"
 url = "2.5.8"
+
+[profile.release]
+strip = true
