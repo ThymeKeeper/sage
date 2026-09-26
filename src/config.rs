@@ -12,6 +12,12 @@ pub struct Snippet {
 pub struct Config {
     #[serde(default)]
     pub snippets: Vec<Snippet>,
+    /// Terminal to run interactive scripts in (see
+    /// [`crate::external_term`]). On Unix a binary name — `kitty`,
+    /// `gnome-terminal`, `xterm`; on macOS an application — `iTerm`. Unset
+    /// means autodetect. `$SAGE_TERMINAL` overrides it.
+    #[serde(default)]
+    pub terminal: Option<String>,
 }
 
 impl Config {

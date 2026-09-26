@@ -54,6 +54,7 @@ Sage lets you write and execute Python code in cells, just like Jupyter notebook
 
 - **Interactive mode**: Edit and execute cells in a live session
 - **Headless execution**: Run notebooks from the command line
+- **Terminal lane**: Scripts that read stdin get their own terminal window
 - **Error handling**: Clear tracebacks, stops on errors
 - **Output persistence**: Results stay visible until cleared
 
@@ -81,6 +82,38 @@ Execute without opening the editor:
 sage --execute myfile.py
 sage --execute myfile.py --python /path/to/python3
 ```
+
+### Interactive Scripts
+
+Sage holds the terminal in raw mode, so a cell that reads from stdin — `input()`,
+`getpass`, a `termios`/`curses` key reader — can't be given a usable tty by the
+session. Sage detects these and launches them in their own terminal window
+instead, then returns immediately; the kernel is left untouched and the window
+stays open on exit so you can read the output.
+
+The terminal is autodetected (kitty, alacritty, ghostty, wezterm, foot,
+gnome-terminal, konsole, xfce4-terminal, xterm; Terminal.app on macOS; a console
+window on Windows). To pin one:
+
+```bash
+SAGE_TERMINAL=alacritty sage myscript.py
+```
+
+or in `~/.config/sage/config.toml`:
+
+```toml
+terminal = "alacritty"
+```
+
+With no display to open a window on (a bare console, a plain ssh session), the
+script falls back to running with no stdin, and the output pane says why.
+
+Scripts run out-of-process (in a terminal, or as a standalone app) keep the
+identity they'd have under a plain `python yourfile.py`: `__file__`,
+`sys.argv[0]`, and `sys.path[0]` point at the file you're editing, the working
+directory is its folder — so sibling imports and relative data paths work — and
+tracebacks name your file and show the lines that actually ran, even with
+unsaved edits.
 
 Autocomplete automatically shows:
 - **Tables**: `users`, `orders`, etc.

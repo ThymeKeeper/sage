@@ -91,8 +91,17 @@ impl Editor {
         }
         // Large files will initialize viewport on first render
 
-        // Enable REPL mode and auto-connect a kernel based on the file extension.
-        // .sql -> Snowflake (if configured); .py/.pyw -> Python interpreter.
+        self.auto_setup_repl(path);
+
+        Ok(())
+    }
+
+    /// Enable REPL mode and auto-connect a kernel based on the file extension.
+    /// .sql -> Snowflake (if configured); .py/.pyw -> Python interpreter;
+    /// .sh/.bash/.zsh -> persistent shell session. Called both when loading an
+    /// existing file and when opening a path that doesn't exist yet (a new
+    /// script), so Ctrl+E works the same in either case.
+    fn auto_setup_repl(&mut self, path: &str) {
         if let Some(ext) = Path::new(path).extension() {
             if ext == "sql" {
                 self.enable_repl_mode();
@@ -108,10 +117,13 @@ impl Editor {
                 if !self.is_kernel_connected() {
                     self.auto_connect_kernel();
                 }
+            } else if ext == "sh" || ext == "bash" || ext == "zsh" {
+                self.enable_repl_mode();
+                if !self.is_kernel_connected() {
+                    self.try_connect_shell_kernel(path);
+                }
             }
         }
-
-        Ok(())
     }
 
     /// Try to build and connect a SnowflakeKernel from the user's config
@@ -141,6 +153,74 @@ impl Editor {
             Err(e) => {
                 self.status_message = Some((
                     format!("Snowflake config not loaded: {} (add C:\\.dotfile\\snowflake.toml)", e),
+                    true,
+                ));
+            }
+        }
+    }
+
+    /// Connect a persistent shell session for a shell script. The shell is
+    /// picked from the script's shebang when one names a discovered shell,
+    /// then the file's extension (`.zsh` prefers zsh), then whatever
+    /// discovery ranked first (bash before zsh before sh). Silently requires
+    /// nothing beyond a shell on PATH; Ctrl+K can still swap it.
+    fn try_connect_shell_kernel(&mut self, path: &str) {
+        let kernels = crate::shell_kernel::discover_shell_kernels();
+        if kernels.is_empty() {
+            self.status_message = Some((
+                "No shell found on PATH (looked for bash, zsh, sh)".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        // Basename the shebang interpreter ("/usr/bin/env zsh" and
+        // "/bin/zsh" both come back as a name/path from detect_shebang).
+        let shebang_shell = self.detect_shebang().and_then(|interp| {
+            Path::new(&interp)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        });
+        let ext_shell = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| *e == "bash" || *e == "zsh")
+            .map(str::to_string);
+
+        let wanted = shebang_shell.or(ext_shell);
+        let info = wanted
+            .and_then(|name| {
+                kernels
+                    .iter()
+                    .find(|k| k.display_name == format!("Shell ({})", name))
+                    .cloned()
+            })
+            .unwrap_or_else(|| kernels[0].clone());
+
+        // The file itself may not exist yet (a new script opened by path), so
+        // resolve the directory rather than the file. An empty parent means
+        // a bare relative filename — that's the current directory.
+        let workdir = {
+            let parent = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty());
+            let dir = parent.unwrap_or(Path::new("."));
+            std::fs::canonicalize(dir).ok()
+        };
+        let mut kernel = crate::shell_kernel::ShellKernel::new(
+            info.python_path.clone(),
+            info.display_name.clone(),
+        )
+        .with_workdir(workdir);
+
+        match kernel.connect() {
+            Ok(()) => {
+                let display = info.display_name.clone();
+                self.set_kernel(Box::new(kernel));
+                self.status_message =
+                    Some((format!("Auto-connected to {}", display), false));
+            }
+            Err(e) => {
+                self.status_message = Some((
+                    format!("Shell auto-connect failed: {} (press Ctrl+K to pick another shell)", e),
                     true,
                 ));
             }
@@ -458,6 +538,7 @@ impl Editor {
         self.text_view_origin = None;
         self.file_path = Some(PathBuf::from(path));
         self.syntax.set_language_from_path(path);
+        self.auto_setup_repl(path);
     }
 
     /// Ctrl+Y → Spreadsheet (CSV / TSV): show this text as a grid. Reads the

@@ -326,7 +326,15 @@ impl ExitPrompt {
                 }
                 
                 let old_option = self.selected_option;
-                
+
+                // Shortcut letters/digits only count unchorded: a Ctrl+D
+                // (shell-reflex EOF) or Ctrl+S landing in this prompt must not
+                // silently re-target the selection — least of all onto
+                // "exit without saving".
+                let chorded = key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                );
+
                 match key.code {
                     KeyCode::Enter => {
                         return Ok(self.selected_option);
@@ -349,13 +357,13 @@ impl ExitPrompt {
                         };
                     }
                     // Number shortcuts
-                    KeyCode::Char('1') => self.selected_option = ExitOption::Save,
-                    KeyCode::Char('2') => self.selected_option = ExitOption::ExitWithoutSaving,
-                    KeyCode::Char('3') => self.selected_option = ExitOption::Cancel,
+                    KeyCode::Char('1') if !chorded => self.selected_option = ExitOption::Save,
+                    KeyCode::Char('2') if !chorded => self.selected_option = ExitOption::ExitWithoutSaving,
+                    KeyCode::Char('3') if !chorded => self.selected_option = ExitOption::Cancel,
                     // Letter shortcuts
-                    KeyCode::Char('s') | KeyCode::Char('S') => self.selected_option = ExitOption::Save,
-                    KeyCode::Char('d') | KeyCode::Char('D') => self.selected_option = ExitOption::ExitWithoutSaving,
-                    KeyCode::Char('c') | KeyCode::Char('C') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('s') | KeyCode::Char('S') if !chorded => self.selected_option = ExitOption::Save,
+                    KeyCode::Char('d') | KeyCode::Char('D') if !chorded => self.selected_option = ExitOption::ExitWithoutSaving,
+                    KeyCode::Char('c') | KeyCode::Char('C') if !chorded => {
                         self.selected_option = ExitOption::Cancel;
                     }
                     _ => {}

@@ -190,6 +190,275 @@ pub fn is_standalone_program(code: &str) -> bool {
     false
 }
 
+/// True if `code` needs a real terminal — it reads from stdin or drives the
+/// tty directly, so there is no way to run it inside sage at all.
+///
+/// sage owns the terminal in raw mode, so neither execution lane can hand a
+/// program a usable tty:
+/// - in the shared kernel, the REPL reads its own protocol off stdin, so a
+///   cell that calls `input()` steals the `SAGE_EXEC_END` delimiter and wedges
+///   the kernel until it's killed;
+/// - in the application lane, stdin is `Stdio::null()` and stdout is a pipe,
+///   so `input()` hits EOF immediately, `termios`/`curses` calls fail, and
+///   nothing is shown until the process is already over.
+///
+/// The host routes these to their own terminal window instead — see
+/// [`crate::external_term::launch_interactive`].
+///
+/// Any one of these trips it:
+/// - a call that blocks on stdin (`input(`, `getpass(`, `sys.stdin.read`, …),
+/// - an import of a module whose purpose is reading keys / driving the tty.
+///
+/// A plain `sys.stdin.isatty()` is deliberately *not* a signal: scripts use it
+/// to detect a tty and take a non-interactive path, which runs here fine.
+/// Full-line comments and triple-quoted blocks are skipped (a long docstring
+/// describing `input()` is the obvious false positive), and a name only counts
+/// when it starts at an identifier boundary, so `widget.input(` and
+/// `parse_input(` don't trip it.
+pub fn is_interactive_program(code: &str) -> bool {
+    /// Modules that exist to read keystrokes or drive the terminal directly.
+    const TTY_MODULES: &[&str] = &[
+        "termios", "tty", "curses", "msvcrt", "getpass", "readline",
+        "prompt_toolkit", "questionary", "inquirer", "blessed", "pwinput",
+    ];
+    /// Calls that block waiting for the user.
+    const STDIN_CALLS: &[&str] = &[
+        "input(", "raw_input(", "getpass(", "getpass.getpass(",
+        "sys.stdin.read", "sys.stdin.readline", "sys.stdin.fileno",
+        "sys.stdin.buffer", "click.prompt(", "click.confirm(", "click.pause(",
+        "Prompt.ask(", "Confirm.ask(", "curses.wrapper(",
+    ];
+
+    for line in code_lines(code) {
+        let line = line.trim();
+        if (line.starts_with("import ") || line.starts_with("from "))
+            && TTY_MODULES.iter().any(|m| starts_name_at_boundary(line, m))
+        {
+            return true;
+        }
+        if STDIN_CALLS.iter().any(|c| starts_name_at_boundary(line, c)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if this shell code talks to the user through the terminal — it calls
+/// the `read` builtin, drives a tty dialog tool, or touches `/dev/tty`
+/// directly. The shell counterpart of [`is_interactive_program`].
+///
+/// In the shell session kernel each cell is sourced with stdin redirected
+/// from /dev/null (to protect the protocol stream), so a `read` there can
+/// only fail with EOF. The host routes cells this detects to a real terminal
+/// window instead — see [`crate::external_term::launch_interactive_shell`].
+///
+/// Detection is per command position: each line is split on `;`, `|`, `&`, so
+/// `echo x; read y` trips it but `readlink`, `grep read file`, or a comment
+/// mentioning `read` does not.
+pub fn is_interactive_shell(code: &str) -> bool {
+    /// Commands whose purpose is asking the user something on the tty, plus
+    /// full-screen tty programs (pagers, editors, monitors) that are
+    /// unusable without one.
+    const TTY_COMMANDS: &[&str] = &[
+        "read", "select", "dialog", "whiptail", "stty",
+        "less", "more", "vim", "vi", "nvim", "nano", "emacs", "top", "htop", "fzf",
+    ];
+
+    for (cmd, _seg, line) in shell_commands(code) {
+        if line.contains("/dev/tty") {
+            return true;
+        }
+        if TTY_COMMANDS.contains(&cmd.as_str()) {
+            // `while read line` fed by a pipe or redirect isn't the user
+            // typing — it's the standard file-reading idiom. Only a read
+            // whose stdin would be the terminal counts, so any line with
+            // a `<` redirect or a `|` feeding the read is skipped.
+            if cmd == "read" && (line.contains('<') || line.contains('|')) {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// True if this shell code starts something that intentionally never returns —
+/// a dev server, a file watcher, a log follower. The shell counterpart of
+/// [`is_standalone_program`]: run in the session kernel such a cell would sit
+/// at "Executing..." forever with its output invisible (the pane only paints
+/// when the cell finishes), so the host gives it its own terminal window where
+/// the logs stream live and Ctrl+C means what it always means.
+pub fn is_longrunning_shell(code: &str) -> bool {
+    /// Commands that ARE a foreground server / watcher.
+    const SERVER_COMMANDS: &[&str] = &[
+        "uvicorn", "gunicorn", "uwsgi", "hypercorn", "daphne",
+        "flask", "streamlit", "jupyter", "caddy", "live-server", "http-server",
+        "vite", "webpack-dev-server", "watch",
+    ];
+
+    for (cmd, seg, _line) in shell_commands(code) {
+        if SERVER_COMMANDS.contains(&cmd.as_str()) {
+            return true;
+        }
+        let mut words = seg.split_whitespace();
+        let _ = words.next();
+        let sub = words.next().unwrap_or("");
+        match cmd.as_str() {
+            // tail -f / journalctl -f follow forever.
+            "tail" | "journalctl" => {
+                if seg.split_whitespace().any(|w| w == "-f" || w == "-F" || w == "--follow") {
+                    return true;
+                }
+            }
+            // python -m http.server, php -S: stdlib one-line servers.
+            "python" | "python3" => {
+                if seg.contains("http.server") {
+                    return true;
+                }
+            }
+            "php" => {
+                if seg.split_whitespace().any(|w| w == "-S") {
+                    return true;
+                }
+            }
+            // npm start / npm run dev / yarn dev / pnpm serve …
+            "npm" | "yarn" | "pnpm" | "bun" => {
+                let target = if sub == "run" { words.next().unwrap_or("") } else { sub };
+                if matches!(target, "start" | "dev" | "serve" | "watch") {
+                    return true;
+                }
+            }
+            // docker compose up in the foreground (no -d) streams logs forever.
+            "docker" | "docker-compose" | "podman" | "podman-compose" => {
+                if seg.split_whitespace().any(|w| w == "up")
+                    && !seg.split_whitespace().any(|w| w == "-d" || w == "--detach")
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The command-position segments of each shell line, as
+/// `(command, segment, line)` — the command word (basenamed, so
+/// `/usr/bin/uvicorn` reads as `uvicorn`), the segment it heads, and the full
+/// line it came from. Lines are split on `;`, `|`, `&` so every command
+/// position is seen; full-line `#` comments are dropped; wrapper words that
+/// still leave the real command next (`if`, `while`, `sudo`, `nohup`, `exec`,
+/// leading `VAR=value` assignments, …) are stripped. Deliberately not a shell
+/// parser — just enough for the heuristics above.
+fn shell_commands(code: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for raw in code.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        for seg in line.split(|c| c == ';' || c == '|' || c == '&') {
+            let mut seg = seg.trim();
+            loop {
+                let Some((head, rest)) = seg.split_once(char::is_whitespace) else { break };
+                let is_wrapper = matches!(
+                    head,
+                    "if" | "while" | "until" | "then" | "elif" | "do" | "else"
+                        | "sudo" | "command" | "builtin" | "exec" | "nohup" | "time" | "env"
+                ) || head.contains('=');
+                if is_wrapper {
+                    seg = rest.trim_start();
+                } else {
+                    break;
+                }
+            }
+            let cmd = seg.split_whitespace().next().unwrap_or("");
+            let cmd = cmd.rsplit('/').next().unwrap_or(cmd);
+            out.push((cmd.to_string(), seg.to_string(), line.to_string()));
+        }
+    }
+    out
+}
+
+/// True if `needle` occurs in `line` starting at an identifier boundary — the
+/// character before it is not a letter, digit, `_`, or `.`. Keeps `input(`
+/// from matching `parse_input(` or `self.input(`.
+fn starts_name_at_boundary(line: &str, needle: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(needle) {
+        let at = from + rel;
+        let ok = at == 0
+            || !(bytes[at - 1].is_ascii_alphanumeric()
+                || bytes[at - 1] == b'_'
+                || bytes[at - 1] == b'.');
+        if ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// The code-bearing part of each line: full-line `#` comments are dropped and
+/// the bodies of triple-quoted blocks (docstrings) are skipped. Deliberately
+/// not a lexer — it tracks only the outermost `'''`/`"""` run, which is enough
+/// to keep prose out of the heuristics above.
+fn code_lines(code: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut open: Option<&str> = None;
+
+    for raw in code.lines() {
+        let mut rest = raw.trim();
+
+        // Inside a docstring: nothing counts until the closing quotes, and
+        // only what follows them on that line is code.
+        if let Some(quote) = open {
+            match rest.find(quote) {
+                Some(pos) => {
+                    rest = rest[pos + quote.len()..].trim();
+                    open = None;
+                }
+                None => continue,
+            }
+        }
+
+        if rest.starts_with('#') {
+            continue;
+        }
+
+        // Does this line leave a triple-quoted block open? Walk the quote runs
+        // it contains; an odd count means the last one is still open.
+        let mut scan = rest;
+        while let Some((pos, quote)) = next_triple_quote(scan) {
+            let after = &scan[pos + quote.len()..];
+            match after.find(quote) {
+                Some(end) => scan = &after[end + quote.len()..],
+                None => {
+                    open = Some(quote);
+                    rest = rest[..rest.len() - scan.len() + pos].trim_end();
+                    break;
+                }
+            }
+        }
+
+        if !rest.is_empty() {
+            out.push(rest);
+        }
+    }
+    out
+}
+
+/// The first `'''` or `"""` in `text`, as (byte offset, the quote matched).
+fn next_triple_quote(text: &str) -> Option<(usize, &'static str)> {
+    let single = text.find("'''").map(|p| (p, "'''"));
+    let double = text.find("\"\"\"").map(|p| (p, "\"\"\""));
+    match (single, double) {
+        (Some(s), Some(d)) => Some(if s.0 <= d.0 { s } else { d }),
+        (s, d) => s.or(d),
+    }
+}
+
 /// SQL title marker: a line comment beginning with `--##`. It's a valid SQL
 /// line comment, so it has no effect on execution.
 pub const TITLE_MARKER: &str = "--##";
@@ -364,6 +633,96 @@ mod tests {
         assert!(!is_standalone_program("import seaborn as sns\nsns.histplot(x)\n"));
         // A framework name only inside a comment must not trip it.
         assert!(!is_standalone_program("# import pygame would be an app\nx = 1\n"));
+    }
+
+    #[test]
+    fn interactive_program_detection() {
+        // Anything that blocks on stdin → its own terminal.
+        assert!(is_interactive_program("name = input('who? ')\n"));
+        assert!(is_interactive_program("input()\n"));
+        assert!(is_interactive_program("import getpass\np = getpass.getpass()\n"));
+        assert!(is_interactive_program("import termios\n"));
+        assert!(is_interactive_program("import curses, sys\n"));
+        assert!(is_interactive_program("from prompt_toolkit import prompt\n"));
+        assert!(is_interactive_program("data = sys.stdin.read()\n"));
+        assert!(is_interactive_program("if x:\n    y = input('? ')\n"));
+
+        // Ordinary analysis stays in the session.
+        assert!(!is_interactive_program(
+            "import pandas as pd\ndf = pd.read_csv('x.csv')\ndf.head()\n"
+        ));
+        // Detecting a tty is not the same as reading from one: this branch is
+        // exactly how a script avoids needing a terminal.
+        assert!(!is_interactive_program("if sys.stdin.isatty():\n    pass\n"));
+        // `input` as part of another name, or a method on some object.
+        assert!(!is_interactive_program("x = parse_input(raw)\n"));
+        assert!(!is_interactive_program("widget.input('a')\n"));
+        assert!(!is_interactive_program("user_input = 3\n"));
+        // Prose about input(), not a call.
+        assert!(!is_interactive_program("# ask with input('name: ')\nx = 1\n"));
+        assert!(!is_interactive_program(
+            "\"\"\"Reads config.\n\nUnlike input(), never blocks.\n\"\"\"\nx = 1\n"
+        ));
+        // ...but code after the docstring still counts.
+        assert!(is_interactive_program(
+            "\"\"\"Docs mentioning nothing.\"\"\"\nx = input('go: ')\n"
+        ));
+        // A single-line docstring must not leave the block open.
+        assert!(!is_interactive_program("'''one liner'''\nx = 1\n"));
+    }
+
+    #[test]
+    fn interactive_shell_detection() {
+        // Talking to the user → its own terminal window.
+        assert!(is_interactive_shell("echo 'name?'\nread name\n"));
+        assert!(is_interactive_shell("read -p 'continue? ' answer\n"));
+        assert!(is_interactive_shell("echo hi; read x\n"));
+        assert!(is_interactive_shell("if read line\nthen echo \"$line\"\nfi\n"));
+        assert!(is_interactive_shell("select opt in a b; do echo $opt; done\n"));
+        assert!(is_interactive_shell("whiptail --msgbox hello 10 40\n"));
+        assert!(is_interactive_shell("dialog --yesno 'ok?' 10 40\n"));
+        assert!(is_interactive_shell("stty -echo\n"));
+        assert!(is_interactive_shell("head -1 < /dev/tty\n"));
+
+        // Plain batch work stays in the session kernel.
+        assert!(!is_interactive_shell("echo hello\nls -la\n"));
+        assert!(!is_interactive_shell("readlink -f /usr/bin/sh\n"));
+        assert!(!is_interactive_shell("grep read notes.txt\n"));
+        assert!(!is_interactive_shell("# read the docs\necho ok\n"));
+        // The file-reading idiom: read fed by a redirect or pipe.
+        assert!(!is_interactive_shell("while read line; do echo $line; done < f.txt\n"));
+        assert!(!is_interactive_shell("cat f.txt | while read line; do echo $line; done\n"));
+    }
+
+    #[test]
+    fn longrunning_shell_detection() {
+        // Servers and watchers → their own terminal window.
+        assert!(is_longrunning_shell(
+            "source venv/bin/activate\nuvicorn main:app --host 0.0.0.0 --port 8000 --reload\n"
+        ));
+        assert!(is_longrunning_shell("/usr/local/bin/gunicorn app:app\n"));
+        assert!(is_longrunning_shell("npm start\n"));
+        assert!(is_longrunning_shell("npm run dev\n"));
+        assert!(is_longrunning_shell("yarn dev\n"));
+        assert!(is_longrunning_shell("python3 -m http.server 8080\n"));
+        assert!(is_longrunning_shell("php -S localhost:8000\n"));
+        assert!(is_longrunning_shell("tail -f /var/log/syslog\n"));
+        assert!(is_longrunning_shell("journalctl -f -u nginx\n"));
+        assert!(is_longrunning_shell("docker compose up\n"));
+        assert!(is_longrunning_shell("docker-compose up\n"));
+        assert!(is_longrunning_shell("PORT=8000 nohup uvicorn main:app\n"));
+
+        // Batch work stays in the session kernel.
+        assert!(!is_longrunning_shell("echo hello\nls -la\n"));
+        assert!(!is_longrunning_shell("npm install\n"));
+        assert!(!is_longrunning_shell("npm run build\n"));
+        assert!(!is_longrunning_shell("tail -n 20 log.txt\n"));
+        assert!(!is_longrunning_shell("docker compose up -d\n"));
+        assert!(!is_longrunning_shell("docker compose build\n"));
+        assert!(!is_longrunning_shell("python3 script.py\n"));
+        // Server names in comments or as plain arguments don't count.
+        assert!(!is_longrunning_shell("# start uvicorn later\necho ok\n"));
+        assert!(!is_longrunning_shell("pip install uvicorn\n"));
     }
 
     /// Just the code strings a selection would run (drops the titles).

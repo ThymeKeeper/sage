@@ -661,6 +661,27 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 needs_redraw = true;
             }
             Event::Key(key) => {
+                // Opt-in key diagnostics: run `SAGE_KEY_DEBUG=1 sage ...` and
+                // every key event lands in <temp>/sage_key_debug.log exactly as
+                // crossterm delivered it — the ground truth for "this terminal
+                // strips the Ctrl modifier" reports. Logged before the release
+                // filter so the full stream is visible. Off by default: this is
+                // a keystroke log, and must never be one silently.
+                if std::env::var_os("SAGE_KEY_DEBUG").is_some() {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(std::env::temp_dir().join("sage_key_debug.log"))
+                    {
+                        use std::io::Write as _;
+                        let _ = writeln!(
+                            f,
+                            "code={:?} mods={:?} kind={:?}",
+                            key.code, key.modifiers, key.kind
+                        );
+                    }
+                }
+
                 // Ignore key release events (both Windows and other platforms)
                 if key.kind == event::KeyEventKind::Release {
                     continue;
@@ -936,6 +957,28 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
                     }
                     continue; // Skip normal command processing
+                }
+
+                // While the output pane has focus (Esc toggles it), the editor
+                // buffer is not what the user is looking at — plain typing
+                // must not edit it invisibly. Swallow the pure text-entry keys
+                // here; chorded commands (Ctrl+S, Ctrl+E, the pane's own
+                // Ctrl+C copy) and navigation keys still flow to their
+                // handlers below, which check pane focus themselves.
+                if output_pane_visible && output_pane.is_focused() {
+                    let is_text_entry = match key.code {
+                        KeyCode::Char(_) => !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ),
+                        KeyCode::Enter => !key.modifiers.contains(KeyModifiers::CONTROL),
+                        KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab | KeyCode::BackTab => {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if is_text_entry {
+                        continue;
+                    }
                 }
 
                 let cmd = match key.code {
@@ -1264,11 +1307,17 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         commands::Command::None
                     }
 
-                    // Execute Cell (Ctrl+E as alternative)
-                    KeyCode::Char('e') | KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Execute Cell (Ctrl+E as alternative). F5 does the same
+                    // with no modifier involved at all, so it survives
+                    // terminals that swallow or strip Ctrl; Char('\u{0005}')
+                    // is Ctrl+E delivered as its raw C0 byte by terminals
+                    // that report the control character as the codepoint.
+                    KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::F(5) | KeyCode::Char('\u{0005}')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            || matches!(key.code, KeyCode::F(5) | KeyCode::Char('\u{0005}')) => {
                         // Only allow execution in REPL-mode languages (Python or SQL).
                         if !editor.is_repl_mode() {
-                            editor.status_message = Some(("Cell execution only available in REPL mode (Python/SQL). Press Ctrl+Y to switch language.".to_string(), true));
+                            editor.status_message = Some(("Cell execution only available in REPL mode (Python/SQL/Shell). Press Ctrl+Y to switch language.".to_string(), true));
                             needs_redraw = true;
                         } else if execution_rx.is_some() {
                             // Check if already executing
@@ -1324,8 +1373,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     KeyCode::Char('k') | KeyCode::Char('K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Allow kernel selection in REPL-mode languages (Python or SQL).
                         let lang = *editor.get_language();
-                        if lang != syntax::Language::Python && lang != syntax::Language::Sql {
-                            editor.status_message = Some(("Kernel selection only available in REPL mode (Python/SQL). Press Ctrl+Y to switch language.".to_string(), true));
+                        if lang != syntax::Language::Python
+                            && lang != syntax::Language::Sql
+                            && lang != syntax::Language::Shell
+                        {
+                            editor.status_message = Some(("Kernel selection only available in REPL mode (Python/SQL/Shell). Press Ctrl+Y to switch language.".to_string(), true));
                             commands::Command::None
                         } else {
                         // Show loading message (status bar only: a full
@@ -1551,6 +1603,38 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                                     }
                                 }
                                 // Show output pane for SQL
+                                output_pane_visible = true;
+                            } else if language == syntax::Language::Shell {
+                                // Enable REPL mode for Shell and auto-connect a
+                                // shell session. Mirrors the Python branch.
+                                if !editor.is_repl_mode() {
+                                    if !editor.is_kernel_connected() {
+                                        let shells = crate::shell_kernel::discover_shell_kernels();
+                                        if let Some(info) = shells.into_iter().next() {
+                                            let mut new_kernel: Box<dyn kernel::Kernel> = Box::new(
+                                                crate::shell_kernel::ShellKernel::new(
+                                                    info.python_path.clone(),
+                                                    info.display_name.clone(),
+                                                )
+                                            );
+                                            if new_kernel.connect().is_ok() {
+                                                editor.set_kernel(new_kernel);
+                                                editor.enable_repl_mode();
+                                                editor.status_message = Some((format!("Shell mode enabled with {}", info.display_name), false));
+                                            } else {
+                                                editor.enable_repl_mode();
+                                                editor.status_message = Some(("Shell mode enabled. Press Ctrl+K to select a shell.".to_string(), false));
+                                            }
+                                        } else {
+                                            editor.enable_repl_mode();
+                                            editor.status_message = Some(("Shell mode enabled but no shell found on PATH.".to_string(), true));
+                                        }
+                                    } else {
+                                        editor.enable_repl_mode();
+                                        editor.status_message = Some(("Switched to Shell mode with REPL enabled".to_string(), false));
+                                    }
+                                }
+                                // Show output pane for Shell
                                 output_pane_visible = true;
                             } else {
                                 // Disable REPL mode for other languages
@@ -1832,7 +1916,34 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         }
                         commands::Command::None
                     }
-                    KeyCode::Char(c) => commands::Command::InsertChar(c),
+                    // A C0 control character that reached the plain-char lane
+                    // is a mis-parsed control chord (a terminal delivering,
+                    // say, Ctrl+A as \x01 with no modifier flag), never typed
+                    // text — dropping it beats invisibly corrupting the buffer.
+                    KeyCode::Char(c) if c.is_control() => commands::Command::None,
+                    // A chorded letter that matched no binding above (Ctrl+G,
+                    // Alt+X, Super+L, ...) is a command sage doesn't have, not
+                    // text — inserting the bare letter would corrupt the buffer
+                    // invisibly. CONTROL+ALT together is the exception: that's
+                    // AltGr, which is how accented and symbol characters are
+                    // legitimately typed on many layouts.
+                    KeyCode::Char(c) => {
+                        let is_altgr = key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.modifiers.contains(KeyModifiers::ALT);
+                        let is_chord = !is_altgr
+                            && key.modifiers.intersects(
+                                KeyModifiers::CONTROL
+                                    | KeyModifiers::ALT
+                                    | KeyModifiers::SUPER
+                                    | KeyModifiers::META
+                                    | KeyModifiers::HYPER,
+                            );
+                        if is_chord {
+                            commands::Command::None
+                        } else {
+                            commands::Command::InsertChar(c)
+                        }
+                    }
                     KeyCode::Enter => {
                         // Ctrl+Enter = Execute cell (primary binding)
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2068,6 +2179,12 @@ fn spawn_background_execution(
     let selection = editor.selection();
     let cursor_offset = editor.cursor();  // Get byte offset, not line/col
     let is_sql = *editor.get_language() == crate::syntax::Language::Sql;
+    let is_shell = *editor.get_language() == crate::syntax::Language::Shell;
+    // The buffer's own file, for the out-of-process lanes: they run a temp copy
+    // of the code, and this is what lets that copy keep the script's identity
+    // (`__file__`, sibling imports, working directory). None for an unsaved
+    // buffer — there's nothing to point at.
+    let origin = editor.file_path().map(|p| p.to_path_buf());
 
     // Build the statements to run as (header_label, code). The label is a
     // title from the cell's marker line (`--##` for SQL, the `##--` delimiter
@@ -2125,6 +2242,96 @@ fn spawn_background_execution(
         return None;
     }
 
+    // Set when the terminal lane below wanted this cell but had nowhere to
+    // open a window: it forces the application lane (stdin nulled) instead of
+    // the shared kernel, and its text is prefixed to the output pane entry.
+    let mut lane_note: Option<String> = None;
+
+    // Terminal lane: code that talks to the user over stdin (see
+    // cell::is_interactive_program) has no home inside sage — sage holds the
+    // terminal in raw mode, the kernel reads its own protocol off stdin, and
+    // the application lane below nulls stdin entirely. Either way the script
+    // wedges or dies on EOF. Hand it to a terminal emulator instead, which
+    // gives it a real pty, and return immediately: the launch is
+    // fire-and-forget, so sage never enters "Executing..." for it and the
+    // kernel goes straight back untouched. This runs ahead of the application
+    // lane (an interactive program with a `__main__` guard belongs in a
+    // terminal, not on a null stdin) and applies to selections too, since a
+    // selected `input()` would hang the shared kernel just the same. SQL and
+    // the interpreter-less Snowflake kernel are skipped, as below.
+    // Shell flavor of the terminal lane: a script that talks to the user
+    // (`read`, dialog, stty — see cell::is_interactive_shell) or that starts
+    // a foreground server / watcher (uvicorn, npm dev, tail -f — see
+    // cell::is_longrunning_shell) gets a real terminal window. In the session
+    // kernel the first would EOF on its nulled stdin, and the second would sit
+    // at "Executing..." forever with its output invisible, since the pane
+    // only paints when the cell finishes.
+    if is_shell
+        && cells.len() == 1
+        && !kernel_info.python_path.is_empty()
+        && (crate::cell::is_interactive_shell(&cells[0].1)
+            || crate::cell::is_longrunning_shell(&cells[0].1))
+    {
+        match crate::external_term::launch_interactive_shell(
+            &kernel_info.python_path,
+            &cells[0].1,
+            origin.as_deref(),
+        ) {
+            Ok(terminal) => {
+                let kind = if crate::cell::is_interactive_shell(&cells[0].1) {
+                    "Interactive script"
+                } else {
+                    "Long-running script"
+                };
+                editor.set_kernel(kernel);
+                editor.status_message = Some((
+                    format!("{} — launched in {}", kind, terminal),
+                    false,
+                ));
+                return None;
+            }
+            Err(_) => {
+                // No terminal available. Fall through to the session kernel:
+                // the cell is sourced with stdin from /dev/null, so `read`
+                // fails fast with a visible error instead of wedging anything.
+            }
+        }
+    }
+
+    if !is_sql
+        && !is_shell
+        && cells.len() == 1
+        && !kernel_info.python_path.is_empty()
+        && crate::cell::is_interactive_program(&cells[0].1)
+    {
+        match crate::external_term::launch_interactive(
+            &kernel_info.python_path,
+            &cells[0].1,
+            origin.as_deref(),
+        ) {
+            Ok(terminal) => {
+                editor.set_kernel(kernel);
+                editor.status_message = Some((
+                    format!("Interactive script — launched in {}", terminal),
+                    false,
+                ));
+                return None;
+            }
+            Err(e) => {
+                // No terminal to run it in. Fall through to the application
+                // lane — never the shared kernel, whose stdin is the REPL's own
+                // protocol stream and would be eaten by the first read. The app
+                // lane can't interact with the script either, but it does
+                // surface whatever it prints before it gives up on stdin, and
+                // the note explains why an EOFError is about to appear.
+                lane_note = Some(format!(
+                    "[sage] Interactive script, but {} — ran with no stdin.",
+                    e
+                ));
+            }
+        }
+    }
+
     // Application lane: a single Python program that would take over its own
     // event loop (a GUI app / game — see cell::is_standalone_program) can't run
     // in the shared kernel without blocking the REPL thread for its whole
@@ -2137,14 +2344,17 @@ fn spawn_background_execution(
     // the app (soft cancel — the kernel is never touched and is handed straight
     // back via Done). Explicit selections and SQL always stay in-session; a
     // Snowflake kernel (empty python_path) has no interpreter to run, so skip.
+    // An interactive cell the terminal lane couldn't place (lane_note) lands
+    // here too, selection or not — a null stdin beats wedging the kernel.
     if !is_sql
-        && selection.is_none()
+        && !is_shell
         && cells.len() == 1
         && !kernel_info.python_path.is_empty()
-        && crate::cell::is_standalone_program(&cells[0].1)
+        && (lane_note.is_some()
+            || (selection.is_none() && crate::cell::is_standalone_program(&cells[0].1)))
     {
         let program = cells[0].1.clone();
-        match spawn_app_process(&kernel_info.python_path, &program) {
+        match spawn_app_process(&kernel_info.python_path, &program, origin.as_deref()) {
             Ok(child) => {
                 let cancel: Option<std::sync::Arc<dyn kernel::CancelHandle>> = Some(
                     std::sync::Arc::new(direct_kernel::ProcessKillHandle::new(child.id())),
@@ -2152,7 +2362,10 @@ fn spawn_background_execution(
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let start = std::time::Instant::now();
-                    let (output, is_error) = run_and_capture(child);
+                    let (mut output, is_error) = run_and_capture(child);
+                    if let Some(note) = lane_note {
+                        output = format!("{}\n{}", note, output);
+                    }
                     let _ = tx.send(ExecMsg::Cell {
                         label: "application".to_string(),
                         output,
@@ -2256,20 +2469,20 @@ fn spawn_background_execution(
 /// stdout/stderr piped so the host can capture them. The GUI window still
 /// appears; only the console is suppressed.
 ///
-/// The program is written to a temp `.py` so the child runs a real file (a
-/// correct `__file__`, tracebacks, and `__name__ == "__main__"`). It inherits
-/// none of sage's stdio — sage is a raw-mode TUI, and letting the child touch
-/// those terminal handles (or opening a new console against them) is what made
-/// an earlier version flash-and-die. `CREATE_NO_WINDOW` keeps it off sage's
-/// console entirely while still allowing its own GUI window.
-fn spawn_app_process(python_path: &str, source: &str) -> io::Result<std::process::Child> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static APP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = APP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("sage_app_{}_{}.py", std::process::id(), seq));
-    std::fs::File::create(&path)?.write_all(source.as_bytes())?;
+/// The program is written to a temp `.py` so the child runs a real file
+/// (tracebacks, and `__name__ == "__main__"`); `origin` — the buffer's own
+/// file, when it has one — is what keeps `__file__`, `sys.path[0]` and the
+/// working directory pointing at the user's script rather than the temp copy.
+/// It inherits none of sage's stdio — sage is a raw-mode TUI, and letting the
+/// child touch those terminal handles (or opening a new console against them)
+/// is what made an earlier version flash-and-die. `CREATE_NO_WINDOW` keeps it
+/// off sage's console entirely while still allowing its own GUI window.
+fn spawn_app_process(
+    python_path: &str,
+    source: &str,
+    origin: Option<&std::path::Path>,
+) -> io::Result<std::process::Child> {
+    let path = crate::external_term::write_program_temp(source, origin)?;
 
     let mut cmd = std::process::Command::new(python_path);
     cmd.arg(&path)

@@ -39,6 +39,10 @@ impl KernelSelector {
                 "Snowflake kernel not configured. Add C:\\.dotfile\\snowflake.toml."
                     .to_string(),
             ),
+            crate::syntax::Language::Shell => (
+                crate::shell_kernel::discover_shell_kernels(),
+                "No shell found on PATH (looked for bash, zsh, sh).".to_string(),
+            ),
             _ => (
                 all.into_iter()
                     .filter(|k| k.name != crate::kernel::SNOWFLAKE_KERNEL_NAME)

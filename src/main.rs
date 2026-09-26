@@ -8,8 +8,10 @@ mod exit_prompt;
 mod syntax;
 mod kernel;
 mod direct_kernel;
+mod shell_kernel;
 mod snowflake;
 mod cell;
+mod external_term;
 mod dsv;
 mod sql_split;
 mod kernel_selector;
@@ -125,6 +127,25 @@ fn execute_file(file_path: Option<String>, python_path: Option<String>) -> io::R
     if !std::path::Path::new(&file_path).exists() {
         eprintln!("Error: File '{}' not found", file_path);
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("File '{}' not found", file_path)));
+    }
+
+    // Shell scripts run under a shell, not the Python cell pipeline: hand the
+    // file to its shebang shell (or the first shell on PATH) with sage's own
+    // stdio, and exit with the script's status.
+    let ext = std::path::Path::new(&file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if matches!(ext, "sh" | "bash" | "zsh") {
+        let shell = parse_shebang(&file_path)
+            .filter(|p| std::path::Path::new(p).exists())
+            .or_else(shell_kernel::default_shell_path)
+            .ok_or_else(|| {
+                eprintln!("Error: No shell found to run '{}'", file_path);
+                io::Error::new(io::ErrorKind::NotFound, "No shell found")
+            })?;
+        let status = std::process::Command::new(&shell).arg(&file_path).status()?;
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     // Determine Python interpreter to use

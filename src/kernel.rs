@@ -150,6 +150,12 @@ pub trait Kernel: Send {
 /// `SnowflakeKernel::new` writes into its own `KernelInfo.name`.
 pub const SNOWFLAKE_KERNEL_NAME: &str = "snowflake";
 
+/// Sentinel value used in `KernelInfo::name` to mark a shell-session kernel
+/// (see `crate::shell_kernel`). As with the Snowflake sentinel, dispatch in
+/// `build_from_info` matches on it; the `python_path` field carries the shell
+/// binary's path.
+pub const SHELL_KERNEL_NAME: &str = "shell";
+
 /// Construct a concrete Kernel from a discovered `KernelInfo`. Dispatch is by
 /// `info.name`: the SNOWFLAKE_KERNEL_NAME sentinel builds a SnowflakeKernel
 /// (reloading config + token), everything else is treated as a Python
@@ -159,6 +165,11 @@ pub fn build_from_info(info: &KernelInfo) -> Result<Box<dyn Kernel>, Box<dyn Err
         let config = crate::snowflake::SnowflakeConfig::load()?;
         let k = crate::snowflake::SnowflakeKernel::new(config)?;
         Ok(Box::new(k))
+    } else if info.name == SHELL_KERNEL_NAME {
+        Ok(Box::new(crate::shell_kernel::ShellKernel::new(
+            info.python_path.clone(),
+            info.display_name.clone(),
+        )))
     } else {
         Ok(Box::new(crate::direct_kernel::DirectKernel::new(
             info.python_path.clone(),
