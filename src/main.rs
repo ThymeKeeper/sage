@@ -40,6 +40,11 @@ use crossterm::{
 };
 use std::io::{self, Write};
 
+/// mimalloc is faster than the system allocator for the many small, short-lived
+/// strings sage creates when loading large CSV files and query results.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn debug_log(msg: &str) {
     use std::fs::OpenOptions;
     let log_path = std::env::temp_dir().join("sage_debug.log");
