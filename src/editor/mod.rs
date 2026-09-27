@@ -128,6 +128,22 @@ impl Editor {
         self.spreadsheet.as_mut()
     }
 
+    /// Put text on the system clipboard (over SSH, the local one via OSC 52).
+    pub fn set_clipboard_text(&mut self, text: String) -> Result<(), String> {
+        self.clipboard.set_text(text)
+    }
+
+    /// The system clipboard's text.
+    pub fn clipboard_text(&mut self) -> Result<String, String> {
+        self.clipboard.get_text()
+    }
+
+    /// Swap in a clipboard for a test: none at all, or one held in memory.
+    #[cfg(test)]
+    pub fn set_clipboard_provider(&mut self, clipboard: ClipboardProvider) {
+        self.clipboard = clipboard;
+    }
+
     /// True while a CSV/TSV is drawn and edited as a grid. False in its text
     /// view, where the text editor shows the data instead.
     pub fn is_spreadsheet_mode(&self) -> bool {

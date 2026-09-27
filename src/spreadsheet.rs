@@ -172,6 +172,26 @@ pub struct Spreadsheet {
     /// `undo.len()` at the last save (or load); `None` once that state can't
     /// be reached again (a new change after undoing past it). Drives `modified`.
     save_point: Option<usize>,
+    /// The selection a click or drag on column letters or row numbers made,
+    /// while it stands: it tells Ctrl+= and Ctrl+- to act on whole columns or
+    /// rows even where the shape alone can't (a one-column file, say).
+    picked_lines: Option<PickedLines>,
+}
+
+/// Whole rows or columns picked by their numbers or letters, with the
+/// selection that made, so a later change to the selection retires it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PickedLines {
+    columns: bool,
+    anchor: Option<(usize, usize)>,
+    cursor: (usize, usize),
+}
+
+/// What Ctrl+= and Ctrl+- act on: display rows or columns, first to last.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Lines {
+    Rows(usize, usize),
+    Cols(usize, usize),
 }
 
 /// One cell of an undo step, addressed by file row so it holds under any
@@ -193,17 +213,62 @@ struct UndoStep {
     /// How the data grew to hold a value typed into a ghost cell; undo shrinks
     /// it back, redo grows it again.
     growth: Option<Growth>,
+    /// Rows or columns inserted or deleted (such a step changes no cells).
+    reshape: Option<Reshape>,
 }
 
-/// The data's shape before it grew to hold one typed cell.
-#[derive(Debug, Clone, Copy)]
+/// Rows or columns inserted or deleted (Ctrl+= / Ctrl+-). Each holds what the
+/// step's other direction needs: undo reverses it, redo carries it out again.
+/// Rows are file rows, as everywhere in undo; undo and redo run in order, so
+/// the row and column numbers of the steps around it stay true.
+enum Reshape {
+    /// `count` blank rows put in at file row `at`, shown from display row
+    /// `shown` while a filter or sort is on.
+    InsertRows { at: usize, count: usize, shown: usize },
+    DeleteRows(DeletedRows),
+    /// `count` blank columns put in at column `at`.
+    InsertCols { at: usize, count: usize },
+    DeleteCols(DeletedCols),
+}
+
+struct DeletedRows {
+    /// Each deleted row in file order: its file row, its display row while a
+    /// filter or sort was on, and (while deleted) its cells and null mask.
+    rows: Vec<(usize, Option<usize>, Vec<String>, Vec<bool>)>,
+    /// With the header deleted, the length the row that took its place had
+    /// before it was widened to the header's width.
+    header_len: Option<usize>,
+    /// Every row went, leaving an empty header row in their place.
+    emptied: bool,
+    /// With every row gone, the filters and sorts, which no column is left
+    /// to hold (one can be put on between an undo and a redo of this).
+    views: Option<(BTreeMap<usize, HashSet<String>>, Vec<(usize, bool)>)>,
+}
+
+struct DeletedCols {
+    at: usize,
+    count: usize,
+    /// (While deleted) each row the columns cut into, with the cells taken.
+    cells: Vec<(usize, Vec<String>, Vec<bool>)>,
+    widths: Vec<usize>,
+    /// Filters and sort levels (with their place in the sort order) on the
+    /// deleted columns, which went with them.
+    filters: Vec<(usize, HashSet<String>)>,
+    sorts: Vec<(usize, usize, bool)>,
+    /// With every column gone, how many (now empty) rows there were: the
+    /// grid is then an empty one, a single empty header row.
+    rows_before: Option<usize>,
+}
+
+/// The data's shape before it grew to hold typed or pasted cells.
+#[derive(Debug, Clone)]
 struct Growth {
     rows: usize,
     cols: usize,
     widths: usize,
-    /// The edited file row and its length before.
-    row: usize,
-    row_len: usize,
+    /// Data rows that already existed and were lengthened, each with its length
+    /// before (the header's is `cols`). A row listed twice is shortest first.
+    extended: Vec<(usize, usize)>,
 }
 
 /// How a cell orders in a sort: numbers (and ISO dates, as epoch seconds)
@@ -358,6 +423,7 @@ impl Spreadsheet {
             undo: Vec::new(),
             redo: Vec::new(),
             save_point: Some(0),
+            picked_lines: None,
         };
         ss.recompute_column_widths();
         Ok(ss)
@@ -397,6 +463,7 @@ impl Spreadsheet {
             undo: Vec::new(),
             redo: Vec::new(),
             save_point: Some(0),
+            picked_lines: None,
         }
     }
 
@@ -831,12 +898,13 @@ impl Spreadsheet {
         // of a short row) grows the data to hold it. Typing nothing grows
         // nothing, though a short row's missing cell becomes real, so an empty
         // commit turns it into an empty string just as it does a stored null.
-        let growth = if edit.text.is_empty() {
-            self.fill_short_row(r, c);
-            None
+        let mut growth = self.shape();
+        let grew = if edit.text.is_empty() {
+            self.fill_short_row(r, c, &mut growth)
         } else {
-            self.grow_to(r, c)
+            self.grow_to(r, c, &mut growth)
         };
+        let growth = grew.then_some(growth);
         // An edited cell holds a real value, never a null — even if the
         // committed text is empty (that's now an empty string).
         let was_null = self.file_is_null(r, c);
@@ -854,28 +922,36 @@ impl Spreadsheet {
                 changes: vec![CellChange { row: r, col: c, other: before, other_null: was_null }],
                 filter: None,
                 growth,
+                reshape: None,
             });
         }
         self.recompute_col_width(c);
     }
 
-    /// Grow the data so file cell (row, col) exists. New columns widen the
-    /// header; new rows are appended in file order (and shown at the bottom of
-    /// an active filter or sort); every other new cell is a null, which Save
-    /// writes as an empty field. Returns the shape before, or `None` if the
-    /// cell already existed.
-    fn grow_to(&mut self, row: usize, col: usize) -> Option<Growth> {
-        let exists = self.rows.get(row).map_or(false, |r| col < r.len());
-        if exists {
-            return None;
-        }
-        let before = Growth {
+    /// The data's shape now, for `grow_to` to record growth against.
+    fn shape(&self) -> Growth {
+        Growth {
             rows: self.rows.len(),
             cols: self.num_cols(),
             widths: self.column_widths.len(),
-            row,
-            row_len: self.rows.get(row).map_or(0, |r| r.len()),
-        };
+            extended: Vec::new(),
+        }
+    }
+
+    /// Grow the data so file cell (row, col) exists. New columns widen the
+    /// header; new rows are appended in file order (and shown at the bottom of
+    /// an active filter or sort); every other new cell is a null, which Save
+    /// writes as an empty field. `before` is the shape taken before the first
+    /// of the cells grown for one step; each existing row this lengthens is
+    /// noted in it, so undo can shrink them all back. Returns whether the data
+    /// grew (false if the cell already existed).
+    fn grow_to(&mut self, row: usize, col: usize, before: &mut Growth) -> bool {
+        // Past the header's width a cell only counts once the header covers it.
+        let exists = col < self.num_cols() && self.rows.get(row).map_or(false, |r| col < r.len());
+        if exists {
+            return false;
+        }
+        self.note_lengthened(row, before);
         while self.rows[0].len() <= col {
             self.rows[0].push(String::new());
             self.null_mask[0].push(true);
@@ -895,16 +971,28 @@ impl Spreadsheet {
             self.rows[row].push(String::new());
             self.null_mask[row].push(true);
         }
-        Some(before)
+        true
+    }
+
+    /// Note in `before` that file row `row` is about to be lengthened, if it
+    /// existed then. Rows appended since are truncated whole, and the header is
+    /// cut back to `cols`, so neither needs noting. A row's cells are grown
+    /// together, so checking the last entry keeps it to one per row.
+    fn note_lengthened(&self, row: usize, before: &mut Growth) {
+        if row > 0 && row < before.rows && before.extended.last().map(|&(r, _)| r) != Some(row) {
+            before.extended.push((row, self.rows[row].len()));
+        }
     }
 
     /// Undo a growth: back to the shape recorded before it.
     fn shrink(&mut self, g: &Growth) {
-        if let Some(r) = self.rows.get_mut(g.row) {
-            r.truncate(g.row_len);
-        }
-        if let Some(m) = self.null_mask.get_mut(g.row) {
-            m.truncate(g.row_len);
+        for &(row, len) in &g.extended {
+            if let Some(r) = self.rows.get_mut(row) {
+                r.truncate(len);
+            }
+            if let Some(m) = self.null_mask.get_mut(row) {
+                m.truncate(len);
+            }
         }
         self.rows.truncate(g.rows);
         self.null_mask.truncate(g.rows);
@@ -930,28 +1018,35 @@ impl Spreadsheet {
 
     /// Give a short row a real (null) cell at `col` when `col` is inside the
     /// header's width. A missing cell and a stored null look and save the same;
-    /// making it real lets Delete and edits treat both alike.
-    fn fill_short_row(&mut self, row: usize, col: usize) {
-        if col >= self.num_cols() {
-            return;
+    /// making it real lets Delete and edits treat both alike. The row is noted
+    /// in `before` as growth is, so undo shortens it again: a row left longer
+    /// than the header would keep later values past the header from Save.
+    /// Returns whether the row grew.
+    fn fill_short_row(&mut self, row: usize, col: usize, before: &mut Growth) -> bool {
+        if col >= self.num_cols() || self.rows.get(row).map_or(true, |r| col < r.len()) {
+            return false;
         }
+        self.note_lengthened(row, before);
         if let (Some(cells), Some(mask)) = (self.rows.get_mut(row), self.null_mask.get_mut(row)) {
             while cells.len() <= col {
                 cells.push(String::new());
                 mask.push(true);
             }
         }
+        true
     }
 
     pub fn clear_selection_content(&mut self) {
         let ((r0, c0), (r1, c1)) = self.selected_range();
         let mut changes = Vec::new();
+        let mut growth = self.shape();
+        let mut filled = false;
         // Display rows only: cells a filter hides are left alone, as in Excel.
         for display_row in r0..=r1 {
             let r = self.file_row(display_row);
             for c in c0..=c1 {
                 // A short row's missing cells clear like stored nulls.
-                self.fill_short_row(r, c);
+                filled |= self.fill_short_row(r, c, &mut growth);
                 // Clearing yields an empty string, not a null.
                 let was_null = self.file_is_null(r, c);
                 let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { continue };
@@ -965,18 +1060,442 @@ impl Spreadsheet {
                 changes.push(CellChange { row: r, col: c, other: before, other_null: was_null });
             }
         }
-        self.record(changes);
+        // A filled cell was a null, so it always cleared: filling comes with changes.
+        self.record_step(UndoStep { changes, filter: None, growth: filled.then_some(growth), reshape: None });
+    }
+
+    // --- Insert & delete rows and columns (Ctrl+= / Ctrl+-) --------------------
+
+    /// Note that the selection now is whole rows or columns picked by their
+    /// numbers or letters.
+    fn pick_lines(&mut self, columns: bool) {
+        self.picked_lines = Some(PickedLines { columns, anchor: self.selection_anchor, cursor: self.cursor });
+    }
+
+    /// What Ctrl+= and Ctrl+- act on: whole columns when they were picked by
+    /// their letters, or the selection runs the grid's full height (but not
+    /// its full width); otherwise the rows the selection or cursor covers.
+    fn selected_lines(&self) -> Lines {
+        let ((r0, c0), (r1, c1)) = self.selected_range();
+        let picked = self
+            .picked_lines
+            .filter(|p| p.anchor == self.selection_anchor && p.cursor == self.cursor)
+            .map(|p| p.columns);
+        let full_height = r0 == 0 && r1 + 1 >= self.num_rows();
+        let full_width = c0 == 0 && c1 + 1 >= self.num_cols();
+        let columns = picked.unwrap_or(self.has_selection() && full_height && !full_width);
+        if columns { Lines::Cols(c0, c1) } else { Lines::Rows(r0, r1) }
+    }
+
+    /// Insert blank rows above the selection, or blank columns left of it, as
+    /// many as it covers (Ctrl+=). Rows go into the file just above the
+    /// selection's top row and show where they went, whatever a filter or sort
+    /// would say, as an edit's row stays put. The selection moves onto them.
+    /// Nothing happens past the data, which is blank already. Refused (with
+    /// the reason) above the header row while a filter or sort is on, since
+    /// the header can't move then.
+    pub fn insert_lines(&mut self) -> Result<(), &'static str> {
+        if self.num_cols() == 0 {
+            return Ok(()); // an empty grid: every cell is a ghost
+        }
+        let mut reshape = match self.selected_lines() {
+            Lines::Rows(r0, r1) => {
+                if r0 >= self.num_rows() {
+                    return Ok(());
+                }
+                if r0 == 0 && self.view.is_some() {
+                    return Err("Can't insert above the header row while filtered or sorted");
+                }
+                Reshape::InsertRows { at: self.file_row(r0), count: r1 - r0 + 1, shown: r0 }
+            }
+            Lines::Cols(c0, c1) => {
+                if c0 >= self.num_cols() {
+                    return Ok(());
+                }
+                Reshape::InsertCols { at: c0, count: c1 - c0 + 1 }
+            }
+        };
+        let (anchor, cursor) = (self.selection_anchor, self.cursor);
+        self.reshape_forward(&mut reshape);
+        self.record_step(UndoStep { changes: Vec::new(), filter: None, growth: None, reshape: Some(reshape) });
+        // Keep the selection, now on the new rows or columns.
+        self.selection_anchor = anchor;
+        self.cursor = cursor;
+        Ok(())
+    }
+
+    /// Delete the rows or columns the selection covers (Ctrl+-). Like Delete,
+    /// it sees only the rows shown: rows a filter hides stay, and while a
+    /// filter or sort is on the header row stays too. Deleting a column drops
+    /// its filter and sort, so rows only its filter hid come back.
+    pub fn delete_lines(&mut self) {
+        if self.num_cols() == 0 {
+            return; // an empty grid: nothing to delete
+        }
+        let lines = self.selected_lines();
+        // Land where the deleted rows or columns were.
+        let col = match lines {
+            Lines::Cols(c0, _) => c0,
+            Lines::Rows(..) => self.cursor.1,
+        };
+        let mut reshape = match lines {
+            Lines::Rows(r0, r1) => {
+                let first = if self.view.is_some() { r0.max(1) } else { r0 };
+                let last = r1.min(self.num_rows().saturating_sub(1));
+                if first > last {
+                    return;
+                }
+                let mut rows: Vec<usize> = (first..=last).map(|d| self.file_row(d)).collect();
+                rows.sort_unstable();
+                let rows = rows.into_iter().map(|r| (r, None, Vec::new(), Vec::new())).collect();
+                Reshape::DeleteRows(DeletedRows { rows, header_len: None, emptied: false, views: None })
+            }
+            Lines::Cols(c0, c1) => {
+                let cols = self.num_cols();
+                if c0 >= cols {
+                    return;
+                }
+                let count = c1.min(cols - 1) - c0 + 1;
+                Reshape::DeleteCols(DeletedCols {
+                    at: c0,
+                    count,
+                    cells: Vec::new(),
+                    widths: Vec::new(),
+                    filters: Vec::new(),
+                    sorts: Vec::new(),
+                    rows_before: None,
+                })
+            }
+        };
+        let r0 = self.selected_range().0 .0;
+        self.reshape_forward(&mut reshape);
+        self.record_step(UndoStep { changes: Vec::new(), filter: None, growth: None, reshape: Some(reshape) });
+        self.selection_anchor = None;
+        self.cursor = (
+            r0.min(self.num_rows().saturating_sub(1)),
+            col.min(self.num_cols().saturating_sub(1)),
+        );
+    }
+
+    /// Carry out `reshape`, for a new step or a redo, leaving in it what undo needs.
+    fn reshape_forward(&mut self, reshape: &mut Reshape) {
+        match reshape {
+            Reshape::InsertRows { at, count, shown } => {
+                let (at, count) = (*at, *count);
+                let cols = self.num_cols();
+                self.rows.splice(at..at, std::iter::repeat_with(Vec::new).take(count));
+                self.null_mask.splice(at..at, std::iter::repeat_with(Vec::new).take(count));
+                if at == 0 {
+                    // A new header row: as wide as the old one, or the data
+                    // past its width would drop out of the file.
+                    self.rows[0] = vec![String::new(); cols];
+                    self.null_mask[0] = vec![true; cols];
+                }
+                if let Some(view) = self.view.as_mut() {
+                    for r in view.iter_mut() {
+                        if *r >= at {
+                            *r += count;
+                        }
+                    }
+                    let shown = (*shown).min(view.len());
+                    view.splice(shown..shown, at..at + count);
+                }
+                self.header_changed(at == 0);
+            }
+            Reshape::DeleteRows(d) => self.delete_file_rows(d),
+            Reshape::InsertCols { at, count } => {
+                let (at, count) = (*at, *count);
+                for (row, mask) in self.rows.iter_mut().zip(self.null_mask.iter_mut()) {
+                    if row.len() > at {
+                        row.splice(at..at, std::iter::repeat_with(String::new).take(count));
+                        mask.splice(at..at, std::iter::repeat(true).take(count));
+                    }
+                }
+                let w = at.min(self.column_widths.len());
+                self.column_widths.splice(w..w, std::iter::repeat(GHOST_COL_WIDTH).take(count));
+                self.shift_columns(at, count as isize);
+            }
+            Reshape::DeleteCols(d) => self.delete_cols(d),
+        }
+    }
+
+    /// Reverse `reshape`, for an undo, leaving in it what redo needs.
+    fn reshape_back(&mut self, reshape: &mut Reshape) {
+        match reshape {
+            Reshape::InsertRows { at, count, .. } => {
+                let (at, count) = (*at, *count);
+                self.rows.drain(at..at + count);
+                self.null_mask.drain(at..at + count);
+                if let Some(view) = self.view.as_mut() {
+                    view.retain(|&r| r < at || r >= at + count);
+                    for r in view.iter_mut() {
+                        if *r >= at + count {
+                            *r -= count;
+                        }
+                    }
+                }
+                if at == 0 && self.view.is_some() {
+                    // The old header is the header again (a filter put on
+                    // since may have hidden it as a data row): it leads the view.
+                    self.rebuild_view_keeping_column();
+                }
+                self.header_changed(at == 0);
+            }
+            Reshape::DeleteRows(d) => self.restore_file_rows(d),
+            Reshape::InsertCols { at, count } => {
+                let (at, count) = (*at, *count);
+                // A filter or sort put on the new columns since goes with them.
+                let dropped = self.drop_column_views(at, count);
+                self.shift_columns(at + count, -(count as isize));
+                for (row, mask) in self.rows.iter_mut().zip(self.null_mask.iter_mut()) {
+                    if row.len() > at {
+                        let end = (at + count).min(row.len());
+                        row.drain(at..end);
+                        mask.drain(at..end.min(mask.len()));
+                    }
+                }
+                let w = at.min(self.column_widths.len());
+                let end = (at + count).min(self.column_widths.len());
+                self.column_widths.drain(w..end);
+                if dropped {
+                    self.rebuild_view_keeping_column();
+                }
+            }
+            Reshape::DeleteCols(d) => self.restore_cols(d),
+        }
+    }
+
+    /// Delete the file rows `d` lists (in file order), keeping their cells and
+    /// display rows in it for undo.
+    fn delete_file_rows(&mut self, d: &mut DeletedRows) {
+        let n = self.rows.len();
+        let cols = self.num_cols();
+        let mut gone = vec![false; n];
+        for &(r, ..) in &d.rows {
+            gone[r] = true;
+        }
+        if let Some(view) = &self.view {
+            for (shown, &r) in view.iter().enumerate() {
+                if gone[r] {
+                    if let Ok(i) = d.rows.binary_search_by_key(&r, |e| e.0) {
+                        d.rows[i].1 = Some(shown);
+                    }
+                }
+            }
+        }
+        let rows = std::mem::take(&mut self.rows);
+        let masks = std::mem::take(&mut self.null_mask);
+        let mut moved_to = vec![usize::MAX; n];
+        let mut next = 0;
+        for (r, (row, mask)) in rows.into_iter().zip(masks).enumerate() {
+            if gone[r] {
+                d.rows[next].2 = row;
+                d.rows[next].3 = mask;
+                next += 1;
+            } else {
+                moved_to[r] = self.rows.len();
+                self.rows.push(row);
+                self.null_mask.push(mask);
+            }
+        }
+        if let Some(view) = self.view.as_mut() {
+            *view = view.iter().filter(|&&r| !gone[r]).map(|&r| moved_to[r]).collect();
+        }
+        if self.rows.is_empty() {
+            // Every row went: an empty grid, as a new file starts. No column
+            // is left to hold a filter or sort, so they go with the rows.
+            self.rows.push(Vec::new());
+            self.null_mask.push(Vec::new());
+            d.emptied = true;
+            d.views = Some((std::mem::take(&mut self.filters), std::mem::take(&mut self.sorts)));
+            self.view = None;
+        } else if gone[0] {
+            // The next row is the header now; widen it to the old header's
+            // width, or the data past its end would drop out of the file.
+            d.header_len = Some(self.rows[0].len());
+            while self.rows[0].len() < cols {
+                self.rows[0].push(String::new());
+                self.null_mask[0].push(true);
+            }
+        }
+        if gone[0] && self.view.is_some() {
+            self.rebuild_view_keeping_column(); // the header leads the view
+        }
+        self.header_changed(gone[0]);
+    }
+
+    /// Put back the rows `delete_file_rows` took, where they were in the file
+    /// and (while a filter or sort is on) on screen.
+    fn restore_file_rows(&mut self, d: &mut DeletedRows) {
+        if d.emptied {
+            self.rows.clear();
+            self.null_mask.clear();
+            if let Some((filters, sorts)) = d.views.take() {
+                self.filters = filters;
+                self.sorts = sorts;
+            }
+            self.view = None; // rebuilt below, once the rows are back
+            d.emptied = false;
+        } else if let Some(len) = d.header_len.take() {
+            self.rows[0].truncate(len);
+            self.null_mask[0].truncate(len);
+        }
+        let header_back = d.rows.first().map_or(false, |e| e.0 == 0);
+        let survivors = std::mem::take(&mut self.rows).into_iter().zip(std::mem::take(&mut self.null_mask));
+        let mut survivors = survivors.peekable();
+        let total = survivors.len() + d.rows.len();
+        let mut moved_to = Vec::with_capacity(total - d.rows.len());
+        let mut deleted = d.rows.iter_mut().peekable();
+        for r in 0..total {
+            match deleted.next_if(|e| e.0 == r) {
+                Some(e) => {
+                    self.rows.push(std::mem::take(&mut e.2));
+                    self.null_mask.push(std::mem::take(&mut e.3));
+                }
+                None => {
+                    let (row, mask) = survivors.next().expect("a surviving row");
+                    moved_to.push(r);
+                    self.rows.push(row);
+                    self.null_mask.push(mask);
+                }
+            }
+        }
+        // A row deleted with no filter or sort on has no place in a view put
+        // on since: the view is rebuilt to take it.
+        let unplaced = self.view.is_some() && d.rows.iter().any(|e| e.1.is_none());
+        if let Some(view) = self.view.as_mut() {
+            // Back to where they showed, in one pass: the old view's rows,
+            // with each restored row put in at its display row.
+            let mut shown: Vec<(usize, usize)> = d.rows.iter().filter_map(|e| e.1.map(|s| (s, e.0))).collect();
+            shown.sort_unstable();
+            let mut shown = shown.into_iter().peekable();
+            let mut merged = Vec::with_capacity(view.len() + d.rows.len());
+            for &r in view.iter() {
+                while let Some((_, restored)) = shown.next_if(|&(s, _)| s <= merged.len()) {
+                    merged.push(restored);
+                }
+                merged.push(moved_to[r]);
+            }
+            merged.extend(shown.map(|(_, restored)| restored));
+            *view = merged;
+        }
+        for e in d.rows.iter_mut() {
+            e.1 = None;
+        }
+        // The header leads the view; and rows put back where no view placed them.
+        if (header_back || unplaced) && (self.is_filtered() || self.is_sorted()) {
+            self.rebuild_view_keeping_column();
+        }
+        self.header_changed(header_back);
+    }
+
+    /// Delete columns `d.at..d.at + d.count`, keeping their cells, widths,
+    /// filters and sort levels in `d` for undo.
+    fn delete_cols(&mut self, d: &mut DeletedCols) {
+        let (at, count) = (d.at, d.count);
+        for (r, (row, mask)) in self.rows.iter_mut().zip(self.null_mask.iter_mut()).enumerate() {
+            if row.len() > at {
+                let end = (at + count).min(row.len());
+                let cells = row.drain(at..end).collect();
+                let nulls = mask.drain(at..end.min(mask.len())).collect();
+                d.cells.push((r, cells, nulls));
+            }
+        }
+        let w = at.min(self.column_widths.len());
+        let end = (at + count).min(self.column_widths.len());
+        d.widths = self.column_widths.drain(w..end).collect();
+        for c in at..at + count {
+            if let Some(allowed) = self.filters.remove(&c) {
+                d.filters.push((c, allowed));
+            }
+        }
+        let mut level = 0;
+        self.sorts.retain(|&(c, descending)| {
+            let keep = c < at || c >= at + count;
+            if !keep {
+                d.sorts.push((level, c, descending));
+            }
+            level += 1;
+            keep
+        });
+        self.shift_columns(at + count, -(count as isize));
+        if self.num_cols() == 0 && self.rows.len() > 1 {
+            // Every column went: an empty grid, not rows of nothing that
+            // would come back as rows of "" once a column is typed again.
+            d.rows_before = Some(self.rows.len());
+            self.rows.truncate(1);
+            self.null_mask.truncate(1);
+        }
+        if !d.filters.is_empty() || !d.sorts.is_empty() {
+            self.rebuild_view_keeping_column();
+        }
+    }
+
+    /// Put back the columns `delete_cols` took, with their filters and sorts.
+    fn restore_cols(&mut self, d: &mut DeletedCols) {
+        let at = d.at;
+        if let Some(rows) = d.rows_before.take() {
+            self.rows.resize_with(rows, Vec::new);
+            self.null_mask.resize_with(rows, Vec::new);
+        }
+        self.shift_columns(at, d.count as isize);
+        for (r, cells, nulls) in d.cells.drain(..) {
+            self.rows[r].splice(at..at, cells);
+            self.null_mask[r].splice(at..at, nulls);
+        }
+        let w = at.min(self.column_widths.len());
+        self.column_widths.splice(w..w, d.widths.drain(..));
+        let refilter = !d.filters.is_empty() || !d.sorts.is_empty();
+        for (c, allowed) in d.filters.drain(..) {
+            self.filters.insert(c, allowed);
+        }
+        for (level, c, descending) in d.sorts.drain(..) {
+            let level = level.min(self.sorts.len());
+            self.sorts.insert(level, (c, descending));
+        }
+        if refilter {
+            self.rebuild_view_keeping_column();
+        }
+    }
+
+    /// Move the filters and sort levels on columns `from` and later by `by`.
+    fn shift_columns(&mut self, from: usize, by: isize) {
+        let shift = |c: usize| if c >= from { c.saturating_add_signed(by) } else { c };
+        self.filters = std::mem::take(&mut self.filters).into_iter().map(|(c, v)| (shift(c), v)).collect();
+        for (c, _) in self.sorts.iter_mut() {
+            *c = shift(*c);
+        }
+    }
+
+    /// Drop the filters and sort levels on columns `at..at + count`. Returns
+    /// whether there were any.
+    fn drop_column_views(&mut self, at: usize, count: usize) -> bool {
+        let before = self.filters.len() + self.sorts.len();
+        self.filters.retain(|&c, _| c < at || c >= at + count);
+        self.sorts.retain(|&(c, _)| c < at || c >= at + count);
+        before != self.filters.len() + self.sorts.len()
+    }
+
+    /// Re-apply the filters and sorts (their columns moved or went), keeping
+    /// the cursor's column.
+    fn rebuild_view_keeping_column(&mut self) {
+        let col = self.cursor.1;
+        self.rebuild_view();
+        self.cursor.1 = col;
+    }
+
+    /// Refit the columns after the header row changed, as it sizes them.
+    fn header_changed(&mut self, changed: bool) {
+        if changed {
+            self.recompute_column_widths();
+        }
     }
 
     // --- Undo / redo ---------------------------------------------------------
 
-    /// Push a change onto the undo history (nothing to record is a no-op).
-    fn record(&mut self, changes: Vec<CellChange>) {
-        self.record_step(UndoStep { changes, filter: None, growth: None });
-    }
-
+    /// Push a step onto the undo history (nothing to record is a no-op).
     fn record_step(&mut self, step: UndoStep) {
-        if step.changes.is_empty() {
+        if step.changes.is_empty() && step.reshape.is_none() {
             return;
         }
         // A new change after undoing past the save point makes that point
@@ -1044,7 +1563,7 @@ impl Spreadsheet {
                 .collect::<HashSet<String>>()
         });
         let filter = filter.map(|mapped| (col, self.filters.insert(col, mapped)));
-        self.record_step(UndoStep { changes, filter, growth: None });
+        self.record_step(UndoStep { changes, filter, growth: None, reshape: None });
         self.recompute_col_width(col);
         converted
     }
@@ -1058,8 +1577,11 @@ impl Spreadsheet {
         if let Some((col, stored)) = step.filter.as_mut() {
             self.swap_filter(*col, stored);
         }
-        if let Some(growth) = step.growth {
-            self.shrink(&growth);
+        if let Some(growth) = &step.growth {
+            self.shrink(growth);
+        }
+        if let Some(reshape) = step.reshape.as_mut() {
+            self.reshape_back(reshape);
         }
         self.finish_step(&step);
         self.redo.push(step);
@@ -1070,10 +1592,12 @@ impl Spreadsheet {
     /// Redo the last undone step (Ctrl+Shift+Z). Returns false with nothing to redo.
     pub fn redo(&mut self) -> bool {
         let Some(mut step) = self.redo.pop() else { return false };
+        // Grow back to the step's full extent: every changed cell that growth
+        // created (the rest already exist, so growing to them does nothing).
         if step.growth.is_some() {
-            if let Some(first) = step.changes.first() {
-                let (row, col) = (first.row, first.col);
-                self.grow_to(row, col);
+            let mut regrowth = self.shape();
+            for change in &step.changes {
+                self.grow_to(change.row, change.col, &mut regrowth);
             }
         }
         for change in step.changes.iter_mut() {
@@ -1081,6 +1605,9 @@ impl Spreadsheet {
         }
         if let Some((col, stored)) = step.filter.as_mut() {
             self.swap_filter(*col, stored);
+        }
+        if let Some(reshape) = step.reshape.as_mut() {
+            self.reshape_forward(reshape);
         }
         self.finish_step(&step);
         self.undo.push(step);
@@ -1113,7 +1640,32 @@ impl Spreadsheet {
                 self.cursor = (display_row, first.col);
             }
         }
+        // An insert or delete: onto where the rows or columns are (or were).
+        if let Some(reshape) = &step.reshape {
+            let (row, col) = match reshape {
+                Reshape::InsertRows { at, .. } => (Some(*at), None),
+                Reshape::DeleteRows(d) => (d.rows.first().map(|e| e.0), None),
+                Reshape::InsertCols { at, .. } => (None, Some(*at)),
+                Reshape::DeleteCols(d) => (None, Some(d.at)),
+            };
+            if let Some(display_row) = row.and_then(|r| self.display_row_of(r)) {
+                self.cursor.0 = display_row;
+            }
+            if let Some(col) = col {
+                self.cursor.1 = col;
+            }
+            self.cursor.0 = self.cursor.0.min(self.num_rows().saturating_sub(1));
+            self.cursor.1 = self.cursor.1.min(self.num_cols().saturating_sub(1));
+        }
         self.selection_anchor = None;
+    }
+
+    /// The display row showing file row `row`, if one does.
+    fn display_row_of(&self, row: usize) -> Option<usize> {
+        match &self.view {
+            None => (row < self.rows.len()).then_some(row),
+            Some(v) => v.iter().position(|&r| r == row),
+        }
     }
 
     pub fn copy_selection_tsv(&self) -> String {
@@ -1128,7 +1680,9 @@ impl Spreadsheet {
                     out.push('\t');
                 }
                 let cell = self.cell(r, c);
-                if cell.contains('\t') || cell.contains('\n') || cell.contains('"') {
+                // Quoted as Paste reads it back: a leading BOM would be taken
+                // for the clipboard's own.
+                if cell.contains(['\t', '\n', '\r', '"']) || cell.starts_with('\u{FEFF}') {
                     out.push('"');
                     out.push_str(&cell.replace('"', "\"\""));
                     out.push('"');
@@ -1137,7 +1691,92 @@ impl Spreadsheet {
                 }
             }
         }
+        // An empty last line would read as the trailing line end a paste drops;
+        // one more keeps it a row.
+        if r1 > r0 && out.ends_with('\n') {
+            out.push('\n');
+        }
         out
+    }
+
+    /// Paste clipboard text: into the cell being edited, or else as a block of
+    /// cells (tab-separated rows, as Copy writes and spreadsheets put on the
+    /// clipboard) at the selection's top-left, or the cursor.
+    ///
+    /// Like Copy and Delete, a paste sees only the rows the grid shows: block
+    /// row i goes to the i-th shown row, in the order shown, and rows a filter
+    /// hides are left alone. Past the last row or column it grows the data as
+    /// typing into a ghost cell does. One value fills a selection, and a
+    /// selection a whole number of blocks tall and wide is filled with copies
+    /// of the block. One undo step; the view isn't re-applied, as with an
+    /// edit; the pasted cells end selected.
+    pub fn paste(&mut self, text: &str) {
+        if self.editing.is_some() {
+            self.edit_paste(text);
+            return;
+        }
+        let block = parse_clipboard(text);
+        let h = block.len();
+        let w = block.iter().map(|line| line.len()).max().unwrap_or(1);
+        let ((r0, c0), (r1, c1)) = self.selected_range();
+        let (sel_h, sel_w) = (r1 - r0 + 1, c1 - c0 + 1);
+        let (out_h, out_w) = if self.has_selection() && sel_h % h == 0 && sel_w % w == 0 {
+            (sel_h, sel_w)
+        } else {
+            (h, w)
+        };
+        // The file row behind each target row, fixed before anything grows. A
+        // ghost row past the view maps to the row appended for it, and stays
+        // mapped as rows are appended (each is shown at the bottom of the view).
+        let targets: Vec<usize> = (r0..r0 + out_h).map(|d| self.file_row(d)).collect();
+        // Visit each value with its file row and column. A line shorter than
+        // the block leaves the cells past its end alone.
+        let each = |f: &mut dyn FnMut(usize, usize, &String)| {
+            for (i, &r) in targets.iter().enumerate() {
+                let line = &block[i % h];
+                for copy in 0..out_w / w {
+                    for (k, v) in line.iter().enumerate() {
+                        f(r, c0 + copy * w + k, v);
+                    }
+                }
+            }
+        };
+
+        // As with typing, only a value grows the data to hold it.
+        let mut growth = self.shape();
+        let mut grew = false;
+        each(&mut |r, c, v| {
+            if !v.is_empty() {
+                grew |= self.grow_to(r, c, &mut growth);
+            }
+        });
+
+        let mut changes = Vec::new();
+        each(&mut |r, c, v| {
+            let was_null = self.file_is_null(r, c);
+            // No cell here only for an empty value (past a short row, or a ghost).
+            let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { return };
+            // An empty value clears a cell as Delete does, but leaves an empty
+            // one (null or not) as it is: sage's Copy writes both as an empty
+            // field, so copying and pasting them changes nothing.
+            let unchanged = if v.is_empty() { cell.is_empty() } else { cell == v && !was_null };
+            if unchanged {
+                return;
+            }
+            let before = std::mem::replace(cell, v.clone());
+            if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
+                *m = false;
+            }
+            changes.push(CellChange { row: r, col: c, other: before, other_null: was_null });
+        });
+        // Only a written value grows the data, so growth always comes with changes.
+        let cols: std::collections::BTreeSet<usize> = changes.iter().map(|c| c.col).collect();
+        self.record_step(UndoStep { changes, filter: None, growth: grew.then_some(growth), reshape: None });
+        for col in cols {
+            self.recompute_col_width(col);
+        }
+        self.cursor = (r0, c0);
+        self.selection_anchor = (out_h > 1 || out_w > 1).then_some((r0 + out_h - 1, c0 + out_w - 1));
     }
 
     pub fn edit_insert_char(&mut self, ch: char) {
@@ -1253,6 +1892,10 @@ impl Spreadsheet {
 
     pub fn edit_paste(&mut self, text: &str) {
         let Some(edit) = self.editing.as_mut() else { return };
+        // Line ends as the grid stores them. A cell copied from a spreadsheet
+        // ends in one, which isn't part of its value.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = text.strip_suffix('\n').unwrap_or(&text);
         edit.delete_selection();
         edit.text.insert_str(edit.cursor, text);
         edit.cursor += text.len();
@@ -1365,6 +2008,7 @@ impl Spreadsheet {
             self.cursor = (0, col);
             self.selection_anchor = Some((last_row, col));
         }
+        self.pick_lines(true);
     }
 
     /// Extend an in-progress column-header drag to include column `col`.
@@ -1375,6 +2019,7 @@ impl Spreadsheet {
         let last_row = self.num_rows() - 1;
         let col = col.min(self.num_cols() - 1);
         self.selection_anchor = Some((last_row, col));
+        self.pick_lines(true);
     }
 
     /// Select the entire row `row`. Cursor lands at (row, 0); anchor at (row, last_col).
@@ -1391,6 +2036,7 @@ impl Spreadsheet {
             self.cursor = (row, 0);
             self.selection_anchor = Some((row, last_col));
         }
+        self.pick_lines(false);
     }
 
     /// Extend an in-progress row-number drag to include row `row`.
@@ -1401,6 +2047,7 @@ impl Spreadsheet {
         let last_col = self.num_cols() - 1;
         let row = row.min(self.num_rows() - 1);
         self.selection_anchor = Some((row, last_col));
+        self.pick_lines(false);
     }
 
     pub fn set_column_width(&mut self, col: usize, width: usize) {
@@ -1728,6 +2375,52 @@ fn detect_delimiter(path: &Path) -> u8 {
         Some(ext) if ext.eq_ignore_ascii_case("tsv") => b'\t',
         _ => b',',
     }
+}
+
+/// Split clipboard text into lines of fields: tab-separated, as Copy writes
+/// them and spreadsheets put cells on the clipboard, whatever the file's own
+/// delimiter. Line ends may be CRLF or CR; one trailing line end is dropped,
+/// and blank lines are kept (a line of one empty field). A field that starts
+/// with `"` is quoted, with `""` for a quote, and may hold tabs and line
+/// breaks; one whose quote doesn't end it (`"12" pipe`, or never closed) is
+/// plain text to the next tab or line break. Always at least one field.
+fn parse_clipboard(text: &str) -> Vec<Vec<String>> {
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut rest = text.strip_suffix('\n').unwrap_or(&text);
+    let mut lines = vec![Vec::new()];
+    loop {
+        let (field, after) = clipboard_field(rest);
+        lines.last_mut().expect("a line").push(field);
+        match after.as_bytes().first() {
+            Some(b'\t') => {}
+            Some(_) => lines.push(Vec::new()), // '\n'
+            None => return lines,
+        }
+        rest = &after[1..];
+    }
+}
+
+/// The field at the start of `s`, and the rest of `s` from the tab or line
+/// break that ends it (empty at the end of the text).
+fn clipboard_field(s: &str) -> (String, &str) {
+    if let Some(body) = s.strip_prefix('"') {
+        let mut value = String::new();
+        let mut from = 0;
+        while let Some(q) = body[from..].find('"').map(|i| from + i) {
+            value.push_str(&body[from..q]);
+            match body.as_bytes().get(q + 1) {
+                Some(b'"') => {
+                    value.push('"');
+                    from = q + 2;
+                }
+                None | Some(b'\t') | Some(b'\n') => return (value, &body[q + 1..]),
+                Some(_) => break,
+            }
+        }
+    }
+    let end = s.find(['\t', '\n']).unwrap_or(s.len());
+    (s[..end].to_string(), &s[end..])
 }
 
 fn cell_grid_width(s: &str) -> usize {
@@ -3153,5 +3846,693 @@ mod tests {
         ss.clear_selection_content();
         assert_eq!(ss.rows[2][0], "banana");
         assert_eq!((ss.rows[1][0].as_str(), ss.rows[3][0].as_str()), ("", ""));
+    }
+
+    // --- range paste ---
+
+    fn rows_of(ss: &Spreadsheet) -> Vec<Vec<String>> {
+        ss.rows.clone()
+    }
+
+    #[test]
+    fn clipboard_text_splits_on_tabs_and_lines_keeping_blank_lines_and_quoted_fields() {
+        let p = |t: &str| parse_clipboard(t);
+        let v = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+            rows.iter().map(|r| r.iter().map(|s| s.to_string()).collect()).collect()
+        };
+        // Excel's clipboard: CRLF after every row, the last one included.
+        assert_eq!(p("a\tb\r\n1\t2\r\n"), v(&[&["a", "b"], &["1", "2"]]));
+        // A blank cell in a one-column copy is a row, not a gap (sage's Copy and Excel's).
+        assert_eq!(p("a\n\nb"), v(&[&["a"], &[""], &["b"]]));
+        assert_eq!(p("a\r\n\r\nb\r\n"), v(&[&["a"], &[""], &["b"]]));
+        assert_eq!(p("a\t\n\tb"), v(&[&["a", ""], &["", "b"]]));
+        // Lone CR line ends, and a BOM.
+        assert_eq!(p("\u{FEFF}a\rb"), v(&[&["a"], &["b"]]));
+        // Quoted fields hold tabs, line breaks and doubled quotes, as Copy writes them.
+        assert_eq!(p("\"x\ty\"\t\"say \"\"hi\"\"\"\n\"two\r\nlines\"\tz"), v(&[&["x\ty", "say \"hi\""], &["two\nlines", "z"]]));
+        // A quote that doesn't end its field is text; an unclosed one doesn't swallow the rest.
+        assert_eq!(p("\"12\" pipe\t10\nx\ty"), v(&[&["\"12\" pipe", "10"], &["x", "y"]]));
+        assert_eq!(p("5'10\"\ta\n\"open\tb"), v(&[&["5'10\"", "a"], &["\"open", "b"]]));
+        // Nothing (or one line end) is one empty field: pasting it clears a cell.
+        assert_eq!(p(""), v(&[&[""]]));
+        assert_eq!(p("\r\n"), v(&[&[""]]));
+    }
+
+    #[test]
+    fn a_pasted_block_lands_at_the_cursor_selected_and_undoes_in_one_step() {
+        let mut ss = grid(&[&["a", "b", "c"], &["1", "2", "3"], &["4", "5", "6"]]);
+        ss.cursor = (1, 1);
+        ss.paste("x\ty\r\nz\tw\r\n");
+        assert_eq!(rows_of(&ss), vec![vec!["a", "b", "c"], vec!["1", "x", "y"], vec!["4", "z", "w"]]);
+        assert_eq!(ss.selected_range(), ((1, 1), (2, 2)));
+        assert_eq!(ss.cursor, (1, 1));
+        assert!(ss.is_modified());
+        assert!(ss.undo());
+        assert_eq!(saved(&mut ss), "a,b,c\n1,2,3\n4,5,6\n");
+        assert!(!ss.is_modified());
+        assert!(!ss.undo()); // one step
+        assert!(ss.redo());
+        assert_eq!(saved(&mut ss), "a,b,c\n1,x,y\n4,z,w\n");
+    }
+
+    #[test]
+    fn a_paste_under_a_filter_writes_only_the_visible_rows() {
+        let mut ss = grid(&[&["st", "who"], &["Open", "a"], &["Closed", "b"], &["Open", "c"], &["Closed", "d"], &["Open", "e"]]);
+        ss.set_filter(0, Some(set(&["Open"]))); // hides file rows 2 and 4
+        ss.cursor = (1, 1);
+        ss.paste("X\nY\nZ");
+        assert_eq!(saved(&mut ss), "st,who\nOpen,X\nClosed,b\nOpen,Y\nClosed,d\nOpen,Z\n");
+        // Exactly the pasted cells are selected: a rectangle of shown rows.
+        assert_eq!(ss.selected_range(), ((1, 1), (3, 1)));
+        assert!(ss.undo());
+        assert_eq!(saved(&mut ss), "st,who\nOpen,a\nClosed,b\nOpen,c\nClosed,d\nOpen,e\n");
+    }
+
+    #[test]
+    fn a_paste_under_a_sort_follows_the_order_shown() {
+        let mut ss = grid(&[&["n", "tag"], &["3", ""], &["1", ""], &["2", ""]]);
+        ss.sort_by(0, false); // shows 1 2 3: file rows 2 3 1
+        ss.cursor = (1, 1);
+        ss.paste("one\ntwo\nthree");
+        assert_eq!(column(&ss, 1), vec!["tag", "one", "two", "three"]);
+        assert_eq!(saved(&mut ss), "n,tag\n3,three\n1,one\n2,two\n");
+    }
+
+    #[test]
+    fn copy_then_paste_in_one_filtered_sorted_view_lines_up_row_for_row() {
+        let mut ss = grid(&[
+            &["gw", "n", "copy"],
+            &["YYC", "3", ""],
+            &["YYZ", "10", ""],
+            &["YYC", "1", ""],
+            &["YVR", "7", ""],
+            &["YYC", "2", ""],
+        ]);
+        ss.set_filter(0, Some(set(&["YYC"])));
+        ss.sort_by(1, true); // shows file rows 1 (3), 5 (2), 3 (1)
+        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (3, 1);
+        let clip = ss.copy_selection_tsv();
+        ss.selection_anchor = None;
+        ss.cursor = (1, 2);
+        ss.paste(&clip);
+        for r in 1..ss.rows.len() {
+            let (n, copy) = (&ss.rows[r][1], &ss.rows[r][2]);
+            assert!(copy.is_empty() || copy == n, "file row {r}: {n} vs {copy}");
+        }
+        assert_eq!(saved(&mut ss), "gw,n,copy\nYYC,3,3\nYYZ,10,\"\"\nYYC,1,1\nYVR,7,\"\"\nYYC,2,2\n");
+    }
+
+    #[test]
+    fn a_block_past_the_last_shown_row_appends_rows_and_undo_removes_them() {
+        let mut ss = grid(&[&["k", "v"], &["x", "1"], &["y", "2"], &["x", "3"]]);
+        ss.set_filter(0, Some(set(&["x"]))); // shows file rows 1 and 3
+        ss.cursor = (2, 1); // the last shown row
+        ss.paste("a\nb\nc");
+        assert_eq!(ss.rows.len(), 6); // two rows appended to the file
+        assert_eq!(column(&ss, 1), vec!["v", "1", "a", "b", "c"]); // shown under the view
+        assert_eq!(ss.selected_range(), ((2, 1), (4, 1)));
+        assert_eq!(saved(&mut ss), "k,v\nx,1\ny,2\nx,a\n,b\n,c\n");
+        assert!(ss.undo());
+        assert_eq!(ss.num_rows(), 3);
+        assert_eq!(saved(&mut ss), "k,v\nx,1\ny,2\nx,3\n");
+        assert!(ss.redo());
+        assert_eq!(saved(&mut ss), "k,v\nx,1\ny,2\nx,a\n,b\n,c\n");
+    }
+
+    #[test]
+    fn a_block_wider_than_the_data_adds_columns_and_undo_restores_every_row() {
+        let mut ss = grid(&[&["a", "b"], &["1", "2"], &["3", "4"]]);
+        ss.cursor = (1, 1);
+        ss.paste("p\tq\nr\ts");
+        assert_eq!(saved(&mut ss), "a,b,\n1,p,q\n3,r,s\n");
+        assert!(ss.undo());
+        assert_eq!(ss.num_cols(), 2);
+        assert!(ss.rows.iter().all(|r| r.len() == 2), "{:?}", ss.rows);
+        assert_eq!(saved(&mut ss), "a,b\n1,2\n3,4\n");
+        // A value typed into the ghost column afterwards still saves.
+        ss.move_to(1, 2, false);
+        ss.enter_edit_mode_replace('z');
+        ss.commit_edit();
+        assert_eq!(saved(&mut ss), "a,b,\n1,2,z\n3,4,\n");
+    }
+
+    #[test]
+    fn redo_of_a_paste_into_ghost_cells_regrows_every_cell() {
+        let mut ss = grid(&[&["a"], &["1"]]);
+        ss.cursor = (2, 1); // a ghost row and column
+        ss.paste("p\tq\nr\ts");
+        assert_eq!(saved(&mut ss), "a,,\n1,,\n,p,q\n,r,s\n");
+        assert!(ss.undo());
+        assert_eq!(saved(&mut ss), "a\n1\n");
+        assert!(ss.redo());
+        assert_eq!(saved(&mut ss), "a,,\n1,,\n,p,q\n,r,s\n");
+    }
+
+    #[test]
+    fn one_value_fills_the_visible_cells_of_a_selection() {
+        let mut ss = grid(&[&["k", "v"], &["x", "1"], &["y", "2"], &["x", "3"]]);
+        ss.set_filter(0, Some(set(&["x"])));
+        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (2, 1);
+        ss.paste("0\r\n");
+        assert_eq!(saved(&mut ss), "k,v\nx,0\ny,2\nx,0\n");
+        assert_eq!(ss.selected_range(), ((1, 1), (2, 1)));
+    }
+
+    #[test]
+    fn a_block_repeats_over_a_selection_it_divides_and_otherwise_pastes_once() {
+        let mut ss = grid(&[&["h"], &[""], &[""], &[""], &[""], &[""]]);
+        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (4, 0); // four rows: two copies of a two-row block
+        ss.paste("a\nb");
+        assert_eq!(column(&ss, 0), vec!["h", "a", "b", "a", "b", ""]);
+        // Three rows don't hold whole copies: the block goes once, at full size.
+        let mut ss = grid(&[&["h"], &[""], &[""], &[""], &[""], &[""]]);
+        ss.selection_anchor = Some((3, 0));
+        ss.cursor = (1, 0);
+        ss.paste("a\nb");
+        assert_eq!(column(&ss, 0), vec!["h", "a", "b", "", "", ""]);
+        assert_eq!(ss.selected_range(), ((1, 0), (2, 0)));
+    }
+
+    #[test]
+    fn empty_and_missing_fields_leave_empty_cells_alone_and_clear_values() {
+        let mut ss = Spreadsheet::from_text("a,b,c\n1,,\"\"\n4,5,6\n", b',', true).unwrap();
+        assert!(ss.is_null(1, 1) && !ss.is_null(1, 2));
+        ss.cursor = (1, 0);
+        // Row 1: empties over a value, a null and an empty string. Row 2 is
+        // short: its missing cells leave 5 and 6 alone.
+        ss.paste("\t\t\n7");
+        assert_eq!(saved(&mut ss), "a,b,c\n\"\",,\"\"\n7,5,6\n");
+        assert!(ss.is_null(1, 1));
+        // Pasting what's there already changes nothing and records nothing.
+        let mut same = grid(&[&["a", "b"], &["1", "2"]]);
+        same.cursor = (1, 0);
+        same.paste("1\t2");
+        assert!(!same.is_modified());
+        assert!(!same.undo());
+    }
+
+    #[test]
+    fn empty_values_never_grow_the_data() {
+        let mut ss = grid(&[&["a"], &["1"]]);
+        ss.cursor = (1, 0);
+        ss.paste("x\t\n\t");
+        assert_eq!(saved(&mut ss), "a\nx\n");
+        assert_eq!(ss.num_cols(), 1);
+    }
+
+    #[test]
+    fn a_paste_on_the_header_under_a_filter_continues_on_the_first_shown_row() {
+        let mut ss = grid(&[&["k"], &["y"], &["x"]]);
+        ss.set_filter(0, Some(set(&["x"])));
+        ss.cursor = (0, 0);
+        ss.paste("key\nX");
+        assert_eq!(saved(&mut ss), "key\ny\nX\n");
+    }
+
+    #[test]
+    fn a_paste_while_editing_goes_into_the_cell_without_its_line_end() {
+        let mut ss = grid(&[&["a"], &["1"]]);
+        ss.cursor = (1, 0);
+        ss.enter_edit_mode();
+        ss.paste("2\t3\r\n");
+        assert!(ss.is_editing());
+        ss.commit_edit();
+        assert_eq!(ss.cell(1, 0), "12\t3");
+    }
+
+    #[test]
+    fn copy_quotes_a_carriage_return_so_it_pastes_back_as_one_cell() {
+        let mut ss = grid(&[&["a", "b"], &["x\ry", "z"], &["", ""]]);
+        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (1, 1);
+        let clip = ss.copy_selection_tsv();
+        assert_eq!(clip, "\"x\ry\"\tz");
+        ss.selection_anchor = None;
+        ss.cursor = (2, 0);
+        ss.paste(&clip);
+        // Line ends are made LF on the way in, as everywhere in the grid.
+        assert_eq!((ss.cell(2, 0), ss.cell(2, 1)), ("x\ny", "z"));
+    }
+
+    #[test]
+    fn undoing_a_clear_of_short_rows_shortens_them_so_later_values_still_save() {
+        let mut ss = Spreadsheet::from_text("a,b\n1,2\n3,4\n", b',', false).unwrap();
+        ss.cursor = (1, 2);
+        ss.paste("p\tq\n\t"); // widens the header; row 2 stays short
+        ss.clear_selection_content(); // the pasted block is selected: row 2's missing cells become real
+        assert!(ss.undo() && ss.undo());
+        assert!(ss.rows.iter().all(|r| r.len() <= ss.num_cols()), "{:?}", ss.rows);
+        ss.selection_anchor = None;
+        ss.cursor = (2, 2);
+        ss.paste("v\tw");
+        assert_eq!(saved(&mut ss), "a,b,,\n1,2,,\n3,4,v,w\n");
+
+        // Redo brings back the filled cells too, so the clear lands on every one.
+        let mut ss = Spreadsheet::from_text("a,b\n1,2\n", b',', false).unwrap();
+        ss.cursor = (2, 0);
+        ss.paste("x"); // appends the short row [x]
+        ss.selection_anchor = Some((2, 1));
+        ss.clear_selection_content();
+        let tip = saved(&mut ss);
+        assert_eq!(tip, "a,b\n1,2\n\"\",\"\"\n");
+        assert!(ss.undo() && ss.undo() && ss.redo() && ss.redo());
+        assert_eq!(saved(&mut ss), tip);
+    }
+
+    #[test]
+    fn undoing_an_empty_commit_into_a_short_row_shortens_it_again() {
+        let mut ss = Spreadsheet::from_text("a,b\n1\n", b',', false).unwrap();
+        assert_eq!(ss.rows[1].len(), 1);
+        ss.cursor = (1, 1);
+        ss.enter_edit_mode();
+        ss.commit_edit(); // the missing cell becomes an empty string
+        assert_eq!(saved(&mut ss), "a,b\n1,\"\"\n");
+        assert!(ss.undo());
+        assert_eq!(ss.rows[1].len(), 1);
+        assert!(ss.redo());
+        assert_eq!(saved(&mut ss), "a,b\n1,\"\"\n");
+    }
+
+    #[test]
+    fn a_one_column_copy_ending_in_blanks_pastes_back_every_row() {
+        let mut ss = Spreadsheet::from_text("h,k\nx,1\n,2\n\"\",3\n", b',', false).unwrap();
+        assert!(ss.is_null(2, 0) && !ss.is_null(3, 0));
+        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (3, 0);
+        let clip = ss.copy_selection_tsv();
+        assert_eq!(parse_clipboard(&clip).len(), 3);
+        // Pasted back over its own selection: nothing changes.
+        ss.paste(&clip);
+        assert!(!ss.is_modified());
+        // Into another column: the blanks clear what was there.
+        let mut other = grid(&[&["h", "k"], &["1", "a"], &["2", "b"], &["3", "c"]]);
+        other.cursor = (1, 1);
+        other.paste(&clip);
+        assert_eq!(column(&other, 1), vec!["k", "x", "", ""]);
+        // Over a selection twice its height: two copies, blanks included.
+        let mut tall = grid(&[&["h"], &["1"], &["2"], &["3"], &["4"], &["5"], &["6"]]);
+        tall.selection_anchor = Some((1, 0));
+        tall.cursor = (6, 0);
+        tall.paste(&clip);
+        assert_eq!(column(&tall, 0), vec!["h", "x", "", "", "x", "", ""]);
+        // Only blanks: still one row each.
+        let mut blanks = grid(&[&["h"], &[""], &[""]]);
+        blanks.selection_anchor = Some((1, 0));
+        blanks.cursor = (2, 0);
+        assert_eq!(parse_clipboard(&blanks.copy_selection_tsv()).len(), 2);
+    }
+
+    #[test]
+    fn a_cell_starting_with_a_bom_copies_and_pastes_intact() {
+        let mut ss = grid(&[&["h", "k"], &["\u{FEFF}x", ""]]);
+        ss.cursor = (1, 0);
+        let clip = ss.copy_selection_tsv();
+        ss.cursor = (1, 1);
+        ss.paste(&clip);
+        assert_eq!(ss.cell(1, 1), "\u{FEFF}x");
+    }
+
+    #[test]
+    fn pasted_values_that_fail_the_filter_stay_shown_until_it_changes() {
+        let mut ss = grid(&[&["st"], &["Open"], &["Closed"], &["Open"]]);
+        ss.set_filter(0, Some(set(&["Open"])));
+        ss.cursor = (1, 0);
+        ss.paste("Closed\nClosed");
+        assert_eq!(column(&ss, 0), vec!["st", "Closed", "Closed"]);
+        ss.set_filter(0, Some(set(&["Open"])));
+        assert_eq!(ss.num_rows(), 1);
+    }
+
+    // --- insert & delete rows and columns (Ctrl+= / Ctrl+-) ---
+
+    fn text(ss: &Spreadsheet) -> String {
+        ss.to_text()
+    }
+
+    #[test]
+    fn ctrl_equals_inserts_as_many_blank_rows_as_are_selected_above_them() {
+        let mut ss = grid(&[&["h", "k"], &["1", "a"], &["2", "b"], &["3", "c"]]);
+        ss.selection_anchor = Some((2, 0));
+        ss.cursor = (3, 1);
+        ss.insert_lines().unwrap();
+        assert_eq!(text(&ss), "h,k\n1,a\n,\n,\n2,b\n3,c\n");
+        assert_eq!(ss.selected_range(), ((2, 0), (3, 1))); // on the new rows
+        assert!(ss.is_modified());
+        assert!(ss.undo());
+        assert_eq!(text(&ss), "h,k\n1,a\n2,b\n3,c\n");
+        assert!(!ss.is_modified());
+        assert!(ss.redo());
+        assert_eq!(text(&ss), "h,k\n1,a\n,\n,\n2,b\n3,c\n");
+    }
+
+    #[test]
+    fn ctrl_minus_deletes_the_rows_the_selection_covers() {
+        let mut ss = grid(&[&["h", "k"], &["1", "a"], &["2", "b"], &["3", "c"]]);
+        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (2, 0);
+        ss.delete_lines();
+        assert_eq!(text(&ss), "h,k\n3,c\n");
+        assert_eq!(ss.cursor, (1, 0));
+        assert!(!ss.has_selection());
+        assert!(ss.undo());
+        assert_eq!(text(&ss), "h,k\n1,a\n2,b\n3,c\n");
+        assert!(ss.redo());
+        assert_eq!(text(&ss), "h,k\n3,c\n");
+    }
+
+    #[test]
+    fn under_a_filter_and_sort_rows_go_in_by_the_cursor_and_only_shown_rows_go_out() {
+        let original = "gw,n\nYYC,3\nYYZ,10\nYYC,1\nYVR,7\nYYC,2\n";
+        let mut ss = grid(&[&["gw", "n"], &["YYC", "3"], &["YYZ", "10"], &["YYC", "1"], &["YVR", "7"], &["YYC", "2"]]);
+        ss.set_filter(0, Some(set(&["YYC"])));
+        ss.sort_by(1, false); // shows file rows 3 (1), 5 (2), 1 (3)
+        ss.cursor = (2, 0); // on file row 5
+        ss.insert_lines().unwrap();
+        // Into the file just above row 5, and on screen where the cursor is.
+        assert_eq!(column(&ss, 1), vec!["n", "1", "", "2", "3"]);
+        assert_eq!(text(&ss), "gw,n\nYYC,3\nYYZ,10\nYYC,1\nYVR,7\n,\nYYC,2\n");
+        // Delete the three rows shown under the header: YYZ and YVR, hidden, stay.
+        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (3, 1);
+        ss.delete_lines();
+        assert_eq!(text(&ss), "gw,n\nYYC,3\nYYZ,10\nYVR,7\n");
+        assert_eq!(column(&ss, 1), vec!["n", "3"]);
+        assert!(ss.undo());
+        assert_eq!(column(&ss, 1), vec!["n", "1", "", "2", "3"]); // back where they showed
+        assert!(ss.undo());
+        assert_eq!(text(&ss), original);
+        assert_eq!(column(&ss, 1), vec!["n", "1", "2", "3"]);
+    }
+
+    #[test]
+    fn the_header_row_moves_only_without_a_filter_or_sort() {
+        let mut ss = grid(&[&["h", "k", "m"], &["1"], &["2", "b", "c"]]);
+        ss.cursor = (0, 1);
+        ss.insert_lines().unwrap(); // a blank header row, as wide as the old one
+        assert_eq!(ss.num_cols(), 3);
+        assert_eq!(text(&ss), ",,\nh,k,m\n1,,\n2,b,c\n");
+        assert!(ss.undo());
+        // Deleting the header: the next row, short, takes its place at full width.
+        ss.cursor = (0, 0);
+        ss.delete_lines();
+        assert_eq!(ss.num_cols(), 3);
+        assert_eq!(text(&ss), "1,,\n2,b,c\n");
+        assert!(ss.undo());
+        assert_eq!(text(&ss), "h,k,m\n1,,\n2,b,c\n");
+        assert_eq!(ss.rows[1].len(), 1); // short again
+        // While filtered, the header stays put.
+        ss.set_filter(1, Some(set(&["b"])));
+        ss.cursor = (0, 0);
+        assert!(ss.insert_lines().is_err());
+        ss.select_all();
+        ss.delete_lines(); // the shown data row; the header and the hidden row stay
+        assert_eq!(text(&ss), "h,k,m\n1,,\n");
+    }
+
+    #[test]
+    fn whole_columns_go_in_to_the_left_and_out_with_their_filters() {
+        let original = "a,b,c\n1,x,p\n2,y,q\n3,x,r\n";
+        let mut ss = grid(&[&["a", "b", "c"], &["1", "x", "p"], &["2", "y", "q"], &["3", "x", "r"]]);
+        ss.set_filter(1, Some(set(&["x"]))); // hides file row 2
+        ss.sort_by(2, true);
+        ss.select_column(1, false);
+        ss.insert_lines().unwrap();
+        assert_eq!(text(&ss), "a,,b,c\n1,,x,p\n2,,y,q\n3,,x,r\n");
+        assert!(ss.column_filter(2).is_some() && ss.column_filter(1).is_none());
+        assert_eq!(ss.column_sort(3), Some(true));
+        // Delete the filtered column (now C): its filter goes, the row it hid comes back.
+        ss.select_column(2, false);
+        ss.delete_lines();
+        assert_eq!(text(&ss), "a,,c\n1,,p\n2,,q\n3,,r\n");
+        assert!(!ss.is_filtered());
+        assert_eq!(ss.visible_data_rows(), 3);
+        assert_eq!(ss.column_sort(2), Some(true));
+        assert!(ss.undo()); // the column, its filter, and the hidden row
+        assert!(ss.column_filter(2).is_some());
+        assert_eq!(ss.visible_data_rows(), 2);
+        assert!(ss.undo());
+        assert_eq!(text(&ss), original);
+        assert!(ss.column_filter(1).is_some());
+        assert_eq!(ss.column_sort(2), Some(true));
+        assert!(ss.redo() && ss.redo());
+        assert_eq!(text(&ss), "a,,c\n1,,p\n2,,q\n3,,r\n");
+    }
+
+    #[test]
+    fn a_selection_the_full_height_is_columns_and_a_letter_pick_is_even_in_one_column() {
+        // Shift-selecting top to bottom across two columns deletes those columns.
+        let mut ss = grid(&[&["a", "b", "c"], &["1", "2", "3"]]);
+        ss.selection_anchor = Some((0, 0));
+        ss.cursor = (1, 1);
+        ss.delete_lines();
+        assert_eq!(text(&ss), "c\n3\n");
+        // In a one-column file the letter picks the column, though that
+        // selection is also the full width.
+        let mut one = grid(&[&["a"], &["1"], &["2"]]);
+        one.select_column(0, false);
+        one.insert_lines().unwrap();
+        assert_eq!(text(&one), ",a\n,1\n,2\n");
+        // A row picked by its number is a row, though the grid is one row tall.
+        let mut flat = grid(&[&["a", "b"]]);
+        flat.select_row(0, false);
+        flat.insert_lines().unwrap();
+        assert_eq!(text(&flat), ",\na,b\n");
+    }
+
+    #[test]
+    fn deleting_every_row_leaves_an_empty_grid_that_undo_refills() {
+        let mut ss = grid(&[&["a", "b"], &["1", "2"]]);
+        ss.select_all();
+        ss.delete_lines();
+        assert_eq!(text(&ss), "");
+        assert_eq!(ss.num_cols(), 0);
+        assert!(ss.undo());
+        assert_eq!(text(&ss), "a,b\n1,2\n");
+        assert!(ss.redo() && ss.undo());
+        assert_eq!(text(&ss), "a,b\n1,2\n");
+    }
+
+    #[test]
+    fn inserting_or_deleting_past_the_data_does_nothing() {
+        let mut ss = grid(&[&["a", "b"], &["1", "2"]]);
+        ss.cursor = (5, 0);
+        ss.insert_lines().unwrap();
+        ss.delete_lines();
+        ss.selection_anchor = Some((0, 4));
+        ss.cursor = (1, 5); // ghost columns, full height
+        ss.insert_lines().unwrap();
+        ss.delete_lines();
+        assert_eq!(text(&ss), "a,b\n1,2\n");
+        assert!(!ss.is_modified());
+        assert!(!ss.undo());
+    }
+
+    fn assert_consistent(ss: &Spreadsheet, context: &str) {
+        assert!(!ss.rows.is_empty(), "{context}");
+        assert_eq!(ss.rows.len(), ss.null_mask.len(), "{context}");
+        for (r, (row, mask)) in ss.rows.iter().zip(&ss.null_mask).enumerate() {
+            assert_eq!(row.len(), mask.len(), "{context}: row {r}");
+            assert!(row.len() <= ss.num_cols(), "{context}: row {r} is longer than the header: {:?}", ss.rows);
+        }
+        if let Some(view) = &ss.view {
+            assert_eq!(view.first(), Some(&0), "{context}: the header leads the view");
+            let mut seen = HashSet::new();
+            for &r in view {
+                assert!(r < ss.rows.len() && seen.insert(r), "{context}: view {:?}", view);
+            }
+            if ss.filters.is_empty() {
+                assert_eq!(view.len(), ss.rows.len(), "{context}: a sort alone hides no row");
+            }
+        }
+        assert!(ss.filters.keys().all(|&c| c < ss.num_cols()), "{context}: a filter on a column that's gone");
+        assert!(ss.sorts.iter().all(|&(c, _)| c < ss.num_cols()), "{context}: a sort on a column that's gone");
+    }
+
+    #[test]
+    fn random_row_and_column_changes_undo_and_redo_exactly() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: usize| -> usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        for round in 0..400 {
+            let mut ss = Spreadsheet::from_text("h,k,m\n1,a,x\n2,b\n3,,z\n4,a,w\n5,b,v\n", b',', false).unwrap();
+            let mut states = vec![text(&ss)];
+            for op in 0..14 {
+                let context = format!("round {round}, op {op}");
+                let steps = ss.undo.len();
+                let (rows, cols) = (ss.num_rows() + 2, ss.num_cols() + 2);
+                ss.selection_anchor = Some((next(rows), next(cols)));
+                ss.cursor = (next(rows), next(cols));
+                match next(12) {
+                    0 | 1 => {
+                        let _ = ss.insert_lines();
+                    }
+                    2 | 3 => ss.delete_lines(),
+                    4 => {
+                        ss.select_column(next(cols), false);
+                        let _ = ss.insert_lines();
+                    }
+                    5 => {
+                        ss.select_column(next(cols), next(2) == 0);
+                        ss.delete_lines();
+                    }
+                    6 => {
+                        ss.select_row(next(rows), next(2) == 0);
+                        if next(2) == 0 { ss.delete_lines() } else { let _ = ss.insert_lines(); }
+                    }
+                    7 => {
+                        ss.selection_anchor = None;
+                        ss.enter_edit_mode_replace('q');
+                        ss.commit_edit();
+                    }
+                    8 => ss.paste("p\tq\n\tr"),
+                    9 => ss.clear_selection_content(),
+                    _ => {
+                        let c = next(ss.num_cols().max(1));
+                        if ss.num_cols() > 0 {
+                            match next(4) {
+                                0 => ss.set_filter(c, Some(set(&["a", "b", "", "q"]))),
+                                1 => ss.sort_by(c, next(2) == 0),
+                                2 => ss.clear_filters(),
+                                _ => ss.clear_sort(),
+                            }
+                        }
+                    }
+                }
+                assert_consistent(&ss, &context);
+                if ss.undo.len() > steps {
+                    states.push(text(&ss));
+                }
+                assert_eq!(&text(&ss), states.last().unwrap(), "{context}: a change with no undo step");
+            }
+            // Filters and sorts aren't undo steps: change them between undos
+            // and redos too, which must still give back the same data.
+            let mut shuffle_view = |ss: &mut Spreadsheet, pick: usize, col: usize, desc: bool| {
+                if ss.num_cols() == 0 {
+                    return;
+                }
+                let c = col % ss.num_cols();
+                match pick {
+                    0 => ss.set_filter(c, Some(set(&["a", "b", "", "q"]))),
+                    1 => ss.sort_by(c, desc),
+                    2 => ss.clear_filters(),
+                    3 => ss.clear_sort(),
+                    _ => {}
+                }
+            };
+            for i in (0..states.len() - 1).rev() {
+                shuffle_view(&mut ss, next(8), next(8), next(2) == 0);
+                assert!(ss.undo(), "round {round}");
+                assert_consistent(&ss, &format!("round {round}, undo to {i}"));
+                assert_eq!(text(&ss), states[i], "round {round}, undo to {i}");
+            }
+            assert!(!ss.undo());
+            for (i, state) in states.iter().enumerate().skip(1) {
+                shuffle_view(&mut ss, next(8), next(8), next(2) == 0);
+                assert!(ss.redo(), "round {round}");
+                assert_consistent(&ss, &format!("round {round}, redo to {i}"));
+                assert_eq!(&text(&ss), state, "round {round}, redo to {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn rows_deleted_with_no_view_come_back_into_a_sort_put_on_since() {
+        let mut ss = Spreadsheet::from_text("name,n\na,3\nb,1\nc,2\n", b',', false).unwrap();
+        ss.cursor = (2, 0);
+        ss.delete_lines(); // b
+        ss.sort_by(1, false);
+        assert!(ss.undo());
+        assert_eq!(column(&ss, 0), vec!["name", "b", "c", "a"]);
+        assert_eq!(ss.find_cells("b"), vec![(1, 0)]);
+        assert_eq!(ss.cursor.0, 1); // on the restored row
+    }
+
+    #[test]
+    fn undoing_a_big_delete_under_a_sort_puts_every_row_back_in_its_place() {
+        let n = 20_000;
+        let mut text_in = String::from("k,v\n");
+        for i in 0..n {
+            text_in.push_str(&format!("{},{}\n", i, (i * 7919) % n));
+        }
+        let mut ss = Spreadsheet::from_text(&text_in, b',', false).unwrap();
+        ss.sort_by(1, true);
+        let before = column(&ss, 0);
+        ss.selection_anchor = Some((5, 0));
+        ss.cursor = (n / 2, 1);
+        ss.delete_lines();
+        assert_eq!(ss.num_rows(), n + 1 - (n / 2 - 4));
+        let started = std::time::Instant::now();
+        assert!(ss.undo());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "undo took {:?}", started.elapsed());
+        assert_eq!(column(&ss, 0), before);
+        assert_eq!(text(&ss), text_in);
+    }
+
+    #[test]
+    fn deleting_every_column_leaves_an_empty_grid() {
+        let mut ss = Spreadsheet::from_text("a,b\n1,2\n3,4\n", b',', false).unwrap();
+        ss.select_column(0, false);
+        ss.extend_column_selection(1);
+        ss.delete_lines();
+        assert_eq!((text(&ss), ss.rows.len()), (String::new(), 1));
+        // Typing into it starts afresh: no rows of "" come back.
+        ss.cursor = (0, 0);
+        ss.enter_edit_mode_replace('x');
+        ss.commit_edit();
+        assert_eq!(text(&ss), "x\n");
+        assert!(ss.undo() && ss.undo());
+        assert_eq!(text(&ss), "a,b\n1,2\n3,4\n");
+    }
+
+    #[test]
+    fn ctrl_equals_and_ctrl_minus_do_nothing_in_an_empty_grid() {
+        let mut ss = Spreadsheet::from_text("", b',', false).unwrap();
+        ss.insert_lines().unwrap();
+        ss.delete_lines();
+        assert!(!ss.is_modified());
+        assert!(!ss.undo());
+        assert_eq!(ss.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_filter_put_on_before_redoing_a_delete_of_every_row_goes_and_comes_back() {
+        let mut ss = grid(&[&["a", "b"], &["1", "x"]]);
+        ss.select_all();
+        ss.delete_lines();
+        assert!(ss.undo());
+        ss.set_filter(1, Some(set(&["x"])));
+        assert!(ss.redo());
+        assert!(!ss.is_filtered()); // no column left to hold it
+        assert!(ss.undo());
+        assert_eq!(ss.column_filter(1), Some(&set(&["x"])));
+        assert_eq!(column(&ss, 1), vec!["b", "x"]);
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_change_after_a_delete_and_its_undo() {
+        let mut ss = grid(&[&["a", "b", "c", "d"], &["1", "2", "3", "4"]]);
+        // Columns B:C selected left to right by keys: the cursor ends on C,
+        // and lands on B.
+        ss.selection_anchor = Some((0, 1));
+        ss.cursor = (1, 2);
+        ss.delete_lines();
+        assert_eq!(text(&ss), "a,d\n1,4\n");
+        assert_eq!(ss.cursor.1, 1);
+        ss.cursor = (0, 0);
+        assert!(ss.undo());
+        assert_eq!(ss.cursor.1, 1); // on the restored columns
+        let mut rows = grid(&[&["h"], &["1"], &["2"], &["3"], &["4"]]);
+        rows.cursor = (3, 0);
+        rows.delete_lines();
+        rows.cursor = (0, 0);
+        assert!(rows.undo());
+        assert_eq!(rows.cursor.0, 3);
     }
 }

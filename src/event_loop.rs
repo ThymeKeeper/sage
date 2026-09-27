@@ -51,6 +51,18 @@ fn text_key_char(event: &Event) -> Option<char> {
     None
 }
 
+/// Whether keys that arrived together in the grid are the Windows console's
+/// paste of cells, rather than typing that queued up while sage was busy (a
+/// long save, say) or a held key. Data typed ahead is values each followed by
+/// its Tab or Enter, so a burst is a paste only with a tab or line break
+/// between values: not starting with one, not ending in a Tab, and not while a
+/// cell is being edited. Anything else is replayed as the keys it was, since
+/// as a paste a trailing Tab would clear the next cell.
+fn grid_burst_is_paste(text: &str, editing: bool) -> bool {
+    let sep = |c: char| c == '\t' || c == '\n';
+    !editing && !text.starts_with(sep) && !text.ends_with('\t') && text.trim_end_matches(sep).contains(sep)
+}
+
 /// Full-window re-render: clear the terminal and drop every line cache (editor
 /// rows, status bar, output pane) so the next draw repaints each row. Call when
 /// a pop-up (prompt, selector, find pane, help) opens or closes: it paints over
@@ -310,11 +322,13 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
         // per-character autocomplete/auto-indent instead of sage's normalized,
         // atomic paste. Routing the whole burst through paste_text() makes a
         // terminal paste behave exactly like sage's own Ctrl+V paste. Only the
-        // plain editing surface qualifies; modal UIs (find/replace, help,
-        // spreadsheet) and in-flight execution keep raw per-key handling.
+        // editing surfaces qualify; modal UIs (find/replace, help) and in-flight
+        // execution keep raw per-key handling. The grid qualifies only on
+        // Windows: elsewhere a terminal paste arrives as Event::Paste, so a
+        // burst there is typing that queued up, and each key must act as itself.
         let paste_surface = find_replace.is_none()
             && help_screen.is_none()
-            && !editor.is_spreadsheet_mode()
+            && (cfg!(windows) || !editor.is_spreadsheet_mode())
             && !(output_pane_visible && output_pane.is_focused())
             && execution_rx.is_none();
         if paste_surface {
@@ -324,6 +338,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 if event::poll(std::time::Duration::ZERO)? {
                     let mut pasted = String::new();
                     pasted.push(first_ch);
+                    // The keys themselves, for the grid to replay a burst that isn't a paste.
+                    let mut keys: Vec<event::KeyEvent> = Vec::new();
+                    if let Event::Key(k) = &event {
+                        keys.push(*k);
+                    }
                     loop {
                         if !event::poll(std::time::Duration::ZERO)? {
                             break;
@@ -334,7 +353,12 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             continue;
                         }
                         match text_key_char(&next) {
-                            Some(ch) => pasted.push(ch),
+                            Some(ch) => {
+                                pasted.push(ch);
+                                if let Event::Key(k) = &next {
+                                    keys.push(*k);
+                                }
+                            }
                             None => {
                                 pending_event = Some(next);
                                 break;
@@ -347,10 +371,25 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     // through and handle the keystroke normally so autocomplete
                     // still works.
                     if pasted.chars().count() >= 2 {
-                        editor.paste_text(pasted);
-                        let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
-                        editor.update_viewport_for_cursor_with_bottom(bottom_height);
-                        autocomplete.hide();
+                        if editor.is_spreadsheet_mode() {
+                            clear_status_error(editor);
+                            let editing = editor.spreadsheet().map_or(false, |ss| ss.is_editing());
+                            if grid_burst_is_paste(&pasted, editing) {
+                                if let Some(ss) = editor.spreadsheet_mut() {
+                                    ss.paste(&pasted);
+                                }
+                            } else {
+                                for k in &keys {
+                                    handle_spreadsheet_key(editor, k, &mut needs_redraw);
+                                }
+                            }
+                            ensure_ss_cursor_visible(editor)?;
+                        } else {
+                            editor.paste_text(pasted);
+                            let bottom_height = if output_pane_visible { output_pane_height } else { 0 };
+                            editor.update_viewport_for_cursor_with_bottom(bottom_height);
+                            autocomplete.hide();
+                        }
                         if output_pane_visible {
                             output_pane.invalidate_cache();
                         }
@@ -656,8 +695,21 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 }
             }
             Event::Paste(text) => {
-                // Handle bracketed paste - insert the entire text at once without triggering auto-indent
-                editor.paste_text(text);
+                if editor.is_spreadsheet_mode() {
+                    // The grid takes a terminal paste as it does Ctrl+V. With
+                    // the find pane or help open, or mid-run, it's dropped (the
+                    // text buffer behind a grid is hidden, so never into that).
+                    if find_replace.is_none() && help_screen.is_none() && execution_rx.is_none() {
+                        clear_status_error(editor);
+                        if let Some(ss) = editor.spreadsheet_mut() {
+                            ss.paste(&text);
+                        }
+                        ensure_ss_cursor_visible(editor)?;
+                    }
+                } else {
+                    // Handle bracketed paste - insert the entire text at once without triggering auto-indent
+                    editor.paste_text(text);
+                }
                 needs_redraw = true;
             }
             Event::Key(key) => {
@@ -739,10 +791,18 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                 // except when the find pane is open — then input belongs to the find pane —
                 // or the help screen is, which takes its own keys (Esc, arrows, F1).
                 if editor.is_spreadsheet_mode() && find_replace.is_none() && help_screen.is_none() {
-                    let cursor_before = editor.spreadsheet().map(|ss| ss.cursor);
+                    // Scroll to the cursor when a key moved it, or moved the view
+                    // under it (an undo that re-applies a filter starts it back
+                    // at the top).
+                    let place = |editor: &editor::Editor| editor.spreadsheet().map(|ss| (ss.cursor, ss.scroll_row, ss.scroll_col));
+                    let place_before = place(editor);
+                    // A paste leaves the cursor on the block's top-left, which
+                    // may be scrolled out of view: bring it back, as a terminal paste does.
+                    let paste = key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'));
                     if handle_spreadsheet_key(editor, &key, &mut needs_redraw) {
-                        let cursor_after = editor.spreadsheet().map(|ss| ss.cursor);
-                        if cursor_before != cursor_after {
+                        if place(editor) != place_before || paste {
                             ensure_ss_cursor_visible(editor)?;
                         }
                         continue;
@@ -772,6 +832,11 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
 
                 // If find/replace window is active, handle its input first
                 if let Some(ref mut fr) = find_replace {
+                    // An error left in the status bar (a failed copy in the
+                    // pane, say) clears on the next key.
+                    if !matches!(key.code, KeyCode::Modifier(_)) {
+                        clear_status_error(editor);
+                    }
                     // Special handling for find/replace shortcuts
                     let fr_cmd = match key.code {
                         // Ctrl+F while find is open = find next
@@ -868,6 +933,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                     if !is_undo_redo {
                         // Handle regular input for find/replace window
                         let result = fr.handle_input(key.code, key.modifiers);
+                        if let Some(why) = fr.take_clipboard_error() {
+                            editor.status_message = Some((why, true));
+                        }
                         match result {
                             find_replace::InputResult::Close => {
                                 find_replace = None;
@@ -2628,6 +2696,10 @@ fn handle_spreadsheet_find_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+    if !matches!(key.code, KeyCode::Modifier(_)) {
+        clear_status_error(editor);
+    }
+
     // Ctrl+F / Ctrl+Shift+F: cycle next/prev match without touching the find text.
     if ctrl {
         match key.code {
@@ -2652,6 +2724,9 @@ fn handle_spreadsheet_find_key(
     }
 
     let result = fr.handle_input(key.code, key.modifiers);
+    if let Some(why) = fr.take_clipboard_error() {
+        editor.status_message = Some((why, true));
+    }
     match result {
         find_replace::InputResult::Close => SsFindAction::Close,
         find_replace::InputResult::FindTextChanged => {
@@ -2822,6 +2897,38 @@ fn handle_spreadsheet_mouse(
     Ok(())
 }
 
+/// Drop an error from the status bar (a failed copy, say): in the grid and the
+/// find pane it clears on the next key or paste, as it does in the text editor.
+fn clear_status_error(editor: &mut editor::Editor) {
+    if matches!(editor.status_message, Some((_, true))) {
+        editor.status_message = None;
+    }
+}
+
+/// Grid Ctrl+C / Ctrl+X: put `text` on the clipboard, or say in the status bar
+/// why it couldn't. Returns whether it got there, so a cut clears only then.
+fn grid_copy(editor: &mut editor::Editor, text: String, verb: &str) -> bool {
+    match editor.set_clipboard_text(text) {
+        Ok(()) => true,
+        Err(e) => {
+            editor.status_message = Some((format!("{} failed: {}", verb, e), true));
+            false
+        }
+    }
+}
+
+/// Grid Ctrl+V: the clipboard's text, or `None` with the reason in the status bar.
+fn grid_clipboard_text(editor: &mut editor::Editor) -> Option<String> {
+    match editor.clipboard_text() {
+        Ok(text) => Some(text),
+        Err(e) => {
+            // The way out first, so a narrow status bar doesn't cut it off.
+            editor.status_message = Some((format!("Paste failed (use the terminal's paste): {}", e), true));
+            None
+        }
+    }
+}
+
 /// Handle a key in spreadsheet mode. Returns true if consumed, false if it should fall through
 /// to the normal editor handling (used for Ctrl+S, Ctrl+Shift+S, Ctrl+Q which use the standard
 /// save/exit prompt flows).
@@ -2833,6 +2940,13 @@ fn handle_spreadsheet_key(
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // A modifier pressed alone (reported under the kitty keyboard protocol)
+    // does nothing, and isn't the next key that clears an error.
+    if matches!(key.code, KeyCode::Modifier(_)) {
+        return true;
+    }
+    clear_status_error(editor);
 
     // F1 opens the help screen from the grid too.
     if key.code == KeyCode::F(1) {
@@ -2983,29 +3097,29 @@ fn handle_spreadsheet_key(
             }
             KeyCode::Char('c') | KeyCode::Char('C') if ctrl && !alt => {
                 if let Some(text) = ss.edit_get_selected_text() {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        let _ = cb.set_text(text);
-                    }
+                    grid_copy(editor, text, "Copy");
                 }
                 true
             }
             KeyCode::Char('x') | KeyCode::Char('X') if ctrl && !alt => {
                 if let Some(text) = ss.edit_get_selected_text() {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        let _ = cb.set_text(text);
+                    // Cut the text only once it's on the clipboard.
+                    if grid_copy(editor, text, "Cut") {
+                        if let Some(ss) = editor.spreadsheet_mut() {
+                            ss.edit_paste("");
+                        }
                     }
-                    ss.edit_paste("");
                     *needs_redraw = true;
                 }
                 true
             }
             KeyCode::Char('v') | KeyCode::Char('V') if ctrl && !alt => {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    if let Ok(text) = cb.get_text() {
+                if let Some(text) = grid_clipboard_text(editor) {
+                    if let Some(ss) = editor.spreadsheet_mut() {
                         ss.edit_paste(&text);
-                        *needs_redraw = true;
                     }
                 }
+                *needs_redraw = true;
                 true
             }
             KeyCode::Char(c) if !ctrl && !alt => {
@@ -3115,17 +3229,39 @@ fn handle_spreadsheet_key(
             }
             KeyCode::Char('c') | KeyCode::Char('C') if ctrl && !alt => {
                 let text = ss.copy_selection_tsv();
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    let _ = cb.set_text(text);
-                }
+                grid_copy(editor, text, "Copy");
                 true
             }
             KeyCode::Char('x') | KeyCode::Char('X') if ctrl && !alt => {
                 let text = ss.copy_selection_tsv();
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    let _ = cb.set_text(text);
+                // Clear the cells only once they're on the clipboard.
+                if grid_copy(editor, text, "Cut") {
+                    if let Some(ss) = editor.spreadsheet_mut() {
+                        ss.clear_selection_content();
+                    }
                 }
-                ss.clear_selection_content();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') if ctrl && !alt => {
+                if let Some(text) = grid_clipboard_text(editor) {
+                    if let Some(ss) = editor.spreadsheet_mut() {
+                        ss.paste(&text);
+                    }
+                }
+                *needs_redraw = true;
+                true
+            }
+            // Ctrl+= (or Ctrl++) inserts rows or columns; Ctrl+- deletes them.
+            KeyCode::Char('=') | KeyCode::Char('+') if ctrl && !alt => {
+                if let Err(why) = ss.insert_lines() {
+                    editor.status_message = Some((why.to_string(), true));
+                }
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') if ctrl && !alt => {
+                ss.delete_lines();
                 *needs_redraw = true;
                 true
             }
@@ -3173,6 +3309,7 @@ fn results_head_tempfile(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use crate::clipboard::ClipboardProvider;
     use std::io::Write;
 
     const CSV: &str = "id,city,amt\n1,YYC,30\n2,YYZ,10\n3,YVR,20\n4,YYC,40\n";
@@ -3332,5 +3469,103 @@ mod tests {
             std::fs::read_to_string(tmp.path()).unwrap(),
             "id,city,amt\n1,YYC,30\n2,YYZ,10\n3,YVR,20\n9,YQR,40\n"
         );
+    }
+
+    #[test]
+    fn a_cut_that_cant_reach_the_clipboard_leaves_the_cells_and_says_why() {
+        let (mut editor, tmp) = load(CSV);
+        editor.set_clipboard_provider(ClipboardProvider::None);
+        let ctrl = KeyModifiers::CONTROL;
+        press(&mut editor, &[
+            (KeyCode::Down, NONE), (KeyCode::Right, SHIFT), (KeyCode::Down, SHIFT), // B2:C3
+            (KeyCode::Char('x'), ctrl),
+        ]);
+        let ss = editor.spreadsheet().unwrap();
+        assert_eq!((ss.cell(1, 1), ss.cell(2, 2)), ("YYC", "10"));
+        assert!(!ss.is_modified());
+        assert_eq!(editor.status_message, Some(("Cut failed: No clipboard available".to_string(), true)));
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), CSV);
+
+        // Copy and paste say why too, and the next key clears the message.
+        press(&mut editor, &[(KeyCode::Char('c'), ctrl)]);
+        assert_eq!(editor.status_message, Some(("Copy failed: No clipboard available".to_string(), true)));
+        press(&mut editor, &[(KeyCode::Char('v'), ctrl)]);
+        assert!(editor.status_message.as_ref().map_or(false, |(m, err)| *err && m.starts_with("Paste failed")));
+        // A modifier pressed alone (kitty keyboard protocol) doesn't clear it.
+        press(&mut editor, &[(KeyCode::Modifier(event::ModifierKeyCode::LeftShift), SHIFT)]);
+        assert!(editor.status_message.is_some());
+        press(&mut editor, &[(KeyCode::Right, NONE)]);
+        assert_eq!(editor.status_message, None);
+    }
+
+    #[test]
+    fn a_cut_inside_a_cell_that_cant_reach_the_clipboard_keeps_the_text() {
+        let (mut editor, _tmp) = load(CSV);
+        editor.set_clipboard_provider(ClipboardProvider::None);
+        let ctrl = KeyModifiers::CONTROL;
+        press(&mut editor, &[
+            (KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::Enter, NONE), // edit B2
+            (KeyCode::Char('a'), ctrl), (KeyCode::Char('x'), ctrl),
+        ]);
+        assert_eq!(editor.spreadsheet().unwrap().focused_cell_text(), "YYC");
+        assert_eq!(editor.status_message, Some(("Cut failed: No clipboard available".to_string(), true)));
+    }
+
+    #[test]
+    fn a_key_burst_is_a_paste_only_with_a_tab_or_line_break_between_values() {
+        let paste = |t: &str| grid_burst_is_paste(t, false);
+        assert!(paste("a\tb"));
+        assert!(paste("1\n2\n"));
+        assert!(paste("a\tb\t\nc\td\t\n")); // rows ending in a blank cell
+        // Typing that queued up, or a held key: replayed as the keys they were.
+        assert!(!paste("ab"));
+        assert!(!paste("9\t")); // as a paste, the empty field after the Tab would clear a cell
+        assert!(!paste("12\t34\t"));
+        assert!(!paste("9\t\n"));
+        assert!(!paste("x\n")); // as a paste, one value would fill the whole selection
+        assert!(!paste("\nZ"));
+        assert!(!paste("\t\t\t"));
+        assert!(!paste("\n\n"));
+        // In a cell being edited, Tab and Enter commit: always replayed.
+        assert!(!grid_burst_is_paste("a\tb", true));
+    }
+
+    #[test]
+    fn grid_copy_cut_and_paste_go_through_the_clipboard() {
+        let (mut editor, tmp) = load(CSV);
+        editor.set_clipboard_provider(ClipboardProvider::Memory(None));
+        let ctrl = KeyModifiers::CONTROL;
+        press(&mut editor, &[
+            (KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::Right, SHIFT), // B2:C2
+            (KeyCode::Char('x'), ctrl),
+        ]);
+        assert_eq!(editor.clipboard_text().unwrap(), "YYC\t30");
+        assert_eq!(editor.status_message, None);
+        // The cursor ended on C2; paste at B4.
+        press(&mut editor, &[(KeyCode::Left, NONE), (KeyCode::Down, NONE), (KeyCode::Down, NONE), (KeyCode::Char('v'), ctrl)]);
+        editor.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "id,city,amt\n1,\"\",\"\"\n2,YYZ,10\n3,YYC,30\n4,YYC,40\n"
+        );
+        // Inside a cell: copy the selected text, paste it at the caret.
+        press(&mut editor, &[
+            (KeyCode::Up, NONE), (KeyCode::Enter, NONE), (KeyCode::Char('a'), ctrl), (KeyCode::Char('c'), ctrl),
+            (KeyCode::End, NONE), (KeyCode::Char('v'), ctrl), (KeyCode::Enter, NONE),
+        ]);
+        assert_eq!(editor.spreadsheet().unwrap().cell(2, 1), "YYZYYZ");
+    }
+
+    #[test]
+    fn a_key_in_the_grids_find_pane_clears_an_old_error() {
+        let (mut editor, _tmp) = load(CSV);
+        editor.status_message = Some(("Paste failed: gone".to_string(), true));
+        let mut fr = find_replace::FindReplace::new_find_only();
+        let shift_alone = event::KeyEvent::new(KeyCode::Modifier(event::ModifierKeyCode::LeftShift), SHIFT);
+        handle_spreadsheet_find_key(&mut editor, &mut fr, &shift_alone);
+        assert!(editor.status_message.is_some());
+        handle_spreadsheet_find_key(&mut editor, &mut fr, &event::KeyEvent::new(KeyCode::Char('Y'), SHIFT));
+        assert_eq!(editor.status_message, None);
     }
 }

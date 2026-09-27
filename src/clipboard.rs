@@ -8,6 +8,9 @@ pub enum ClipboardProvider {
     Osc52,
     /// No clipboard available
     None,
+    /// A clipboard held in memory, for tests.
+    #[cfg(test)]
+    Memory(Option<String>),
 }
 
 impl ClipboardProvider {
@@ -63,6 +66,11 @@ impl ClipboardProvider {
             ClipboardProvider::None => {
                 Err("No clipboard available".to_string())
             }
+            #[cfg(test)]
+            ClipboardProvider::Memory(slot) => {
+                *slot = Some(text);
+                Ok(())
+            }
         }
     }
 
@@ -79,6 +87,8 @@ impl ClipboardProvider {
             ClipboardProvider::None => {
                 Err("No clipboard available".to_string())
             }
+            #[cfg(test)]
+            ClipboardProvider::Memory(slot) => slot.clone().ok_or_else(|| "Clipboard is empty".to_string()),
         }
     }
 

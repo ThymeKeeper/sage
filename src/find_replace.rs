@@ -5,7 +5,7 @@ use crossterm::{
     style::{Color, Print, SetBackgroundColor, SetForegroundColor, ResetColor},
     terminal,
 };
-use arboard::Clipboard;
+use crate::clipboard::ClipboardProvider;
 use std::io::{self, Write};
 
 pub struct FindReplace {
@@ -17,7 +17,9 @@ pub struct FindReplace {
     current_match: usize,
     total_matches: usize,
     matches: Vec<(usize, usize)>, // (start_byte, end_byte) positions
-    clipboard: Clipboard,
+    clipboard: ClipboardProvider,
+    /// Why the last copy, cut or paste in a field failed, for the status bar.
+    clipboard_error: Option<String>,
     find_only: bool,
 }
 
@@ -38,7 +40,10 @@ impl FindReplace {
             current_match: 0,
             total_matches: 0,
             matches: Vec::new(),
-            clipboard: Clipboard::new().expect("Failed to access clipboard"),
+            // With no clipboard (no display, say) the pane still opens; a copy
+            // or paste then just reports why it can't.
+            clipboard: ClipboardProvider::new(),
+            clipboard_error: None,
             find_only: false,
         }
     }
@@ -51,6 +56,11 @@ impl FindReplace {
         fr
     }
     
+    /// Why the last copy, cut or paste in the pane failed, once.
+    pub fn take_clipboard_error(&mut self) -> Option<String> {
+        self.clipboard_error.take()
+    }
+
     /// Update the search results
     pub fn update_matches(&mut self, matches: Vec<(usize, usize)>) {
         self.matches = matches;
@@ -561,7 +571,7 @@ impl FindReplace {
                 };
                 
                 if let Err(e) = self.clipboard.set_text(text_to_copy) {
-                    eprintln!("Failed to copy to clipboard: {}", e);
+                    self.clipboard_error = Some(format!("Copy failed: {}", e));
                 }
                 InputResult::Continue
             }
@@ -569,26 +579,29 @@ impl FindReplace {
             // Handle Ctrl+X (Cut)
             KeyCode::Char('x') | KeyCode::Char('X') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // Cut selected text or entire field if no selection
-                let text_to_cut = if let Some(selected) = self.get_selected_text() {
-                    selected
-                } else {
-                    // No selection, cut entire field
-                    let text = if self.active_field == Field::Find {
-                        &mut self.find_text
-                    } else {
-                        &mut self.replace_text
-                    };
-                    let all = text.clone();
-                    text.clear();
-                    self.cursor_pos = 0;
-                    all
+                let selected = self.get_selected_text();
+                let whole_field = selected.is_none();
+                let text_to_cut = match selected {
+                    Some(selected) => selected,
+                    None if self.active_field == Field::Find => self.find_text.clone(),
+                    None => self.replace_text.clone(),
                 };
                 
+                // Remove the text only once it's on the clipboard.
                 if let Err(e) = self.clipboard.set_text(text_to_cut) {
-                    eprintln!("Failed to copy to clipboard: {}", e);
-                } else if self.selection_start.is_some() {
-                    // Delete the selection after copying
+                    self.clipboard_error = Some(format!("Cut failed: {}", e));
+                    return InputResult::Continue;
+                }
+                if !whole_field {
                     self.delete_selection();
+                } else {
+                    // No selection: the whole field was cut
+                    if self.active_field == Field::Find {
+                        self.find_text.clear();
+                    } else {
+                        self.replace_text.clear();
+                    }
+                    self.cursor_pos = 0;
                 }
                 
                 if self.active_field == Field::Find {
@@ -629,7 +642,7 @@ impl FindReplace {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to paste from clipboard: {}", e);
+                        self.clipboard_error = Some(format!("Paste failed: {}", e));
                         InputResult::Continue
                     }
                 }
@@ -839,4 +852,45 @@ pub enum InputResult {
     FindTextChanged,
     FindNext,
     Close,
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn type_text(fr: &mut FindReplace, text: &str) {
+        for c in text.chars() {
+            fr.handle_input(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn with_no_clipboard_the_pane_opens_and_a_cut_keeps_the_text() {
+        let mut fr = FindReplace::new_find_only();
+        fr.clipboard = ClipboardProvider::None;
+        type_text(&mut fr, "abc");
+        fr.handle_input(KeyCode::Char('x'), KeyModifiers::CONTROL); // no selection: the whole field
+        assert_eq!(fr.find_text(), "abc");
+        assert_eq!(fr.take_clipboard_error().as_deref(), Some("Cut failed: No clipboard available"));
+        assert_eq!(fr.take_clipboard_error(), None); // reported once
+        fr.handle_input(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(fr.find_text(), "abc");
+        assert_eq!(fr.take_clipboard_error().as_deref(), Some("Paste failed: No clipboard available"));
+    }
+
+    #[test]
+    fn a_cut_takes_the_selection_or_else_the_whole_field() {
+        let mut fr = FindReplace::new_find_only();
+        fr.clipboard = ClipboardProvider::Memory(None);
+        type_text(&mut fr, "abc");
+        fr.handle_input(KeyCode::Left, KeyModifiers::SHIFT);
+        fr.handle_input(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(fr.clipboard.get_text().unwrap(), "c");
+        assert_eq!(fr.find_text(), "ab");
+        fr.handle_input(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(fr.clipboard.get_text().unwrap(), "ab");
+        assert_eq!(fr.find_text(), "");
+        fr.handle_input(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(fr.find_text(), "ab");
+        assert_eq!(fr.take_clipboard_error(), None);
+    }
 }
