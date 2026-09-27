@@ -332,21 +332,23 @@ fn main() -> io::Result<()> {
     // Enable bracketed paste mode
     execute!(io::stdout(), event::EnableBracketedPaste)?;
 
-    // Enable enhanced keyboard protocol for better key combination support
-    // This helps disambiguate Ctrl+Backspace from Ctrl+H
-    if let Ok(_) = execute!(
+    let mut editor = editor::Editor::new();
+    let mut renderer = renderer::Renderer::new()?;
+
+    // Enhanced keyboard reporting (the kitty protocol: kitty, WezTerm, foot,
+    // Ghostty...), so keys with Ctrl or Alt arrive whole: Ctrl+Backspace apart
+    // from Ctrl+H, Ctrl+Shift+Z apart from Ctrl+Z, and Ctrl+= and Ctrl+- at all
+    // (as plain text they're "=" and a control code). Pushed only once the
+    // renderer has entered the alternate screen: each screen keeps its own
+    // mode, so a mode set before would never reach the screen sage draws on.
+    // Only disambiguation: text keys still arrive as text, so Caps Lock and
+    // input methods type as ever, and Shift stays on shifted Ctrl keys.
+    let _ = execute!(
         io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-                | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
-    ) {
-        // Enhanced keyboard mode enabled successfully
-    }
-    
-    let mut editor = editor::Editor::new();
-    let mut renderer = renderer::Renderer::new()?;
+    );
 
     // Load file if provided
     if let Some(path) = file_to_execute {
@@ -380,12 +382,12 @@ fn main() -> io::Result<()> {
     // Main loop
     let result = event_loop::run(&mut editor, &mut renderer);
     
-    // Cleanup
+    // Cleanup. The keyboard mode is popped on the alternate screen it was
+    // pushed on, before the renderer leaves it.
+    let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
     renderer.cleanup()?;
     execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
     execute!(io::stdout(), event::DisableBracketedPaste)?;
-    // Disable enhanced keyboard protocol
-    let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     
     if let Err(e) = result {
