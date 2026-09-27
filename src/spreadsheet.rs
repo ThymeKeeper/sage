@@ -4413,7 +4413,7 @@ mod tests {
             }
             // Filters and sorts aren't undo steps: change them between undos
             // and redos too, which must still give back the same data.
-            let mut shuffle_view = |ss: &mut Spreadsheet, pick: usize, col: usize, desc: bool| {
+            let shuffle_view = |ss: &mut Spreadsheet, pick: usize, col: usize, desc: bool| {
                 if ss.num_cols() == 0 {
                     return;
                 }
