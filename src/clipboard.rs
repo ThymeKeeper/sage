@@ -31,6 +31,18 @@ impl ClipboardProvider {
         ClipboardProvider::None
     }
 
+    /// Whether sage can read the clipboard (not over OSC 52, or with none). An
+    /// empty clipboard, or one holding no text, still counts: it is read as
+    /// having no text.
+    pub fn can_read(&self) -> bool {
+        match self {
+            ClipboardProvider::Native(_) => true,
+            ClipboardProvider::Osc52 | ClipboardProvider::None => false,
+            #[cfg(test)]
+            ClipboardProvider::Memory(_) => true,
+        }
+    }
+
     /// Check if OSC 52 is likely to be supported
     fn is_osc52_likely_supported() -> bool {
         // Check for SSH connection

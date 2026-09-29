@@ -138,6 +138,11 @@ impl Editor {
         self.clipboard.get_text()
     }
 
+    /// Whether sage can read the clipboard at all (see `ClipboardProvider::can_read`).
+    pub fn clipboard_can_read(&self) -> bool {
+        self.clipboard.can_read()
+    }
+
     /// Swap in a clipboard for a test: none at all, or one held in memory.
     #[cfg(test)]
     pub fn set_clipboard_provider(&mut self, clipboard: ClipboardProvider) {

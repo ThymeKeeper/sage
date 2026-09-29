@@ -52,15 +52,59 @@ fn text_key_char(event: &Event) -> Option<char> {
 }
 
 /// Whether keys that arrived together in the grid are the Windows console's
-/// paste of cells, rather than typing that queued up while sage was busy (a
-/// long save, say) or a held key. Data typed ahead is values each followed by
-/// its Tab or Enter, so a burst is a paste only with a tab or line break
-/// between values: not starting with one, not ending in a Tab, and not while a
-/// cell is being edited. Anything else is replayed as the keys it was, since
-/// as a paste a trailing Tab would clear the next cell.
+/// paste, rather than typing that queued up while sage was busy (a long save,
+/// a commit on a huge file) or a held key. Typing is replayed as the keys it
+/// was: Enter and Tab then move on as they do, so values typed ahead land
+/// cell after cell, where a paste would have put them all back under the
+/// cursor. When sage can read the clipboard it decides: a paste is the
+/// clipboard's text, and that text (line ends and all) is what gets pasted.
+/// Without one, the burst's shape does (`grid_burst_is_paste`). Returns the
+/// text to paste, or `None` to replay the keys.
+fn grid_burst_paste_text(editor: &mut editor::Editor, text: &str, editing: bool) -> Option<String> {
+    if editor.clipboard_can_read() {
+        let clip = editor.clipboard_text().ok()?;
+        burst_is_clipboard(text, &clip).then_some(clip)
+    } else {
+        grid_burst_is_paste(text, editing).then(|| text.to_string())
+    }
+}
+
+/// Whether a burst of keys is the clipboard's text, as a terminal types it in:
+/// line ends may come as CR, LF or both, and the terminal may drop trailing
+/// tabs, spaces and line ends (Windows Terminal trims a one-line paste), but
+/// never adds any. So the clipboard must be the burst plus at most such
+/// whitespace: typed-ahead "12" then Enter or Tab never matches a clipboard
+/// holding just "12".
+fn burst_is_clipboard(burst: &str, clip: &str) -> bool {
+    let norm = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            let ch = if ch == '\r' { '\n' } else { ch };
+            if !(ch == '\n' && out.ends_with('\n')) {
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let blank = |c: char| matches!(c, '\t' | ' ' | '\n');
+    let (b, c) = (norm(burst), norm(clip));
+    !b.chars().all(blank) && c.starts_with(&b) && c[b.len()..].chars().all(blank)
+}
+
+/// Without a clipboard to ask, the burst's shape decides. Data typed ahead is
+/// values each followed by its Tab or Enter, so in a cell not being edited a
+/// burst is a paste only with a tab or line break between values: not
+/// starting with one and not ending in a Tab (as a paste a trailing Tab would
+/// clear the next cell). In a cell being edited, a line break followed by
+/// more text is a paste into the cell: replayed, each line would type over
+/// the next cell down.
 fn grid_burst_is_paste(text: &str, editing: bool) -> bool {
     let sep = |c: char| c == '\t' || c == '\n';
-    !editing && !text.starts_with(sep) && !text.ends_with('\t') && text.trim_end_matches(sep).contains(sep)
+    let body = text.trim_end_matches(sep);
+    if editing {
+        return body.contains('\n');
+    }
+    !text.starts_with(sep) && !text.ends_with('\t') && body.contains(sep)
 }
 
 /// Full-window re-render: clear the terminal and drop every line cache (editor
@@ -108,7 +152,8 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
     let mut autocomplete_was_visible = false; // Dropdown was painted last frame
 
     // Spreadsheet: track recent click for double-click detection
-    let mut ss_last_click: Option<(std::time::Instant, crate::spreadsheet::GridHit)> = None;
+    // (when, what it hit, where on screen).
+    let mut ss_last_click: Option<(std::time::Instant, crate::spreadsheet::GridHit, (u16, u16))> = None;
 
     // Event left over from paste-burst coalescing (the non-text key that ended a
     // burst) — consumed on the next iteration before polling for new input.
@@ -344,7 +389,13 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         keys.push(*k);
                     }
                     loop {
-                        if !event::poll(std::time::Duration::ZERO)? {
+                        // Wait a moment, not zero: the console types a paste's
+                        // capitals and symbols with Shift key records around
+                        // them, which crossterm drops, and a zero-wait poll
+                        // that reads only a dropped record says nothing is
+                        // queued, ending the burst at every capital. A few ms
+                        // also bridges the gaps in a large paste's delivery.
+                        if !event::poll(std::time::Duration::from_millis(5))? {
                             break;
                         }
                         let next = event::read()?;
@@ -374,9 +425,9 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         if editor.is_spreadsheet_mode() {
                             clear_status_error(editor);
                             let editing = editor.spreadsheet().map_or(false, |ss| ss.is_editing());
-                            if grid_burst_is_paste(&pasted, editing) {
+                            if let Some(text) = grid_burst_paste_text(editor, &pasted, editing) {
                                 if let Some(ss) = editor.spreadsheet_mut() {
-                                    ss.paste(&pasted);
+                                    ss.paste(&text);
                                 }
                             } else {
                                 for k in &keys {
@@ -439,6 +490,15 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                         continue;
                     }
 
+                    // The wheel moves the grid under the pointer: a click after
+                    // it isn't the second of a double-click.
+                    if matches!(
+                        mouse_event.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                    ) {
+                        ss_last_click = None;
+                    }
+
                     // Double-click detection for auto-sizing columns
                     if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
                         let (term_w, term_h) = crossterm::terminal::size()?;
@@ -446,23 +506,52 @@ pub fn run(editor: &mut editor::Editor, renderer: &mut renderer::Renderer) -> io
                             .spreadsheet()
                             .map(|ss| ss.hit_test(mouse_event.column, mouse_event.row, term_w, term_h));
                         if let Some(hit) = hit_now {
+                            use crate::spreadsheet::GridHit;
                             let now = std::time::Instant::now();
-                            let is_double = ss_last_click
-                                .as_ref()
-                                .map(|(t, prev_hit)| {
-                                    now.duration_since(*t) < std::time::Duration::from_millis(500)
-                                        && *prev_hit == hit
-                                })
-                                .unwrap_or(false);
-                            ss_last_click = Some((now, hit));
-                            if is_double {
-                                if let crate::spreadsheet::GridHit::ColumnSeparator { col } = hit {
+                            let pos = (mouse_event.column, mouse_event.row);
+                            let prev = ss_last_click
+                                .filter(|(t, _, _)| now.duration_since(*t) < std::time::Duration::from_millis(500));
+                            ss_last_click = Some((now, hit, pos));
+                            if let Some((_, prev_hit, prev_pos)) = prev {
+                                if let (true, GridHit::ColumnSeparator { col }) = (prev_hit == hit, hit) {
                                     if let Some(ss) = editor.spreadsheet_mut() {
                                         ss.end_mouse(); // Cancel any pending resize drag
                                         ss.auto_size_column(col);
                                     }
                                     needs_redraw = true;
                                     continue;
+                                }
+                                // Double-clicking a cell edits it (Edit mode, as in
+                                // Excel), with the caret at the click. The second
+                                // click counts in the same place even if the first
+                                // moved the grid under it (committing an edit can
+                                // widen a column; a cut-off cell scrolls into view).
+                                // Not while the find pane is open: it takes the keys.
+                                if let GridHit::DataCell { row, col } = prev_hit {
+                                    let on_it = editor
+                                        .spreadsheet()
+                                        .map_or(false, |ss| ss.cursor == (row, col) && !ss.is_editing());
+                                    if on_it && find_replace.is_none() && (prev_hit == hit || prev_pos == pos) {
+                                        if let Some(ss) = editor.spreadsheet_mut() {
+                                            ss.end_mouse();
+                                            ss.enter_edit_mode();
+                                            // Find the character clicked with the text laid
+                                            // out as the cell showed it (its first line, from
+                                            // the start); off the text, the caret stays at the end.
+                                            let end = ss.editing.as_ref().map_or(0, |e| e.text.len());
+                                            ss.edit_set_cursor(0, false);
+                                            let byte = match ss.hit_test(pos.0, pos.1, term_w, term_h) {
+                                                GridHit::EditText { byte } => byte,
+                                                _ => end,
+                                            };
+                                            ss.edit_set_cursor(byte, false);
+                                        }
+                                        // A third click is a click in the text, not another double.
+                                        ss_last_click = None;
+                                        ensure_ss_cursor_visible(editor)?;
+                                        needs_redraw = true;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2794,6 +2883,9 @@ fn handle_spreadsheet_mouse(
                 GridHit::FormulaBar { row, text_col } => {
                     ss.begin_mouse_formula_bar_select(row, text_col, shift);
                 }
+                GridHit::EditText { byte } => {
+                    ss.begin_mouse_cell_text_select(byte, shift);
+                }
                 GridHit::Divider | GridHit::Outside => {}
             }
             *needs_redraw = true;
@@ -2858,6 +2950,14 @@ fn handle_spreadsheet_mouse(
                 let hit = ss.hit_test(me.column, me.row, width, height);
                 if let GridHit::FormulaBar { row, text_col } = hit {
                     let byte = ss.formula_bar_text_to_byte(row, text_col);
+                    ss.edit_set_cursor(byte, true);
+                    *needs_redraw = true;
+                }
+            }
+            // Drags on in the cell's text by the pointer's column alone, so a
+            // wobble off its one row, or past its ends, still selects.
+            MouseMode::CellTextSelect => {
+                if let Some(byte) = ss.edit_drag_byte(me.column as usize, width, height) {
                     ss.edit_set_cursor(byte, true);
                     *needs_redraw = true;
                 }
@@ -3016,37 +3116,75 @@ fn handle_spreadsheet_key(
         None => return false,
     };
 
+    // Typing over a cell (Excel's Enter mode), the arrow keys and Page Up/Down
+    // keep the entry and then move as they do between cells, below.
     if editing {
         let ss = editor.spreadsheet_mut().expect("spreadsheet");
+        let moves_on = matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::PageUp | KeyCode::PageDown
+        );
+        if moves_on && ss.edit_mode() == Some(crate::spreadsheet::EditMode::Enter) {
+            ss.commit_edit();
+            return handle_spreadsheet_key(editor, key, needs_redraw);
+        }
+    }
+
+    if editing {
+        let ss = editor.spreadsheet_mut().expect("spreadsheet");
+        let typing = ss.edit_mode() == Some(crate::spreadsheet::EditMode::Enter);
         match key.code {
             KeyCode::Esc => {
                 ss.cancel_edit();
                 *needs_redraw = true;
                 true
             }
-            KeyCode::Enter if shift => {
+            // Typing over a cell, Shift+Enter keeps the entry and moves up,
+            // as in Excel.
+            KeyCode::Enter if shift && typing && !ctrl && !alt => {
+                ss.commit_edit();
+                ss.move_up(false);
+                *needs_redraw = true;
+                true
+            }
+            // A line break in the cell: Alt+Enter, as in Excel, or, editing a
+            // value (F2), Shift+Enter, since Windows Terminal keeps Alt+Enter
+            // for full screen.
+            KeyCode::Enter if (shift || alt) && !ctrl => {
                 ss.edit_insert_newline();
                 *needs_redraw = true;
                 true
             }
+            // Ctrl+Enter keeps the entry and stays on the cell.
+            KeyCode::Enter if ctrl => {
+                ss.commit_edit();
+                *needs_redraw = true;
+                true
+            }
+            // Enter keeps the entry and moves down (after a run of Tabs, to
+            // the column it started from).
             KeyCode::Enter => {
                 ss.commit_edit();
+                ss.enter_down();
                 *needs_redraw = true;
                 true
             }
             KeyCode::Tab => {
                 ss.commit_edit();
-                if shift {
-                    ss.move_left(false);
-                } else {
-                    ss.move_right(false);
-                }
+                ss.tab_move(shift);
                 *needs_redraw = true;
                 true
             }
             KeyCode::BackTab => {
                 ss.commit_edit();
-                ss.move_left(false);
+                ss.tab_move(true);
+                *needs_redraw = true;
+                true
+            }
+            // F2 switches between typing (arrows move on) and editing (arrows
+            // move the caret), as in Excel.
+            KeyCode::F(2) => {
+                ss.toggle_edit_mode();
                 *needs_redraw = true;
                 true
             }
@@ -3193,22 +3331,30 @@ fn handle_spreadsheet_key(
                 *needs_redraw = true;
                 true
             }
-            KeyCode::Enter | KeyCode::F(2) => {
+            // Enter moves down (after a run of Tabs, to the column it started
+            // from) and Shift+Enter up, as in Excel; F2 edits the cell.
+            KeyCode::Enter if shift && !ctrl && !alt => {
+                ss.move_up(false);
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::Enter if !ctrl && !alt => {
+                ss.enter_down();
+                *needs_redraw = true;
+                true
+            }
+            KeyCode::F(2) => {
                 ss.enter_edit_mode();
                 *needs_redraw = true;
                 true
             }
             KeyCode::Tab => {
-                if shift {
-                    ss.move_left(false);
-                } else {
-                    ss.move_right(false);
-                }
+                ss.tab_move(shift);
                 *needs_redraw = true;
                 true
             }
             KeyCode::BackTab => {
-                ss.move_left(false);
+                ss.tab_move(true);
                 *needs_redraw = true;
                 true
             }
@@ -3352,6 +3498,214 @@ mod tests {
         );
     }
 
+    fn typed(editor: &mut editor::Editor, s: &str) {
+        let keys: Vec<(KeyCode, KeyModifiers)> = s.chars().map(|c| (KeyCode::Char(c), NONE)).collect();
+        press(editor, &keys);
+    }
+
+    #[test]
+    fn enter_keeps_the_entry_and_moves_down_as_in_excel() {
+        let (mut editor, tmp) = load(CSV);
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::Right, NONE)]); // C2
+        for v in ["31", "11", "21"] {
+            typed(&mut editor, v);
+            press(&mut editor, &[(KeyCode::Enter, NONE)]);
+        }
+        let ss = editor.spreadsheet().unwrap();
+        assert!(!ss.is_editing());
+        assert_eq!(ss.cursor, (4, 2)); // on C5, ready for the next value
+        editor.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "id,city,amt\n1,YYC,31\n2,YYZ,11\n3,YVR,21\n4,YYC,40\n"
+        );
+    }
+
+    #[test]
+    fn enter_and_shift_enter_move_between_cells_without_editing() {
+        let (mut editor, _tmp) = load(CSV);
+        press(&mut editor, &[(KeyCode::Enter, NONE), (KeyCode::Enter, NONE)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert_eq!(ss.cursor, (2, 0));
+        assert!(!ss.is_editing());
+        press(&mut editor, &[(KeyCode::Enter, SHIFT)]);
+        assert_eq!(editor.spreadsheet().unwrap().cursor, (1, 0));
+        // F2 edits the cell as it is, caret at the end.
+        press(&mut editor, &[(KeyCode::F(2), NONE)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert_eq!(ss.edit_mode(), Some(crate::spreadsheet::EditMode::Edit));
+        assert_eq!(ss.focused_cell_text(), "1");
+    }
+
+    #[test]
+    fn typing_over_a_cell_the_arrows_keep_the_entry_and_move_on() {
+        let (mut editor, _tmp) = load(CSV);
+        press(&mut editor, &[(KeyCode::Down, NONE)]); // A2
+        typed(&mut editor, "7");
+        assert_eq!(editor.spreadsheet().unwrap().edit_mode(), Some(crate::spreadsheet::EditMode::Enter));
+        press(&mut editor, &[(KeyCode::Right, NONE)]);
+        typed(&mut editor, "YQR");
+        press(&mut editor, &[(KeyCode::Down, NONE)]);
+        typed(&mut editor, "ABC");
+        press(&mut editor, &[(KeyCode::Up, SHIFT)]); // keeps the entry, then selects up
+        let ss = editor.spreadsheet().unwrap();
+        assert!(!ss.is_editing());
+        assert_eq!((ss.cell(1, 0), ss.cell(1, 1), ss.cell(2, 1)), ("7", "YQR", "ABC"));
+        assert_eq!((ss.cursor, ss.selection_anchor), ((1, 1), Some((2, 1))));
+        // Page Down keeps it too.
+        press(&mut editor, &[(KeyCode::Char('Q'), NONE), (KeyCode::PageDown, NONE)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert!(!ss.is_editing());
+        assert_eq!(ss.cell(1, 1), "Q");
+    }
+
+    #[test]
+    fn in_edit_mode_the_arrows_move_the_caret_and_f2_switches() {
+        let (mut editor, _tmp) = load(CSV);
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::F(2), NONE)]); // B2 = YYC
+        press(&mut editor, &[(KeyCode::Left, NONE), (KeyCode::Left, NONE)]);
+        typed(&mut editor, "-");
+        press(&mut editor, &[(KeyCode::Right, NONE), (KeyCode::Up, NONE), (KeyCode::Down, NONE)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert!(ss.is_editing());
+        assert_eq!((ss.cursor, ss.focused_cell_text()), ((1, 1), "Y-YC"));
+        // F2 switches to typing: now an arrow keeps the entry and moves on.
+        press(&mut editor, &[(KeyCode::F(2), NONE), (KeyCode::Left, NONE)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert!(!ss.is_editing());
+        assert_eq!((ss.cursor, ss.cell(1, 1)), ((1, 0), "Y-YC"));
+        // And back: typed over, F2 makes the arrows move the caret instead.
+        typed(&mut editor, "ab");
+        press(&mut editor, &[(KeyCode::F(2), NONE), (KeyCode::Left, NONE)]);
+        typed(&mut editor, "X");
+        press(&mut editor, &[(KeyCode::Enter, NONE)]);
+        assert_eq!(editor.spreadsheet().unwrap().cell(1, 0), "aXb");
+    }
+
+    #[test]
+    fn tab_across_a_row_then_enter_starts_the_next_row() {
+        let (mut editor, tmp) = load("a,b,c\n");
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Right, NONE)]); // B2
+        for row in [["1", "2"], ["3", "4"]] {
+            typed(&mut editor, row[0]);
+            press(&mut editor, &[(KeyCode::Tab, NONE)]);
+            typed(&mut editor, row[1]);
+            press(&mut editor, &[(KeyCode::Enter, NONE)]);
+        }
+        assert_eq!(editor.spreadsheet().unwrap().cursor, (3, 1)); // B4
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a,b,c\n,1,2\n,3,4\n");
+        // Any other move ends the run: Enter then goes straight down.
+        press(&mut editor, &[(KeyCode::Tab, NONE), (KeyCode::Right, NONE), (KeyCode::Enter, NONE)]);
+        assert_eq!(editor.spreadsheet().unwrap().cursor, (4, 3));
+    }
+
+    #[test]
+    fn ctrl_enter_keeps_the_entry_in_place_and_alt_or_shift_enter_break_the_line() {
+        let (mut editor, _tmp) = load(CSV);
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Right, NONE)]); // B2
+        typed(&mut editor, "a");
+        press(&mut editor, &[(KeyCode::Enter, KeyModifiers::ALT)]); // a line break, even typing
+        typed(&mut editor, "b");
+        // Editing a value (F2), Shift+Enter breaks the line too.
+        press(&mut editor, &[(KeyCode::F(2), NONE), (KeyCode::Enter, SHIFT)]);
+        typed(&mut editor, "c");
+        press(&mut editor, &[(KeyCode::Enter, KeyModifiers::CONTROL)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert!(!ss.is_editing());
+        assert_eq!((ss.cursor, ss.cell(1, 1)), ((1, 1), "a\nb\nc"));
+        // Esc still drops an entry.
+        typed(&mut editor, "zzz");
+        press(&mut editor, &[(KeyCode::Esc, NONE)]);
+        assert_eq!(editor.spreadsheet().unwrap().cell(1, 1), "a\nb\nc");
+        // Typing over a cell, Shift+Enter keeps it and moves up, as in Excel.
+        press(&mut editor, &[(KeyCode::Down, NONE)]);
+        typed(&mut editor, "250");
+        press(&mut editor, &[(KeyCode::Enter, SHIFT)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert!(!ss.is_editing());
+        assert_eq!((ss.cursor, ss.cell(2, 1)), ((1, 1), "250"));
+    }
+
+    #[test]
+    fn a_null_opened_and_left_stays_null_and_delete_leaves_nulls() {
+        let (mut editor, tmp) = load("a,b\n1,\n2,x\n");
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::F(2), NONE), (KeyCode::Enter, NONE)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert!(ss.is_null(1, 1));
+        assert!(!editor.is_modified());
+        // Enter moved to B3: Delete clears its x to a null.
+        press(&mut editor, &[(KeyCode::Delete, NONE)]);
+        assert!(editor.spreadsheet().unwrap().is_null(2, 1));
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a,b\n1,\n2,\n");
+    }
+
+    #[test]
+    fn a_click_on_a_column_letter_ends_a_run_of_tabs() {
+        let (mut editor, _tmp) = load(CSV);
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Tab, NONE), (KeyCode::Tab, NONE)]); // C2, run from A
+        editor.spreadsheet_mut().unwrap().select_column(1, false); // click the letter B
+        press(&mut editor, &[(KeyCode::Enter, NONE)]);
+        assert_eq!(editor.spreadsheet().unwrap().cursor, (1, 1)); // B2, not A2
+        // Ctrl+A likewise.
+        press(&mut editor, &[(KeyCode::Tab, NONE), (KeyCode::Char('a'), KeyModifiers::CONTROL), (KeyCode::Enter, NONE)]);
+        let ss = editor.spreadsheet().unwrap();
+        assert_eq!(ss.cursor.1, 2); // straight down from where Ctrl+A put it
+    }
+
+    #[test]
+    fn a_burst_is_a_paste_when_it_is_the_clipboards_text() {
+        // As terminals type a paste in: CR, LF or both for a line end, and a
+        // trailing line end or space may be dropped.
+        assert!(burst_is_clipboard("a\tb\nc\td\n", "a\tb\r\nc\td\r\n"));
+        assert!(burst_is_clipboard("a\tb\n\nc\td", "a\tb\r\nc\td"));
+        assert!(burst_is_clipboard("Suite 400\nCalgary", "Suite 400\r\nCalgary\r\n"));
+        assert!(!burst_is_clipboard("7\n8\n9\n", "a\tb\r\n"));
+        assert!(!burst_is_clipboard("7\n", "7\n8"));
+        assert!(!burst_is_clipboard("\n\n", "\n"));
+        // Windows Terminal trims a one-line paste's trailing tabs and line end.
+        assert!(burst_is_clipboard("100\t200", "100\t200\t\r\n"));
+        // A terminal never adds what the clipboard lacks: these are typing.
+        assert!(!burst_is_clipboard("12\t", "12"));
+        assert!(!burst_is_clipboard("12\n", "12"));
+        assert!(!burst_is_clipboard("1\n2\n", "1\n2"));
+
+        // With a clipboard to read, typing ahead (anything that isn't its
+        // text) is replayed as keys, and a paste pastes the clipboard's text.
+        let (mut editor, _tmp) = load(CSV);
+        editor.set_clipboard_provider(ClipboardProvider::Memory(Some("x\ty\r\n".to_string())));
+        assert_eq!(grid_burst_paste_text(&mut editor, "7\n8\n", false), None);
+        assert_eq!(grid_burst_paste_text(&mut editor, "x\ty\n", false), Some("x\ty\r\n".to_string()));
+        editor.set_clipboard_provider(ClipboardProvider::Memory(None)); // nothing on it: all typing
+        assert_eq!(grid_burst_paste_text(&mut editor, "a\tb", false), None);
+        // With none to read, the burst's shape decides.
+        editor.set_clipboard_provider(ClipboardProvider::None);
+        assert_eq!(grid_burst_paste_text(&mut editor, "a\tb", false), Some("a\tb".to_string()));
+    }
+
+    #[test]
+    fn values_typed_ahead_land_cell_after_cell() {
+        // Keys that queued up while sage was busy are replayed: Enter moves on.
+        let (mut editor, tmp) = load(CSV);
+        editor.set_clipboard_provider(ClipboardProvider::Memory(None));
+        press(&mut editor, &[(KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::Right, NONE)]); // C2
+        let burst = "31\n11\n2";
+        assert_eq!(grid_burst_paste_text(&mut editor, burst, false), None);
+        let keys: Vec<(KeyCode, KeyModifiers)> = burst
+            .chars()
+            .map(|c| (if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) }, NONE))
+            .collect();
+        press(&mut editor, &keys);
+        typed(&mut editor, "1"); // typing goes on into the same entry
+        press(&mut editor, &[(KeyCode::Enter, NONE)]);
+        editor.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "id,city,amt\n1,YYC,31\n2,YYZ,11\n3,YVR,21\n4,YYC,40\n"
+        );
+    }
+
     #[test]
     fn a_range_delete_under_a_filter_and_sort_clears_only_the_visible_cells() {
         let (mut editor, tmp) = load(CSV);
@@ -3368,10 +3722,11 @@ mod tests {
             (KeyCode::Delete, NONE),
         ]);
         editor.save().unwrap();
-        // ids 3 and 1 cleared (empty strings save quoted); hidden id 2 and id 4 untouched; file order kept.
+        // ids 3 and 1 cleared (to nulls, saved as empty fields); hidden id 2
+        // and id 4 untouched; file order kept.
         assert_eq!(
             std::fs::read_to_string(tmp.path()).unwrap(),
-            "id,city,amt\n1,\"\",\"\"\n2,YYZ,10\n3,\"\",\"\"\n4,YYC,40\n"
+            "id,city,amt\n1,,\n2,YYZ,10\n3,,\n4,YYC,40\n"
         );
     }
 
@@ -3505,7 +3860,7 @@ mod tests {
         editor.set_clipboard_provider(ClipboardProvider::None);
         let ctrl = KeyModifiers::CONTROL;
         press(&mut editor, &[
-            (KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::Enter, NONE), // edit B2
+            (KeyCode::Down, NONE), (KeyCode::Right, NONE), (KeyCode::F(2), NONE), // edit B2
             (KeyCode::Char('a'), ctrl), (KeyCode::Char('x'), ctrl),
         ]);
         assert_eq!(editor.spreadsheet().unwrap().focused_cell_text(), "YYC");
@@ -3527,8 +3882,11 @@ mod tests {
         assert!(!paste("\nZ"));
         assert!(!paste("\t\t\t"));
         assert!(!paste("\n\n"));
-        // In a cell being edited, Tab and Enter commit: always replayed.
+        // In a cell being edited, Tab and Enter commit: replayed, unless a
+        // line break has more text after it (lines pasted into the cell).
         assert!(!grid_burst_is_paste("a\tb", true));
+        assert!(!grid_burst_is_paste("abc\n", true));
+        assert!(grid_burst_is_paste("Suite 400\nCalgary", true));
     }
 
     #[test]
@@ -3547,11 +3905,11 @@ mod tests {
         editor.save().unwrap();
         assert_eq!(
             std::fs::read_to_string(tmp.path()).unwrap(),
-            "id,city,amt\n1,\"\",\"\"\n2,YYZ,10\n3,YYC,30\n4,YYC,40\n"
+            "id,city,amt\n1,,\n2,YYZ,10\n3,YYC,30\n4,YYC,40\n" // the cut cells are nulls
         );
         // Inside a cell: copy the selected text, paste it at the caret.
         press(&mut editor, &[
-            (KeyCode::Up, NONE), (KeyCode::Enter, NONE), (KeyCode::Char('a'), ctrl), (KeyCode::Char('c'), ctrl),
+            (KeyCode::Up, NONE), (KeyCode::F(2), NONE), (KeyCode::Char('a'), ctrl), (KeyCode::Char('c'), ctrl),
             (KeyCode::End, NONE), (KeyCode::Char('v'), ctrl), (KeyCode::Enter, NONE),
         ]);
         assert_eq!(editor.spreadsheet().unwrap().cell(2, 1), "YYZYYZ");

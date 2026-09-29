@@ -960,6 +960,8 @@ impl Renderer {
         let visible_data_rows = data_end_exclusive.saturating_sub(data_start);
 
         let _ = visible_data_rows; // cursor visibility is managed by the event loop now
+        // The selection's summary (kept until the selection or data changes).
+        let summary = editor.spreadsheet_mut().map(|ss| ss.selection_summary()).unwrap_or_default();
         let ss = editor.spreadsheet().expect("spreadsheet mode");
         // Row-number gutter width scales with the row count so the header letters
         // stay aligned with the data columns even at the bottom of a huge file.
@@ -969,12 +971,11 @@ impl Renderer {
         let ((sel_r0, sel_c0), (sel_r1, sel_c1)) = ss.selected_range();
         let has_multi_selection = ss.has_selection();
 
+        // The cell being edited, drawn with its text in the grid (see EditBox).
+        let edit_box = ss.edit_box(width as usize, visible_data_rows);
+
         // --- Formula bar ---
-        let label = if editing {
-            format!(" {} (editing) ", ss.cursor_label())
-        } else {
-            format!(" {} ", ss.cursor_label())
-        };
+        let label = ss.formula_bar_label();
         let label_width = label.chars().count();
 
         let detail_source: String = if let Some(edit) = ss.editing.as_ref() {
@@ -1213,6 +1214,54 @@ impl Renderer {
                     "\x1b[0m\x1b[48;5;234m\x1b[38;5;240m│\x1b[0m"
                 };
                 let is_focused_cell = row_idx == cur_row && col_idx == cur_col;
+
+                // The cell being edited: its text as typed, over the cells to
+                // its right that it has widened across.
+                if let (true, Some(b), Some(edit)) = (is_focused_cell, edit_box, ss.editing.as_ref()) {
+                    let edit_bg = "\x1b[48;5;22m\x1b[38;5;230m";
+                    line.push_str(edit_bg);
+                    let mut shown = 0usize;
+                    let mut byte = b.view_start;
+                    let mut in_sel = false;
+                    for ch in edit.text[b.view_start..b.line_end].chars() {
+                        let cw = ch.width().unwrap_or(1);
+                        if shown + cw > b.width {
+                            break;
+                        }
+                        let selected = edit_selection.map_or(false, |(a, z)| byte >= a && byte < z);
+                        if selected != in_sel {
+                            line.push_str(if selected { "\x1b[48;5;24m\x1b[38;5;230m" } else { edit_bg });
+                            in_sel = selected;
+                        }
+                        // One column each, as the box's layout counts them: a
+                        // raw tab or CR would move the terminal's cursor.
+                        line.push(match ch {
+                            '\t' => shown_char(ch),
+                            c if c.is_control() => '\u{FFFD}',
+                            c => c,
+                        });
+                        shown += cw;
+                        byte += ch.len_utf8();
+                    }
+                    if in_sel {
+                        line.push_str(edit_bg);
+                    }
+                    while shown < b.width {
+                        line.push(' ');
+                        shown += 1;
+                    }
+                    if b.width >= remaining {
+                        // It runs to the screen's edge.
+                        line.push_str("\x1b[0m");
+                        used += remaining;
+                        break;
+                    }
+                    line.push_str(separator);
+                    used += b.width + 1;
+                    col_idx = b.last_col + 1;
+                    continue;
+                }
+
                 let in_selection = has_multi_selection
                     && row_idx >= sel_r0
                     && row_idx <= sel_r1
@@ -1307,7 +1356,7 @@ impl Renderer {
             view_info.push_str(" \u{00b7} sorted");
         }
         let middle = format!(" [{}{}] ", lang_label, view_info);
-        let metrics = ss.selection_metrics().format();
+        let metrics = summary;
         let metrics_display = if metrics.is_empty() {
             String::new()
         } else {
@@ -1355,16 +1404,28 @@ impl Renderer {
         }
         self.last_status = status_line;
 
-        // --- Position text cursor in formula bar if editing ---
+        // --- Position the text cursor if editing: in the cell, or in the
+        // formula bar when the edit was clicked there or the cell is off screen ---
         if editing {
             if let Some(edit) = ss.editing.as_ref() {
-                let (edit_line, edit_col) = cursor_line_col_chars(&edit.text, edit.cursor);
-                let fb_row = edit_line.min(formula_bar_rows - 1);
-                let text_start_col = label_width;
-                let text_width = (width as usize).saturating_sub(text_start_col);
-                let visible_col = edit_col.min(text_width.saturating_sub(1));
-                let screen_row = fb_row;
-                let screen_col = text_start_col + visible_col;
+                let in_cell = edit_box.filter(|_| {
+                    !edit.caret_in_bar && cur_row >= ss.scroll_row && cur_row < ss.scroll_row + visible_data_rows
+                });
+                let (screen_row, screen_col) = if let Some(b) = in_cell {
+                    let before: usize = edit.text[b.view_start..edit.cursor]
+                        .chars()
+                        .map(|c| c.width().unwrap_or(1))
+                        .sum();
+                    let col = b.x + before.min(b.width.saturating_sub(1));
+                    (data_start + (cur_row - ss.scroll_row), col)
+                } else {
+                    let (edit_line, edit_col) = cursor_line_col_chars(&edit.text, edit.cursor);
+                    let fb_row = edit_line.min(formula_bar_rows - 1);
+                    let text_start_col = label_width;
+                    let text_width = (width as usize).saturating_sub(text_start_col);
+                    let visible_col = edit_col.min(text_width.saturating_sub(1));
+                    (fb_row, text_start_col + visible_col)
+                };
                 #[cfg(target_os = "windows")]
                 write!(
                     self.stdout,

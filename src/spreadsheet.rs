@@ -18,6 +18,8 @@ pub enum MouseMode {
     None,
     CellSelect,
     FormulaBarSelect,
+    /// Selecting text in the cell being edited, in the grid.
+    CellTextSelect,
     ColumnResize {
         col: usize,
         anchor_screen_col: u16,
@@ -36,6 +38,9 @@ pub enum GridHit {
     ColumnSeparator { col: usize },
     DataCell { row: usize, col: usize },
     RowNumber { row: usize },
+    /// The text of the cell being edited, drawn in the grid: `byte` is the
+    /// place in it under the click.
+    EditText { byte: usize },
 }
 
 /// Accumulated timezone state across the date/datetime cells in a selection,
@@ -55,6 +60,11 @@ enum TzAgg {
 pub struct SelectionMetrics {
     pub total_cells: usize,
     pub non_empty: usize,
+    /// Distinct values among the non-empty cells (as SQL's COUNT(DISTINCT)
+    /// counts them: nulls and blanks aside, text compared exactly).
+    pub unique: usize,
+    /// Null cells (∅: stored, or missing from a short row).
+    pub nulls: usize,
     pub numbers: Vec<f64>,
     /// Epoch seconds (UTC) for each date/datetime cell. Date-only cells land at
     /// midnight; `dates_have_time` records whether any carried a time-of-day.
@@ -73,10 +83,12 @@ impl SelectionMetrics {
             return String::new();
         }
         let mut parts: Vec<String> = Vec::new();
-        if self.total_cells == 1 {
-            parts.push(format!("n {}", self.non_empty));
-        } else {
-            parts.push(format!("n {}/{}", self.non_empty, self.total_cells));
+        // count: the cells selected.
+        let int = |n: usize| fmt_num(n as f64);
+        parts.push(format!("count {}", int(self.total_cells)));
+        if self.total_cells > 1 {
+            parts.push(format!("unique {}", int(self.unique)));
+            parts.push(format!("null {}", fmt_percent(self.nulls, self.total_cells)));
         }
 
         // Show sum/avg only when ALL non-empty cells are the same parseable type.
@@ -176,6 +188,17 @@ pub struct Spreadsheet {
     /// while it stands: it tells Ctrl+= and Ctrl+- to act on whole columns or
     /// rows even where the shape alone can't (a one-column file, say).
     picked_lines: Option<PickedLines>,
+    /// The column a run of Tabs started from, and the cell the last Tab left
+    /// the cursor on: Enter then goes down to that column, so a table can be
+    /// typed in row by row, as in Excel. It holds only while the cursor is
+    /// still on that cell, so any other move ends the run.
+    tab_start: Option<(usize, (usize, usize))>,
+    /// Counts changes to the cells or to the rows shown (every edit, undo,
+    /// redo, filter and sort), so the status bar's summary is worked out once
+    /// per selection and change, not on every redraw.
+    generation: u64,
+    /// The status bar's summary, with the selection and generation it is for.
+    summary_cache: Option<(((usize, usize), (usize, usize)), u64, String)>,
 }
 
 /// Whole rows or columns picked by their numbers or letters, with the
@@ -318,11 +341,51 @@ pub struct CellEdit {
     pub text: String,
     pub cursor: usize,
     pub selection_start: Option<usize>,
+    pub mode: EditMode,
+    /// The caret shows in the formula bar (the edit was last clicked there)
+    /// rather than in the cell.
+    pub caret_in_bar: bool,
+    /// Where the grid's view of the caret's line starts (a byte), kept from
+    /// one drawing to the next so the text only scrolls when the caret would
+    /// leave the box: the text stays put under a click or a drag.
+    view: std::cell::Cell<usize>,
+}
+
+/// Excel's two ways of being in a cell. Typing over a cell is Enter mode: the
+/// arrow keys (and Page Up/Down) keep the entry and move to the next cell.
+/// F2, a double-click or a click in the text is Edit mode: they move the caret
+/// in the text. F2 switches between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditMode {
+    Enter,
+    Edit,
+}
+
+/// The cell being edited, as the grid draws it. As in Excel the text shows in
+/// the cell itself, and the cell widens over its neighbours to the right as
+/// the text outgrows it (up to the screen's edge). It shows one line of the
+/// text, the caret's, scrolled to keep the caret in view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditBox {
+    /// Screen column the box starts at, and its width.
+    pub x: usize,
+    pub width: usize,
+    /// The last grid column it covers.
+    pub last_col: usize,
+    /// Bytes of the edit text: where the view of the caret's line starts, and
+    /// where the line ends.
+    pub view_start: usize,
+    pub line_end: usize,
 }
 
 impl Spreadsheet {
+    /// Open a CSV/TSV file as a grid. Refused, with the reason, when the grid
+    /// wouldn't fit in the memory the machine has free (see `grid_memory_estimate`).
     pub fn from_file(path: &Path) -> io::Result<Self> {
         let delimiter = detect_delimiter(path);
+        if let Some(free) = available_memory() {
+            grid_fits(grid_memory_estimate(path, delimiter)?, free)?;
+        }
         let content = std::fs::read_to_string(path)?;
         Ok(Self::from_text(&content, delimiter, false).expect("lenient reading never refuses"))
     }
@@ -424,6 +487,9 @@ impl Spreadsheet {
             redo: Vec::new(),
             save_point: Some(0),
             picked_lines: None,
+            tab_start: None,
+            generation: 0,
+            summary_cache: None,
         };
         ss.recompute_column_widths();
         Ok(ss)
@@ -464,6 +530,9 @@ impl Spreadsheet {
             redo: Vec::new(),
             save_point: Some(0),
             picked_lines: None,
+            tab_start: None,
+            generation: 0,
+            summary_cache: None,
         }
     }
 
@@ -729,6 +798,7 @@ impl Spreadsheet {
     /// Recompute the displayed rows from the filters and sort levels, keeping
     /// the cursor on the same file row while that row is still shown.
     fn rebuild_view(&mut self) {
+        self.generation += 1;
         let cursor_file_row = self.file_row(self.cursor.0);
         if self.filters.is_empty() && self.sorts.is_empty() {
             self.view = None;
@@ -758,6 +828,7 @@ impl Spreadsheet {
         };
         self.cursor.0 = new_row;
         self.selection_anchor = None;
+        self.tab_start = None;
         // Back to the top; the caller's ensure_cursor_visible then scrolls just
         // far enough to show the cursor, so a short result fills the screen.
         self.scroll_row = 0;
@@ -769,12 +840,48 @@ impl Spreadsheet {
     }
 
     fn prepare_selection(&mut self, with_selection: bool) {
+        // A move ends a run of Tabs (so does any change of the cursor that
+        // skips this: see `tab_run_start`).
+        self.tab_start = None;
         if with_selection {
             if self.selection_anchor.is_none() {
                 self.selection_anchor = Some(self.cursor);
             }
         } else {
             self.selection_anchor = None;
+        }
+    }
+
+    /// Tab (or Shift+Tab, `back`): one column right (left), remembering the
+    /// column the run of Tabs started from for Enter.
+    pub fn tab_move(&mut self, back: bool) {
+        let start = self.tab_run_start().unwrap_or(self.cursor.1);
+        if back {
+            self.move_left(false);
+        } else {
+            self.move_right(false);
+        }
+        self.tab_start = Some((start, self.cursor));
+    }
+
+    /// Enter: down one row. After a run of Tabs it goes back to the column the
+    /// run started from, so typing a row with Tab and ending it with Enter
+    /// lands on the start of the next row, as in Excel.
+    pub fn enter_down(&mut self) {
+        let back_to = self.tab_run_start();
+        self.move_down(false);
+        if let Some(col) = back_to {
+            self.cursor.1 = col;
+        }
+    }
+
+    /// The column the current run of Tabs started from, while the cursor is
+    /// still on the cell the last Tab left it on with nothing selected since
+    /// (a click on a column letter, Ctrl+A or a paste set the cursor directly).
+    fn tab_run_start(&self) -> Option<usize> {
+        match self.tab_start {
+            Some((col, landed)) if landed == self.cursor && self.selection_anchor.is_none() => Some(col),
+            _ => None,
         }
     }
 
@@ -863,6 +970,8 @@ impl Spreadsheet {
         );
     }
 
+    /// Edit the cell's value in Edit mode (F2): the caret at its end, and the
+    /// arrow keys moving it in the text.
     pub fn enter_edit_mode(&mut self) {
         let text = self.cell(self.cursor.0, self.cursor.1).to_string();
         let cursor = text.len();
@@ -870,9 +979,14 @@ impl Spreadsheet {
             text,
             cursor,
             selection_start: None,
+            mode: EditMode::Edit,
+            caret_in_bar: false,
+            view: std::cell::Cell::new(0),
         });
     }
 
+    /// Type over the cell (Enter mode): its value is replaced by `initial`,
+    /// and the arrow keys will keep the entry and move on.
     pub fn enter_edit_mode_replace(&mut self, initial: char) {
         let mut text = String::new();
         text.push(initial);
@@ -881,7 +995,24 @@ impl Spreadsheet {
             text,
             cursor,
             selection_start: None,
+            mode: EditMode::Enter,
+            caret_in_bar: false,
+            view: std::cell::Cell::new(0),
         });
+    }
+
+    pub fn edit_mode(&self) -> Option<EditMode> {
+        self.editing.as_ref().map(|e| e.mode)
+    }
+
+    /// F2 while editing: switch between Enter and Edit mode.
+    pub fn toggle_edit_mode(&mut self) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.mode = match edit.mode {
+                EditMode::Enter => EditMode::Edit,
+                EditMode::Edit => EditMode::Enter,
+            };
+        }
     }
 
     pub fn cancel_edit(&mut self) {
@@ -894,37 +1025,31 @@ impl Spreadsheet {
         // Write to the file row shown there. The view isn't re-applied, so an
         // edited row stays put until the filter or sort next changes (as in Excel).
         let r = self.file_row(display_row);
+        // Text left as it was changes nothing: a cell opened and left (F2, a
+        // double-click) keeps what it held, a null included.
+        if edit.text == self.file_cell(r, c) {
+            return;
+        }
         // A value typed into a ghost cell past the data (or into a missing cell
-        // of a short row) grows the data to hold it. Typing nothing grows
-        // nothing, though a short row's missing cell becomes real, so an empty
-        // commit turns it into an empty string just as it does a stored null.
+        // of a short row) grows the data to hold it. Emptied text grows
+        // nothing: the cell had a value, so it is there.
         let mut growth = self.shape();
-        let grew = if edit.text.is_empty() {
-            self.fill_short_row(r, c, &mut growth)
-        } else {
-            self.grow_to(r, c, &mut growth)
-        };
-        let growth = grew.then_some(growth);
-        // An edited cell holds a real value, never a null — even if the
-        // committed text is empty (that's now an empty string).
+        let grew = !edit.text.is_empty() && self.grow_to(r, c, &mut growth);
         let was_null = self.file_is_null(r, c);
-        let mut before = None;
-        if let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) {
-            if *cell != edit.text || was_null {
-                before = Some(std::mem::replace(cell, edit.text));
-            }
+        // Emptied, the cell becomes a null (saved as an empty field), as
+        // Delete makes it; otherwise it holds the value typed.
+        let emptied = edit.text.is_empty();
+        let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { return };
+        let before = std::mem::replace(cell, edit.text);
+        if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
+            *m = emptied;
         }
-        if let Some(before) = before {
-            if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
-                *m = false;
-            }
-            self.record_step(UndoStep {
-                changes: vec![CellChange { row: r, col: c, other: before, other_null: was_null }],
-                filter: None,
-                growth,
-                reshape: None,
-            });
-        }
+        self.record_step(UndoStep {
+            changes: vec![CellChange { row: r, col: c, other: before, other_null: was_null }],
+            filter: None,
+            growth: grew.then_some(growth),
+            reshape: None,
+        });
         self.recompute_col_width(c);
     }
 
@@ -1016,52 +1141,28 @@ impl Spreadsheet {
         }
     }
 
-    /// Give a short row a real (null) cell at `col` when `col` is inside the
-    /// header's width. A missing cell and a stored null look and save the same;
-    /// making it real lets Delete and edits treat both alike. The row is noted
-    /// in `before` as growth is, so undo shortens it again: a row left longer
-    /// than the header would keep later values past the header from Save.
-    /// Returns whether the row grew.
-    fn fill_short_row(&mut self, row: usize, col: usize, before: &mut Growth) -> bool {
-        if col >= self.num_cols() || self.rows.get(row).map_or(true, |r| col < r.len()) {
-            return false;
-        }
-        self.note_lengthened(row, before);
-        if let (Some(cells), Some(mask)) = (self.rows.get_mut(row), self.null_mask.get_mut(row)) {
-            while cells.len() <= col {
-                cells.push(String::new());
-                mask.push(true);
-            }
-        }
-        true
-    }
-
+    /// Delete (and Backspace, and Cut once the cells are on the clipboard):
+    /// every selected cell becomes a null, saved as an empty field. A null
+    /// (stored, or missing from a short row) and a ghost cell stay as they are.
     pub fn clear_selection_content(&mut self) {
         let ((r0, c0), (r1, c1)) = self.selected_range();
         let mut changes = Vec::new();
-        let mut growth = self.shape();
-        let mut filled = false;
         // Display rows only: cells a filter hides are left alone, as in Excel.
         for display_row in r0..=r1 {
             let r = self.file_row(display_row);
             for c in c0..=c1 {
-                // A short row's missing cells clear like stored nulls.
-                filled |= self.fill_short_row(r, c, &mut growth);
-                // Clearing yields an empty string, not a null.
-                let was_null = self.file_is_null(r, c);
-                let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { continue };
-                if cell.is_empty() && !was_null {
+                if self.file_is_null(r, c) {
                     continue;
                 }
+                let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { continue };
                 let before = std::mem::take(cell);
                 if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
-                    *m = false;
+                    *m = true;
                 }
-                changes.push(CellChange { row: r, col: c, other: before, other_null: was_null });
+                changes.push(CellChange { row: r, col: c, other: before, other_null: false });
             }
         }
-        // A filled cell was a null, so it always cleared: filling comes with changes.
-        self.record_step(UndoStep { changes, filter: None, growth: filled.then_some(growth), reshape: None });
+        self.record_step(UndoStep { changes, filter: None, growth: None, reshape: None });
     }
 
     // --- Insert & delete rows and columns (Ctrl+= / Ctrl+-) --------------------
@@ -1498,6 +1599,7 @@ impl Spreadsheet {
         if step.changes.is_empty() && step.reshape.is_none() {
             return;
         }
+        self.generation += 1;
         // A new change after undoing past the save point makes that point
         // unreachable: the file on disk no longer matches any state here.
         if self.save_point.map_or(false, |p| p > self.undo.len()) {
@@ -1627,6 +1729,7 @@ impl Spreadsheet {
     /// After an undo/redo: refit the touched columns and put the cursor on the
     /// step's first cell when a filter isn't hiding its row.
     fn finish_step(&mut self, step: &UndoStep) {
+        self.generation += 1;
         let cols: std::collections::BTreeSet<usize> = step.changes.iter().map(|c| c.col).collect();
         for col in cols {
             self.recompute_col_width(col);
@@ -1658,6 +1761,7 @@ impl Spreadsheet {
             self.cursor.1 = self.cursor.1.min(self.num_cols().saturating_sub(1));
         }
         self.selection_anchor = None;
+        self.tab_start = None;
     }
 
     /// The display row showing file row `row`, if one does.
@@ -1756,16 +1860,16 @@ impl Spreadsheet {
             let was_null = self.file_is_null(r, c);
             // No cell here only for an empty value (past a short row, or a ghost).
             let Some(cell) = self.rows.get_mut(r).and_then(|row| row.get_mut(c)) else { return };
-            // An empty value clears a cell as Delete does, but leaves an empty
-            // one (null or not) as it is: sage's Copy writes both as an empty
-            // field, so copying and pasting them changes nothing.
+            // An empty value clears a cell as Delete does (to a null), but
+            // leaves an empty one (null or not) as it is: sage's Copy writes
+            // both as an empty field, so copying and pasting them changes nothing.
             let unchanged = if v.is_empty() { cell.is_empty() } else { cell == v && !was_null };
             if unchanged {
                 return;
             }
             let before = std::mem::replace(cell, v.clone());
             if let Some(m) = self.null_mask.get_mut(r).and_then(|row| row.get_mut(c)) {
-                *m = false;
+                *m = v.is_empty();
             }
             changes.push(CellChange { row: r, col: c, other: before, other_null: was_null });
         });
@@ -1901,12 +2005,136 @@ impl Spreadsheet {
         edit.cursor += text.len();
     }
 
-    pub fn formula_bar_label_width(&self) -> usize {
-        if self.is_editing() {
-            format!(" {} (editing) ", self.cursor_label()).chars().count()
-        } else {
-            format!(" {} ", self.cursor_label()).chars().count()
+    /// The formula bar's label: the cell, and while it is being edited, how
+    /// (typing: arrows move to the next cell; editing: they move the caret).
+    pub fn formula_bar_label(&self) -> String {
+        match self.edit_mode() {
+            Some(EditMode::Enter) => format!(" {} (typing) ", self.cursor_label()),
+            Some(EditMode::Edit) => format!(" {} (editing) ", self.cursor_label()),
+            None => format!(" {} ", self.cursor_label()),
         }
+    }
+
+    pub fn formula_bar_label_width(&self) -> usize {
+        self.formula_bar_label().chars().count()
+    }
+
+    /// Where the cell being edited is drawn (see [`EditBox`]), for a grid
+    /// `term_width` wide showing `visible_rows` data rows; `None` when not
+    /// editing or the cell is scrolled off to the side.
+    pub fn edit_box(&self, term_width: usize, visible_rows: usize) -> Option<EditBox> {
+        let edit = self.editing.as_ref()?;
+        let col = self.cursor.1;
+        if col < self.scroll_col {
+            return None;
+        }
+        let mut x = self.row_num_width(visible_rows) + 1;
+        for c in self.scroll_col..col {
+            x += self.col_width(c) + 1;
+            if x >= term_width {
+                return None;
+            }
+        }
+        if x >= term_width {
+            return None;
+        }
+        let room = term_width - x;
+        let line_start = edit.text[..edit.cursor].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = edit.text[edit.cursor..].find('\n').map_or(edit.text.len(), |i| edit.cursor + i);
+        let text_width = |s: &str| -> usize { s.chars().map(|c| c.width().unwrap_or(1)).sum() };
+        // Wide enough for the line and the caret after it: take in the
+        // columns to the right, whole, until it fits or reaches the edge.
+        let need = text_width(&edit.text[line_start..line_end]) + 1;
+        let mut width = self.col_width(col);
+        let mut last_col = col;
+        while width < need && width < room {
+            last_col += 1;
+            width += 1 + self.col_width(last_col);
+        }
+        let width = width.min(room);
+        // Still too long: scroll the line, from where the view was last drawn,
+        // only as far as keeps the caret in the box.
+        let mut view_start = edit.view.get();
+        if view_start < line_start || view_start > edit.cursor || !edit.text.is_char_boundary(view_start) {
+            // Another line, or the caret went left of the view: start the
+            // view at the caret (the fill-in below brings text back into it).
+            view_start = if view_start < line_start || view_start > line_end { line_start } else { edit.cursor };
+        }
+        if text_width(&edit.text[view_start..edit.cursor]) + 1 > width {
+            // Start as many columns before the caret as leave it room: walk
+            // back from it once (a long line stays linear).
+            let mut used = 0;
+            let mut start = edit.cursor;
+            for ch in edit.text[view_start..edit.cursor].chars().rev() {
+                let w = ch.width().unwrap_or(1);
+                if used + w + 1 > width {
+                    break;
+                }
+                used += w;
+                start -= ch.len_utf8();
+            }
+            view_start = start;
+        }
+        // Text hidden on the left while the box has room at its right end
+        // (after a deletion, say): scroll back to fill it.
+        while view_start > line_start {
+            let Some(prev) = edit.text[line_start..view_start].chars().next_back() else { break };
+            let back = view_start - prev.len_utf8();
+            if text_width(&edit.text[back..line_end]) + 1 > width {
+                break;
+            }
+            view_start = back;
+        }
+        edit.view.set(view_start);
+        Some(EditBox { x, width, last_col, view_start, line_end })
+    }
+
+    /// Where a drag that started in the text of the cell being edited puts the
+    /// caret, with the pointer at screen column `screen_col` on any row: the
+    /// place under it in the box, or, left or right of the box, one character
+    /// past the text shown, so dragging out of it scrolls the text.
+    pub fn edit_drag_byte(&self, screen_col: usize, term_width: u16, term_height: u16) -> Option<usize> {
+        let edit = self.editing.as_ref()?;
+        let data_start = FORMULA_BAR_HEIGHT + 2;
+        let visible_rows = (term_height as usize).saturating_sub(1).saturating_sub(data_start);
+        let b = self.edit_box(term_width as usize, visible_rows)?;
+        if screen_col < b.x {
+            let line_start = edit.text[..b.view_start].rfind('\n').map_or(0, |i| i + 1);
+            return Some(match edit.text[line_start..b.view_start].chars().next_back() {
+                Some(prev) => b.view_start - prev.len_utf8(),
+                None => b.view_start,
+            });
+        }
+        // Right of the box, or on its last column where it meets the screen's
+        // edge (a pointer can't go further): one character past what shows,
+        // so the text scrolls.
+        let right = b.x + b.width;
+        if screen_col >= right || (right >= term_width as usize && screen_col + 1 >= right) {
+            let shown_end = self.edit_box_byte(&b, right);
+            return Some(match edit.text[shown_end..b.line_end].chars().next() {
+                Some(next) => shown_end + next.len_utf8(),
+                None => shown_end,
+            });
+        }
+        Some(self.edit_box_byte(&b, screen_col))
+    }
+
+    /// The byte in the edit text under screen column `screen_col` of `b`:
+    /// before the character there, or the line's end past the text.
+    fn edit_box_byte(&self, b: &EditBox, screen_col: usize) -> usize {
+        let Some(edit) = self.editing.as_ref() else { return 0 };
+        let target = screen_col.saturating_sub(b.x);
+        let mut used = 0;
+        let mut byte = b.view_start;
+        for ch in edit.text[b.view_start..b.line_end].chars() {
+            let w = ch.width().unwrap_or(1);
+            if used + w > target {
+                break;
+            }
+            used += w;
+            byte += ch.len_utf8();
+        }
+        byte
     }
 
     pub fn hit_test(
@@ -1954,6 +2182,16 @@ impl Spreadsheet {
         // Fixed separator between row-num and first visible column
         if col == rw {
             return GridHit::Outside;
+        }
+
+        // The cell being edited shows its text in the grid, over the cells it
+        // has widened across: a click there goes into the text.
+        if is_data_row && self.scroll_row + (row - data_start) == self.cursor.0 {
+            if let Some(b) = self.edit_box(term_width as usize, visible_data_rows) {
+                if col >= b.x && col < b.x + b.width {
+                    return GridHit::EditText { byte: self.edit_box_byte(&b, col) };
+                }
+            }
         }
 
         // Columns run on past the data as ghost columns to the screen's edge;
@@ -2093,17 +2331,43 @@ impl Spreadsheet {
         out
     }
 
+    /// The status bar's summary text for the selection, worked out again only
+    /// when the selection or the data (or the rows shown) changed: a whole
+    /// column of a big file costs its time once, not on every keypress.
+    pub fn selection_summary(&mut self) -> String {
+        let key = (self.selected_range(), self.generation);
+        if let Some((range, generation, text)) = &self.summary_cache {
+            if (*range, *generation) == key {
+                return text.clone();
+            }
+        }
+        let text = self.selection_metrics().format();
+        self.summary_cache = Some((key.0, key.1, text.clone()));
+        text
+    }
+
+    /// The status bar's summary of the selected cells. Row 1 is the header, so
+    /// with data rows selected too it isn't one of the values (a column picked
+    /// by its letter sums and counts its data).
     pub fn selection_metrics(&self) -> SelectionMetrics {
         let ((r0, c0), (r1, c1)) = self.selected_range();
+        let r0 = if r0 == 0 && r1 > 0 { 1 } else { r0 };
         let mut m = SelectionMetrics::default();
         m.total_cells = (r1 - r0 + 1) * (c1 - c0 + 1);
+        let mut distinct: HashSet<&str> = HashSet::new();
         for r in r0..=r1 {
             for c in c0..=c1 {
-                let cell = self.cell(r, c).trim();
+                if self.is_null(r, c) {
+                    m.nulls += 1;
+                    continue;
+                }
+                let raw = self.cell(r, c);
+                let cell = raw.trim();
                 if cell.is_empty() {
                     continue;
                 }
                 m.non_empty += 1;
+                distinct.insert(raw);
                 if let Some(n) = parse_number(cell) {
                     m.numbers.push(n);
                 } else if let Some((secs, has_time, tz_offset)) = parse_iso_datetime(cell) {
@@ -2120,6 +2384,7 @@ impl Spreadsheet {
                 }
             }
         }
+        m.unique = distinct.len();
         m
     }
 
@@ -2198,13 +2463,30 @@ impl Spreadsheet {
         };
     }
 
+    /// A click in the formula bar: edit the cell there, in Edit mode (as in
+    /// Excel), with the caret in the bar.
     pub fn begin_mouse_formula_bar_select(&mut self, row: usize, text_col: usize, shift: bool) {
         if !self.is_editing() {
             self.enter_edit_mode();
         }
         let byte = self.formula_bar_text_to_byte(row, text_col);
         self.edit_set_cursor(byte, shift);
+        if let Some(edit) = self.editing.as_mut() {
+            edit.mode = EditMode::Edit;
+            edit.caret_in_bar = true;
+        }
         self.mouse_mode = MouseMode::FormulaBarSelect;
+    }
+
+    /// A click in the text of the cell being edited, in the grid: the caret
+    /// goes there, in Edit mode (as in Excel), with a drag selecting text.
+    pub fn begin_mouse_cell_text_select(&mut self, byte: usize, shift: bool) {
+        self.edit_set_cursor(byte, shift);
+        if let Some(edit) = self.editing.as_mut() {
+            edit.mode = EditMode::Edit;
+            edit.caret_in_bar = false;
+        }
+        self.mouse_mode = MouseMode::CellTextSelect;
     }
 
     pub fn end_mouse(&mut self) {
@@ -2368,6 +2650,100 @@ impl CellEdit {
         start + bytes.min(end - start)
     }
 
+}
+
+/// Bytes of memory each field takes in the grid besides its text: its string's
+/// own bookkeeping and allocation, its null flag, and its share of its row's
+/// vectors. Measured 2026-09-29 on a 1M-row, 10-column CSV of short values
+/// (53 MB): the load peaked at 595 MB, twice the file plus 10M fields × 49.
+const GRID_BYTES_PER_FIELD: u64 = 49;
+
+/// About how much memory opening `path` as a grid takes at its peak: the
+/// file's text, the same bytes again as the cells' strings, and
+/// `GRID_BYTES_PER_FIELD` for each field. Fields are counted in the file's
+/// first MiB (whole records) and scaled up to its size.
+fn grid_memory_estimate(path: &Path, delimiter: u8) -> io::Result<u64> {
+    use std::io::Read;
+    let size = std::fs::metadata(path)?.len();
+    let mut head = Vec::new();
+    std::fs::File::open(path)?.take(1 << 20).read_to_end(&mut head)?;
+    if (head.len() as u64) < size {
+        if let Some(end) = head.iter().rposition(|&b| b == b'\n') {
+            head.truncate(end + 1);
+        }
+    }
+    if head.is_empty() {
+        return Ok(2 * size);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let fields: usize = crate::dsv::parse(&text, delimiter).iter().map(|r| r.len()).sum();
+    let fields = fields as f64 * size as f64 / head.len() as f64;
+    Ok(2 * size + (fields * GRID_BYTES_PER_FIELD as f64) as u64)
+}
+
+/// Refuse a grid needing more memory than is free: opening it would run sage
+/// (and the machine) out of memory.
+fn grid_fits(need: u64, free: u64) -> io::Result<()> {
+    if need <= free {
+        return Ok(());
+    }
+    let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
+    Err(io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "too big to open as a grid: it needs about {} of memory and {} is free. Open it in DuckDB or pivot instead",
+            gb(need),
+            gb(free)
+        ),
+    ))
+}
+
+/// Physical memory the machine has free, in bytes, where sage can ask.
+#[cfg(windows)]
+fn available_memory() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `status` is a MEMORYSTATUSEX with its length set, as the call requires.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.avail_phys)
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn available_memory() -> Option<u64> {
+    None
 }
 
 fn detect_delimiter(path: &Path) -> u8 {
@@ -2671,6 +3047,27 @@ pub fn format_tz_offset(secs: i64) -> String {
     format!("{}{:02}:{:02}", sign, a / 3600, (a % 3600) / 60)
 }
 
+/// `part` of `whole` as a percentage to one decimal, dropping a trailing `.0`.
+/// Some but under 0.1% reads `<0.1%`, and not quite all `>99.9%`, so a
+/// rounded figure never claims none or all when that isn't so.
+fn fmt_percent(part: usize, whole: usize) -> String {
+    if whole == 0 || part == 0 {
+        return "0%".to_string();
+    }
+    if part == whole {
+        return "100%".to_string();
+    }
+    let p = part as f64 * 100.0 / whole as f64;
+    if p < 0.1 {
+        return "<0.1%".to_string();
+    }
+    if p > 99.9 {
+        return ">99.9%".to_string();
+    }
+    let s = format!("{:.1}", p);
+    format!("{}%", s.strip_suffix(".0").unwrap_or(&s))
+}
+
 fn fmt_num(n: f64) -> String {
     let abs = n.abs();
     if !n.is_finite() {
@@ -2907,14 +3304,20 @@ mod tests {
     }
 
     #[test]
-    fn clearing_a_null_cell_makes_it_empty_string() {
+    fn clearing_makes_a_value_a_null_and_leaves_a_null_as_it_is() {
         let path = write_tmp("sage_test_null_clear.csv", "a,b\n1,\n");
         let mut ss = Spreadsheet::from_file(&path).unwrap();
         assert!(ss.is_null(1, 1));
         ss.cursor = (1, 1);
         ss.selection_anchor = Some((1, 1));
         ss.clear_selection_content();
-        assert!(!ss.is_null(1, 1));
+        assert!(ss.is_null(1, 1));
+        assert!(!ss.is_modified() && !ss.undo()); // nothing to clear
+        ss.cursor = (1, 0);
+        ss.selection_anchor = None;
+        ss.clear_selection_content();
+        assert!(ss.is_null(1, 0));
+        assert_eq!(saved(&mut ss), "a,b\n,\n");
     }
 
     #[test]
@@ -2968,6 +3371,93 @@ mod tests {
             GridHit::RowNumber { row } => assert_eq!(row, 1),
             other => panic!("expected row number, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn the_cell_being_edited_widens_over_its_neighbours_and_takes_clicks() {
+        // Same layout as hit_test_finds_cells: row numbers 0..5, a separator,
+        // then columns of width 4 at 6, 11 and 16 (separators at 10, 15, 20),
+        // then ghost columns of width 8.
+        let mut ss = Spreadsheet::new_empty(b',');
+        ss.rows = vec![
+            vec!["a".into(), "b".into(), "c".into()],
+            vec!["1".into(), "2".into(), "3".into()],
+        ];
+        ss.null_mask = vec![vec![false; 3]; 2];
+        ss.column_widths = vec![4, 4, 4];
+        ss.cursor = (1, 0);
+        assert_eq!(ss.edit_box(80, 18), None); // not editing
+        ss.enter_edit_mode_replace('h');
+        for ch in "ello world".chars() {
+            ss.edit_insert_char(ch);
+        }
+        // 11 characters and the caret: over columns B and C (4 + 1 + 4 + 1 + 4).
+        let b = ss.edit_box(80, 18).unwrap();
+        assert_eq!((b.x, b.width, b.last_col, b.view_start, b.line_end), (6, 14, 2, 0, 11));
+        // A click in it lands in the text; past the text, at its end; beyond
+        // the box, on the next cell as ever. (Data row 1 is screen row 6.)
+        assert_eq!(ss.hit_test(9, 6, 80, 24), GridHit::EditText { byte: 3 });
+        assert_eq!(ss.hit_test(19, 6, 80, 24), GridHit::EditText { byte: 11 });
+        assert_eq!(ss.hit_test(22, 6, 80, 24), GridHit::DataCell { row: 1, col: 3 });
+        assert_eq!(ss.hit_test(9, 5, 80, 24), GridHit::DataCell { row: 0, col: 0 });
+        // Cut off by the screen's edge, it scrolls to keep the caret in view.
+        let b = ss.edit_box(16, 18).unwrap();
+        assert_eq!((b.x, b.width, b.view_start), (6, 10, 2));
+        // One line shows, the caret's.
+        ss.edit_insert_newline();
+        ss.edit_insert_char('z');
+        let b = ss.edit_box(80, 18).unwrap();
+        assert_eq!((b.width, b.last_col, b.view_start, b.line_end), (4, 0, 12, 13));
+        // Scrolled off to the side, it isn't drawn.
+        ss.scroll_col = 1;
+        assert_eq!(ss.edit_box(80, 18), None);
+    }
+
+    #[test]
+    fn the_edit_box_holds_its_scroll_under_a_click_and_a_drag() {
+        let mut ss = Spreadsheet::new_empty(b',');
+        ss.rows = vec![
+            vec!["a".into(), "b".into(), "c".into()],
+            vec!["1".into(), "2".into(), "3".into()],
+        ];
+        ss.null_mask = vec![vec![false; 3]; 2];
+        ss.column_widths = vec![4, 4, 4];
+        ss.cursor = (1, 2); // C2, at screen column 16: a 26-wide screen leaves it 10
+        ss.enter_edit_mode_replace('0');
+        for ch in "123456789ABCDEFGHIJ".chars() {
+            ss.edit_insert_char(ch);
+        }
+        let b = ss.edit_box(26, 18).unwrap();
+        assert_eq!((b.x, b.width, b.view_start), (16, 10, 11)); // "BCDEFGHIJ" and the caret
+        // A click on the D puts the caret before it, and the text stays put.
+        assert_eq!(ss.hit_test(18, 6, 26, 24), GridHit::EditText { byte: 13 });
+        ss.begin_mouse_cell_text_select(13, false);
+        assert_eq!(ss.edit_mode(), Some(EditMode::Edit));
+        assert_eq!(ss.edit_box(26, 18).unwrap().view_start, 11);
+        // A drag right selects rightwards, on any row.
+        assert_eq!(ss.edit_drag_byte(20, 26, 24), Some(15));
+        ss.edit_set_cursor(15, true);
+        assert_eq!(ss.edit_get_selected_text().as_deref(), Some("DE"));
+        // Past the box's left end: one character more, and the text scrolls.
+        assert_eq!(ss.edit_drag_byte(3, 26, 24), Some(10));
+        ss.edit_set_cursor(10, true);
+        assert_eq!(ss.edit_box(26, 18).unwrap().view_start, 10);
+        // Past its right end: the end of what shows, and then on.
+        assert_eq!(ss.edit_drag_byte(40, 26, 24), Some(20));
+        ss.edit_set_cursor(20, false);
+        assert_eq!(ss.edit_box(26, 18).unwrap().view_start, 11);
+        // Deleting from the end brings hidden text back in from the left.
+        for _ in 0..5 {
+            ss.edit_backspace();
+        }
+        assert_eq!(ss.edit_box(26, 18).unwrap().view_start, 6); // "6789ABCDE" and the caret
+        // A pointer can't go past the screen's last column: a drag there
+        // scrolls the rest of the line in, a character at a time.
+        ss.edit_set_cursor(0, false);
+        assert_eq!(ss.edit_box(26, 18).unwrap().view_start, 0);
+        assert_eq!(ss.edit_drag_byte(25, 26, 24), Some(11)); // one past the 9 in the last column
+        ss.edit_set_cursor(11, true);
+        assert_eq!(ss.edit_box(26, 18).unwrap().view_start, 2);
     }
 
     #[test]
@@ -3139,19 +3629,15 @@ mod tests {
 
     #[test]
     fn metrics_numbers_sum_and_avg() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["10".into(), "20".into()],
-            vec!["30".into(), "40".into()],
-        ];
+        let mut ss = grid(&[&["x", "y"], &["10", "20"], &["30", "40"]]);
         ss.column_widths = vec![4, 4];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (0, 0); // from the header: it isn't one of the values
+        ss.selection_anchor = Some((2, 1));
         let m = ss.selection_metrics();
         assert_eq!(m.non_empty, 4);
         assert_eq!(m.numbers, vec![10.0, 20.0, 30.0, 40.0]);
         let s = m.format();
-        assert!(s.contains("n 4/4"));
+        assert!(s.contains("count 4"));
         assert!(s.contains("sum 100"));
         assert!(s.contains("avg 25"));
         assert!(s.contains("min 10"));
@@ -3160,15 +3646,10 @@ mod tests {
 
     #[test]
     fn metrics_dates_min_max_avg() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["2020-01-01".into()],
-            vec!["2022-01-01".into()],
-            vec!["2024-01-01".into()],
-        ];
+        let mut ss = grid(&[&["d"], &["2020-01-01"], &["2022-01-01"], &["2024-01-01"]]);
         ss.column_widths = vec![12];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((2, 0));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((3, 0));
         let m = ss.selection_metrics();
         assert_eq!(m.dates.len(), 3);
         assert!(!m.dates_have_time);
@@ -3180,15 +3661,10 @@ mod tests {
 
     #[test]
     fn metrics_datetimes_min_max_avg() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["2025-01-01 00:00:00".into()],
-            vec!["2025-01-01 12:00:00".into()],
-            vec!["2025-01-02 00:00:00".into()],
-        ];
+        let mut ss = grid(&[&["t"], &["2025-01-01 00:00:00"], &["2025-01-01 12:00:00"], &["2025-01-02 00:00:00"]]);
         ss.column_widths = vec![20];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((2, 0));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((3, 0));
         let m = ss.selection_metrics();
         assert_eq!(m.dates.len(), 3);
         assert!(m.dates_have_time);
@@ -3201,14 +3677,10 @@ mod tests {
 
     #[test]
     fn metrics_tz_datetimes_keep_common_offset() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["2025-01-01 00:00:00+05:30".into()],
-            vec!["2025-01-01 12:00:00+05:30".into()],
-        ];
+        let mut ss = grid(&[&["t"], &["2025-01-01 00:00:00+05:30"], &["2025-01-01 12:00:00+05:30"]]);
         ss.column_widths = vec![30];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((2, 0));
         let s = ss.selection_metrics().format();
         // A shared offset is preserved in the rendered aggregates.
         assert!(s.contains("min 2025-01-01 00:00:00+05:30"), "got: {s}");
@@ -3218,14 +3690,14 @@ mod tests {
 
     #[test]
     fn metrics_mixed_tz_offsets_fall_back_to_utc() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["2025-01-01 00:00:00+00:00".into()],
-            vec!["2025-01-01 00:00:00+05:00".into()], // == 2024-12-31 19:00 UTC
-        ];
+        let mut ss = grid(&[
+            &["t"],
+            &["2025-01-01 00:00:00+00:00"],
+            &["2025-01-01 00:00:00+05:00"], // == 2024-12-31 19:00 UTC
+        ]);
         ss.column_widths = vec![30];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((1, 0));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((2, 0));
         let s = ss.selection_metrics().format();
         // Differing offsets → aggregates rendered in UTC.
         assert!(s.contains("min 2024-12-31 19:00:00+00:00"), "got: {s}");
@@ -3234,19 +3706,15 @@ mod tests {
 
     #[test]
     fn metrics_mixed_types_suppress_sum_avg() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["10".into(), "alice".into()],
-            vec!["2021-03-15".into(), "20".into()],
-        ];
+        let mut ss = grid(&[&["a", "b"], &["10", "alice"], &["2021-03-15", "20"]]);
         ss.column_widths = vec![12, 6];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((2, 1));
         let m = ss.selection_metrics();
         assert_eq!(m.non_empty, 4);
         // Has numbers AND a date AND a string — mixed → no sum/avg in output
         let s = m.format();
-        assert!(s.starts_with("n 4/4"), "got: {}", s);
+        assert!(s.starts_with("count 4"), "got: {}", s);
         assert!(!s.contains("sum"));
         assert!(!s.contains("avg"));
         assert!(!s.contains("min"));
@@ -3255,18 +3723,14 @@ mod tests {
 
     #[test]
     fn metrics_numbers_with_empties_still_sum() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["10".into(), "".into()],
-            vec!["20".into(), "30".into()],
-        ];
+        let mut ss = grid(&[&["a", "b"], &["10", ""], &["20", "30"]]);
         ss.column_widths = vec![4, 4];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((2, 1));
         let m = ss.selection_metrics();
         // 3 non-empty, all numeric → sum/avg still shown
         let s = m.format();
-        assert!(s.contains("n 3/4"));
+        assert!(s.contains("count 4"));
         assert!(s.contains("sum 60"));
         assert!(s.contains("avg 20"));
     }
@@ -3337,36 +3801,122 @@ mod tests {
 
     #[test]
     fn metrics_strings_only_count() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![
-            vec!["alice".into(), "bob".into()],
-            vec!["".into(), "carol".into()],
-        ];
+        let mut ss = grid(&[&["a", "b"], &["alice", "bob"], &["", "carol"]]);
         ss.column_widths = vec![6, 6];
-        ss.cursor = (0, 0);
-        ss.selection_anchor = Some((1, 1));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((2, 1));
         let m = ss.selection_metrics();
         assert_eq!(m.non_empty, 3);
         assert_eq!(m.total_cells, 4);
         assert!(m.numbers.is_empty());
         assert!(m.dates.is_empty());
         let s = m.format();
-        assert!(s.contains("n 3/4"));
+        assert!(s.contains("count 4"));
         assert!(!s.contains("sum"));
         assert!(!s.contains("avg"));
     }
 
     #[test]
     fn metrics_single_cell() {
-        let mut ss = Spreadsheet::new_empty(b',');
-        ss.rows = vec![vec!["42".into()]];
+        let mut ss = grid(&[&["42"]]);
         ss.column_widths = vec![4];
         let m = ss.selection_metrics();
         let s = m.format();
-        // Single-cell: "n 1" without total
-        assert!(s.starts_with("n 1"));
+        // Single cell: "count 1", without unique or null; a header cell
+        // selected on its own is counted.
+        assert!(s.starts_with("count 1"));
         assert!(s.contains("sum 42"));
         assert!(s.contains("avg 42"));
+        assert!(!s.contains("unique") && !s.contains("null"), "got: {s}");
+    }
+
+    #[test]
+    fn metrics_count_unique_values_and_nulls() {
+        // Column gw: YYC twice, YYZ, an empty string (a value, but blank), a
+        // stored null, and 5. Column n: a stored null, and a missing cell in
+        // the short last row.
+        let mut ss = Spreadsheet::from_text("gw,n\nYYC,1\nYYZ,\nYYC,2\n\"\",3\n,4\n5\n", b',', false).unwrap();
+        ss.select_column(0, false); // by its letter: the header comes too, but isn't counted
+        let m = ss.selection_metrics();
+        assert_eq!((m.total_cells, m.non_empty, m.unique, m.nulls), (6, 4, 3, 1));
+        assert_eq!(m.format(), "count 6  unique 3  null 16.7%");
+        // A whole numeric column sums, with its header selected.
+        ss.select_column(1, false);
+        let s = ss.selection_metrics().format();
+        assert!(s.starts_with("count 6  unique 4  null 33.3%  sum 10"), "got: {s}");
+        // Under a filter only the rows shown count.
+        ss.set_filter(0, Some(set(&["YYC"])));
+        ss.select_column(1, false);
+        let s = ss.selection_metrics().format();
+        assert!(s.starts_with("count 2  unique 2  null 0%  sum 3"), "got: {s}");
+    }
+
+    #[test]
+    fn the_summary_is_kept_until_the_selection_or_the_data_changes() {
+        let mut ss = Spreadsheet::from_text("n\n1\n2\n3\n", b',', false).unwrap();
+        ss.select_column(0, false);
+        assert!(ss.selection_summary().contains("sum 6"));
+        // A change behind the grid's back (no edit, filter or undo) isn't
+        // seen: the kept summary is what comes back.
+        ss.rows[1][0] = "100".into();
+        assert!(ss.selection_summary().contains("sum 6"));
+        ss.rows[1][0] = "1".into();
+        // An edit, an undo, a filter and a new selection each work it out again.
+        ss.cursor = (1, 0);
+        ss.selection_anchor = None;
+        ss.enter_edit_mode_replace('5');
+        ss.commit_edit();
+        ss.select_column(0, false);
+        assert!(ss.selection_summary().contains("sum 10"));
+        assert!(ss.undo());
+        ss.select_column(0, false);
+        assert!(ss.selection_summary().contains("sum 6"));
+        ss.set_filter(0, Some(set(&["2", "3"])));
+        ss.select_column(0, false);
+        assert!(ss.selection_summary().contains("sum 5"));
+        ss.cursor = (1, 0);
+        ss.selection_anchor = Some((2, 0));
+        assert!(ss.selection_summary().starts_with("count 2  "));
+    }
+
+    #[test]
+    fn a_grid_that_would_not_fit_in_free_memory_is_refused() {
+        // Twice the file, plus 49 bytes a field: 3 records of 2 fields here.
+        let path = write_tmp("sage_test_mem_estimate.csv", "a,b\n1,2\n3,4\n");
+        assert_eq!(grid_memory_estimate(&path, b',').unwrap(), 2 * 12 + 6 * GRID_BYTES_PER_FIELD);
+        // A file past the first MiB is estimated from it, scaled up.
+        let big: String = std::iter::once("a,b\n".to_string()).chain((0..300_000).map(|i| format!("{:06},x\n", i))).collect();
+        let path = write_tmp("sage_test_mem_estimate_big.csv", &big);
+        let fields = 2.0 * 300_001.0;
+        let estimate = grid_memory_estimate(&path, b',').unwrap() as f64;
+        let exact = 2.0 * big.len() as f64 + fields * GRID_BYTES_PER_FIELD as f64;
+        assert!((estimate - exact).abs() / exact < 0.02, "{estimate} vs {exact}");
+        // The decision, and what it says.
+        assert!(grid_fits(1_000, 2_000).is_ok());
+        let err = grid_fits(120_000_000_000, 22_000_000_000).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(
+            err.to_string(),
+            "too big to open as a grid: it needs about 120.0 GB of memory and 22.0 GB is free. Open it in DuckDB or pivot instead"
+        );
+        #[cfg(any(windows, target_os = "linux"))]
+        assert!(available_memory().map_or(false, |free| free > 0));
+    }
+
+    #[test]
+    fn big_counts_read_with_thousands_separators() {
+        let m = SelectionMetrics { total_cells: 1_200_000, non_empty: 1_000_000, unique: 45_000, nulls: 200_000, ..Default::default() };
+        assert_eq!(m.format(), "count 1,200,000  unique 45,000  null 16.7%");
+    }
+
+    #[test]
+    fn percentages_never_round_to_none_or_all() {
+        assert_eq!(fmt_percent(0, 10), "0%");
+        assert_eq!(fmt_percent(10, 10), "100%");
+        assert_eq!(fmt_percent(1, 4), "25%");
+        assert_eq!(fmt_percent(1, 3), "33.3%");
+        assert_eq!(fmt_percent(1, 10_000), "<0.1%");
+        assert_eq!(fmt_percent(9_999, 10_000), ">99.9%");
     }
 
     #[test]
@@ -3539,7 +4089,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_restores_a_filtered_range_clear_nulls_included() {
+    fn a_filtered_range_clear_makes_nulls_and_undo_restores_the_values() {
         let mut ss = grid(&[&["c", "d"], &["x", "1"], &["y", "7"], &["x", ""]]);
         ss.null_mask[3][1] = true;
         ss.set_filter(0, Some(set(&["x"]))); // file rows 1 and 3 shown
@@ -3547,14 +4097,15 @@ mod tests {
         ss.cursor = (2, 1);
         ss.clear_selection_content();
         assert_eq!((ss.rows[1].clone(), ss.rows[3].clone()), (vec!["".to_string(), "".into()], vec!["".to_string(), "".into()]));
-        assert!(!ss.null_mask[3][1]);
+        assert_eq!((ss.null_mask[1].clone(), ss.null_mask[3].clone()), (vec![true, true], vec![true, true]));
         assert!(ss.undo());
         assert_eq!(ss.rows[1], vec!["x", "1"]);
         assert_eq!(ss.rows[3], vec!["x", ""]);
-        assert!(ss.null_mask[3][1]); // the null comes back as a null
+        assert_eq!((ss.null_mask[1].clone(), ss.null_mask[3].clone()), (vec![false, false], vec![false, true]));
         assert_eq!(ss.rows[2], vec!["y", "7"]); // the hidden row was never touched
         assert!(ss.redo());
         assert_eq!(ss.rows[1], vec!["", ""]);
+        assert!(ss.null_mask[1][0]);
     }
 
     #[test]
@@ -3696,24 +4247,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_cells_clear_and_commit_like_stored_nulls() {
+    fn delete_and_an_unchanged_edit_leave_nulls_as_they_are() {
         let mut ss = Spreadsheet::from_text("a,b,c\n1,,\n2\n", b',', false).unwrap();
-        // B2:C2 are stored nulls, B3:C3 missing; Delete turns all four into empty strings.
+        // B2:C2 are stored nulls, B3:C3 missing: Delete leaves all four null,
+        // records nothing, and leaves row 3 short.
         ss.selection_anchor = Some((1, 1));
         ss.cursor = (2, 2);
         ss.clear_selection_content();
         for (r, c) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
-            assert!(!ss.is_null(r, c), "{r},{c}");
+            assert!(ss.is_null(r, c), "{r},{c}");
         }
-        assert!(ss.undo());
-        assert!(ss.is_null(2, 1) && ss.is_null(2, 2)); // back to null
-        // Enter then Enter on a missing cell: an empty string, as for a stored null.
-        let mut ss = Spreadsheet::from_text("a,b\n1\n", b',', false).unwrap();
-        ss.cursor = (1, 1);
-        ss.enter_edit_mode();
-        ss.commit_edit();
-        assert!(!ss.is_null(1, 1));
-        assert_eq!(saved(&mut ss), "a,b\n1,\"\"\n");
+        assert!(!ss.is_modified() && !ss.undo());
+        assert_eq!(ss.rows[2].len(), 1);
+        // A cell opened (F2, a double-click) and left unchanged stays as it
+        // was: a stored null, a missing cell, and an empty string alike.
+        let mut ss = Spreadsheet::from_text("a,b,c\n1,,\"\"\n2\n", b',', false).unwrap();
+        for cell in [(1, 1), (2, 1), (1, 2)] {
+            ss.cursor = cell;
+            ss.enter_edit_mode();
+            ss.commit_edit();
+        }
+        assert!(!ss.is_modified() && !ss.undo());
+        assert!(ss.is_null(1, 1) && ss.is_null(2, 1) && !ss.is_null(1, 2));
+        assert_eq!(saved(&mut ss), "a,b,c\n1,,\"\"\n2,,\n");
     }
 
     #[test]
@@ -4021,11 +4577,11 @@ mod tests {
         let mut ss = Spreadsheet::from_text("a,b,c\n1,,\"\"\n4,5,6\n", b',', true).unwrap();
         assert!(ss.is_null(1, 1) && !ss.is_null(1, 2));
         ss.cursor = (1, 0);
-        // Row 1: empties over a value, a null and an empty string. Row 2 is
-        // short: its missing cells leave 5 and 6 alone.
+        // Row 1: empties over a value (which becomes a null), a null and an
+        // empty string. Row 2 is short: its missing cells leave 5 and 6 alone.
         ss.paste("\t\t\n7");
-        assert_eq!(saved(&mut ss), "a,b,c\n\"\",,\"\"\n7,5,6\n");
-        assert!(ss.is_null(1, 1));
+        assert_eq!(saved(&mut ss), "a,b,c\n,,\"\"\n7,5,6\n");
+        assert!(ss.is_null(1, 0) && ss.is_null(1, 1) && !ss.is_null(1, 2));
         // Pasting what's there already changes nothing and records nothing.
         let mut same = grid(&[&["a", "b"], &["1", "2"]]);
         same.cursor = (1, 0);
@@ -4078,11 +4634,12 @@ mod tests {
     }
 
     #[test]
-    fn undoing_a_clear_of_short_rows_shortens_them_so_later_values_still_save() {
+    fn a_clear_over_short_rows_leaves_them_short_so_later_values_still_save() {
         let mut ss = Spreadsheet::from_text("a,b\n1,2\n3,4\n", b',', false).unwrap();
         ss.cursor = (1, 2);
         ss.paste("p\tq\n\t"); // widens the header; row 2 stays short
-        ss.clear_selection_content(); // the pasted block is selected: row 2's missing cells become real
+        ss.clear_selection_content(); // the pasted block is selected: p and q become nulls
+        assert!(ss.rows.iter().all(|r| r.len() <= ss.num_cols()), "{:?}", ss.rows);
         assert!(ss.undo() && ss.undo());
         assert!(ss.rows.iter().all(|r| r.len() <= ss.num_cols()), "{:?}", ss.rows);
         ss.selection_anchor = None;
@@ -4090,30 +4647,41 @@ mod tests {
         ss.paste("v\tw");
         assert_eq!(saved(&mut ss), "a,b,,\n1,2,,\n3,4,v,w\n");
 
-        // Redo brings back the filled cells too, so the clear lands on every one.
+        // Undo and redo land the clear on the same cells.
         let mut ss = Spreadsheet::from_text("a,b\n1,2\n", b',', false).unwrap();
         ss.cursor = (2, 0);
         ss.paste("x"); // appends the short row [x]
         ss.selection_anchor = Some((2, 1));
         ss.clear_selection_content();
         let tip = saved(&mut ss);
-        assert_eq!(tip, "a,b\n1,2\n\"\",\"\"\n");
+        assert_eq!(tip, "a,b\n1,2\n,\n");
         assert!(ss.undo() && ss.undo() && ss.redo() && ss.redo());
         assert_eq!(saved(&mut ss), tip);
     }
 
     #[test]
-    fn undoing_an_empty_commit_into_a_short_row_shortens_it_again() {
-        let mut ss = Spreadsheet::from_text("a,b\n1\n", b',', false).unwrap();
-        assert_eq!(ss.rows[1].len(), 1);
+    fn emptying_a_cells_text_makes_it_a_null() {
+        let mut ss = Spreadsheet::from_text("a,b,c\n1,x,\"\"\n", b',', false).unwrap();
         ss.cursor = (1, 1);
         ss.enter_edit_mode();
-        ss.commit_edit(); // the missing cell becomes an empty string
-        assert_eq!(saved(&mut ss), "a,b\n1,\"\"\n");
+        ss.edit_select_all();
+        ss.edit_backspace();
+        ss.commit_edit();
+        assert!(ss.is_null(1, 1));
+        assert_eq!(saved(&mut ss), "a,b,c\n1,,\"\"\n");
         assert!(ss.undo());
-        assert_eq!(ss.rows[1].len(), 1);
+        assert!(!ss.is_null(1, 1));
+        assert_eq!(ss.cell(1, 1), "x");
         assert!(ss.redo());
-        assert_eq!(saved(&mut ss), "a,b\n1,\"\"\n");
+        assert!(ss.is_null(1, 1));
+        // Typing into an empty string and taking it out again changes nothing.
+        ss.cursor = (1, 2);
+        ss.enter_edit_mode();
+        ss.edit_insert_char('z');
+        ss.edit_backspace();
+        ss.commit_edit();
+        assert!(!ss.is_null(1, 2));
+        assert_eq!(saved(&mut ss), "a,b,c\n1,,\"\"\n");
     }
 
     #[test]

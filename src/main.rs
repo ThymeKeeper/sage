@@ -351,6 +351,7 @@ fn main() -> io::Result<()> {
     );
 
     // Load file if provided
+    let mut load_error = None;
     if let Some(path) = file_to_execute {
         match editor.load_file(&path) {
             Ok(_) => {},
@@ -359,7 +360,12 @@ fn main() -> io::Result<()> {
                 editor.set_file_path(&path);
             },
             Err(e) => {
-                eprintln!("Failed to load file: {}", e);
+                // Said in the status bar (the screen is sage's by now). The file
+                // isn't taken as the buffer's, so a save can't write over it.
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+                load_error = Some(format!("Couldn't open {}: {}", name, e));
             }
         }
     } else {
@@ -374,6 +380,9 @@ fn main() -> io::Result<()> {
         editor.status_message = Some(("Press Ctrl+Y to select language, Ctrl+K to select kernel, Ctrl+E to execute".to_string(), false));
     } else {
         editor.status_message = Some(("Press Ctrl+Y to select language".to_string(), false));
+    }
+    if let Some(why) = load_error {
+        editor.status_message = Some((why, true));
     }
 
     // Initialize viewport to follow cursor
