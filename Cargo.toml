@@ -29,6 +29,14 @@ http = "1.4.1"
 url = "2.5.8"
 mimalloc = "0.1.52"
 
+# crossterm 0.28.1 with one fix, in vendor/crossterm/src/event/sys/windows/parse.rs
+# (marked "sage patch"): on Windows it reported an Alt-code character (how the
+# console types a pasted €, £, curly quote, em dash or no-break space) as a key
+# release, so sage dropped it. Still unfixed upstream in 0.29.0 and on master
+# (checked 2026-09-29); drop this and vendor/crossterm once a release fixes it.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
+
 [profile.release]
 strip = true
 lto = true
